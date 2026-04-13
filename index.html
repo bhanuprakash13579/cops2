@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/cops_logo.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>COPS</title>
+    <!-- Prevent flash before React paints — must match body background-color in index.css
+         (--color-bg-primary: #f8fafc). Using the wrong colour here is what caused the
+         dark→light flicker on every launch. DO NOT change this to a dark colour. -->
+    <style>html, body { background: #f8fafc; margin: 0; }</style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

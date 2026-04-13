@@ -1,0 +1,272 @@
+use std::sync::Arc;
+use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
+use serde_json::{json, Value};
+use crate::{auth::AuthUser, db::DbPool};
+
+type Db = State<Arc<DbPool>>;
+type Err = (StatusCode, Json<Value>);
+
+fn e400(m: &str) -> Err { (StatusCode::BAD_REQUEST,          Json(json!({ "detail": m }))) }
+fn e404(m: &str) -> Err { (StatusCode::NOT_FOUND,            Json(json!({ "detail": m }))) }
+fn e500(m: &str) -> Err { (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "detail": m }))) }
+
+// ── List DRs ──────────────────────────────────────────────────────────────────
+
+pub async fn list_drs(
+    State(pool): Db,
+    _auth: AuthUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let page     = params.get("page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).max(1);
+    let per_page = params.get("per_page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20).clamp(1, 100);
+    let offset   = (page - 1) * per_page;
+    let search   = params.get("search").map(|s| s.as_str()).unwrap_or("").trim().to_string();
+
+    let (search_sql, search_params): (&str, Vec<String>) = if search.is_empty() {
+        ("1=1", vec![])
+    } else {
+        let p = format!("%{}%", search);
+        ("(dr_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)", vec![p.clone(), p.clone(), p])
+    };
+
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM dr_master WHERE {search_sql}"),
+        rusqlite::params_from_iter(search_params.iter()),
+        |r| r.get(0)
+    ).unwrap_or(0);
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, dr_no, dr_year, dr_date, pax_name, passport_no, flight_no,
+                total_items_value, dr_printed, os_no, os_year
+         FROM dr_master WHERE {search_sql}
+         ORDER BY dr_date DESC, dr_no DESC
+         LIMIT {per_page} OFFSET {offset}"
+    )).map_err(|e| e500(&e.to_string()))?;
+
+    let rows: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(search_params.iter()), |r| {
+        Ok(json!({
+            "id":                r.get::<_, i64>(0)?,
+            "dr_no":             r.get::<_, String>(1)?,
+            "dr_year":           r.get::<_, i64>(2)?,
+            "dr_date":           r.get::<_, Option<String>>(3)?,
+            "pax_name":          r.get::<_, Option<String>>(4)?,
+            "passport_no":       r.get::<_, Option<String>>(5)?,
+            "flight_no":         r.get::<_, Option<String>>(6)?,
+            "total_items_value": r.get::<_, Option<f64>>(7)?,
+            "dr_printed":        r.get::<_, Option<String>>(8)?,
+            "os_no":             r.get::<_, Option<String>>(9)?,
+            "os_year":           r.get::<_, Option<i64>>(10)?,
+        }))
+    }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+
+    Ok(Json(json!({ "total": total, "page": page, "per_page": per_page, "items": rows })))
+}
+
+// ── Get single DR ─────────────────────────────────────────────────────────────
+
+pub async fn get_dr(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path((dr_no, dr_year)): Path<(String, i64)>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    let case: Option<Value> = conn.query_row(
+        "SELECT * FROM dr_master WHERE dr_no=? AND dr_year=?",
+        rusqlite::params![dr_no, dr_year],
+        |r| {
+            let n = r.as_ref().column_count();
+            let mut map = serde_json::Map::new();
+            for i in 0..n {
+                let name = r.as_ref().column_name(i).unwrap_or("?").to_string();
+                let val: Value = match r.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null       => Value::Null,
+                    rusqlite::types::ValueRef::Integer(n) => json!(n),
+                    rusqlite::types::ValueRef::Real(f)    => json!(f),
+                    rusqlite::types::ValueRef::Text(s)    => json!(String::from_utf8_lossy(s)),
+                    rusqlite::types::ValueRef::Blob(b)    => json!(String::from_utf8_lossy(b)),
+                };
+                map.insert(name, val);
+            }
+            Ok(Value::Object(map))
+        }
+    ).optional().map_err(|e| e500(&e.to_string()))?;
+
+    let mut case = case.ok_or_else(|| e404("DR not found"))?;
+
+    let items = load_dr_items(&conn, &dr_no, dr_year).map_err(|e| e500(&e.to_string()))?;
+    case["items"] = json!(items);
+
+    Ok(Json(case))
+}
+
+// ── Create DR ─────────────────────────────────────────────────────────────────
+
+pub async fn create_dr(
+    State(pool): Db,
+    _auth: AuthUser,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    let dr_no   = req.get("dr_no").and_then(|v| v.as_str()).ok_or_else(|| e400("dr_no required"))?;
+    let dr_year = req.get("dr_year").and_then(|v| v.as_i64())
+        .unwrap_or_else(|| chrono::Local::now().year() as i64);
+    let today   = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let dr_date = req.get("dr_date").and_then(|v| v.as_str()).unwrap_or(&today);
+
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dr_master WHERE dr_no=? AND dr_year=?",
+        rusqlite::params![dr_no, dr_year], |r| r.get(0)
+    ).unwrap_or(0);
+    if exists > 0 { return Err(e400("DR No. already exists for this year.")); }
+
+    conn.execute(
+        "INSERT INTO dr_master (dr_no, dr_year, dr_date, location_code, pax_name, pax_nationality,
+         passport_no, passport_date, pax_date_of_birth, flight_no, flight_date, booked_by,
+         os_no, os_year, dr_printed, total_items_value)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rusqlite::params![
+            dr_no, dr_year, dr_date,
+            req.get("location_code").and_then(|v| v.as_str()),
+            req.get("pax_name").and_then(|v| v.as_str()),
+            req.get("pax_nationality").and_then(|v| v.as_str()),
+            req.get("passport_no").and_then(|v| v.as_str()),
+            req.get("passport_date").and_then(|v| v.as_str()),
+            req.get("pax_date_of_birth").and_then(|v| v.as_str()),
+            req.get("flight_no").and_then(|v| v.as_str()),
+            req.get("flight_date").and_then(|v| v.as_str()),
+            req.get("booked_by").and_then(|v| v.as_str()),
+            req.get("os_no").and_then(|v| v.as_str()),
+            req.get("os_year").and_then(|v| v.as_i64()),
+            "N",
+            req.get("total_items_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        ],
+    ).map_err(|e| e500(&e.to_string()))?;
+
+    // Save items
+    if let Some(items) = req.get("items").and_then(|v| v.as_array()) {
+        for (i, item) in items.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO dr_items (dr_no, dr_year, items_sno, items_desc, items_qty,
+                 items_uqc, items_value, items_category)
+                 VALUES (?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    dr_no, dr_year, (i + 1) as i64,
+                    item.get("items_desc").and_then(|v| v.as_str()),
+                    item.get("items_qty").and_then(|v| v.as_f64()),
+                    item.get("items_uqc").and_then(|v| v.as_str()),
+                    item.get("items_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    item.get("items_category").and_then(|v| v.as_str()),
+                ],
+            ).map_err(|e| e500(&e.to_string()))?;
+        }
+    }
+
+    Ok(Json(json!({ "message": "DR created.", "dr_no": dr_no, "dr_year": dr_year })))
+}
+
+// ── Mark DR printed ───────────────────────────────────────────────────────────
+
+pub async fn mark_dr_printed(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path((dr_no, dr_year)): Path<(String, i64)>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    conn.execute(
+        "UPDATE dr_master SET dr_printed='Y' WHERE dr_no=? AND dr_year=?",
+        rusqlite::params![dr_no, dr_year],
+    ).map_err(|e| e500(&e.to_string()))?;
+    Ok(Json(json!({ "message": "DR marked as printed." })))
+}
+
+// ── Print DR PDF ──────────────────────────────────────────────────────────────
+
+pub async fn print_dr_pdf(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path((dr_no, dr_year)): Path<(String, i64)>,
+) -> Result<axum::response::Response, Err> {
+    use axum::response::IntoResponse;
+    use axum::http::header;
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    let case: Option<Value> = conn.query_row(
+        "SELECT * FROM dr_master WHERE dr_no=? AND dr_year=?",
+        rusqlite::params![dr_no, dr_year],
+        |r| {
+            let n = r.as_ref().column_count();
+            let mut map = serde_json::Map::new();
+            for i in 0..n {
+                let name = r.as_ref().column_name(i).unwrap_or("?").to_string();
+                let val: Value = match r.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null       => Value::Null,
+                    rusqlite::types::ValueRef::Integer(n) => json!(n),
+                    rusqlite::types::ValueRef::Real(f)    => json!(f),
+                    rusqlite::types::ValueRef::Text(s)    => json!(String::from_utf8_lossy(s)),
+                    rusqlite::types::ValueRef::Blob(b)    => json!(String::from_utf8_lossy(b)),
+                };
+                map.insert(name, val);
+            }
+            Ok(Value::Object(map))
+        }
+    ).optional().map_err(|e| e500(&e.to_string()))?;
+
+    let mut case = case.ok_or_else(|| e404("DR not found"))?;
+    let items = load_dr_items(&conn, &dr_no, dr_year).map_err(|e| e500(&e.to_string()))?;
+    case["items"] = json!(items);
+
+    let pdf_bytes = crate::pdf::generate_dr_pdf(&case)
+        .map_err(|e| e500(&format!("PDF generation failed: {e}")))?;
+
+    Ok((
+        [(header::CONTENT_TYPE, "application/pdf"),
+         (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"DR_{dr_no}_{dr_year}.pdf\""))],
+        pdf_bytes,
+    ).into_response())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn load_dr_items(conn: &rusqlite::Connection, dr_no: &str, dr_year: i64) -> rusqlite::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, dr_no, dr_year, items_sno, items_desc, items_qty, items_uqc,
+                items_value, items_category
+         FROM dr_items WHERE dr_no=? AND dr_year=? ORDER BY items_sno"
+    )?;
+    let rows: Vec<Value> = stmt.query_map(rusqlite::params![dr_no, dr_year], |r| {
+        Ok(json!({
+            "id":           r.get::<_, i64>(0)?,
+            "dr_no":        r.get::<_, String>(1)?,
+            "dr_year":      r.get::<_, i64>(2)?,
+            "items_sno":    r.get::<_, i64>(3)?,
+            "items_desc":   r.get::<_, Option<String>>(4)?,
+            "items_qty":    r.get::<_, Option<f64>>(5)?,
+            "items_uqc":    r.get::<_, Option<String>>(6)?,
+            "items_value":  r.get::<_, Option<f64>>(7)?,
+            "items_category": r.get::<_, Option<String>>(8)?,
+        }))
+    })?.filter_map(|r| r.ok()).collect();
+    Ok(rows)
+}
+
+trait OptYear { fn year(&self) -> i64; }
+impl OptYear for chrono::DateTime<chrono::Local> {
+    fn year(&self) -> i64 { chrono::Datelike::year(self) as i64 }
+}
+
+trait OptionalExt<T> {
+    fn optional(self) -> rusqlite::Result<Option<T>>;
+}
+impl<T> OptionalExt<T> for rusqlite::Result<T> {
+    fn optional(self) -> rusqlite::Result<Option<T>> {
+        match self {
+            Ok(v)  => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}

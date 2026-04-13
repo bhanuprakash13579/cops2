@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "system-ui", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "Helvetica Neue", "Arial", "sans-serif";
+
+  --color-brand-50: #eff6fc;
+  --color-brand-100: #dceaf8;
+  --color-brand-200: #c0dbf2;
+  --color-brand-300: #93c3e8;
+  --color-brand-400: #5fa5db;
+  --color-brand-500: #3c88c9;
+  --color-brand-600: #296bad;
+  --color-brand-700: #21558c;
+  --color-brand-800: #1f4975;
+  --color-brand-900: #1b3d62;
+
+  --color-accent-400: #facc15;
+  --color-accent-500: #eab308;
+  --color-accent-600: #ca8a04;
+
+  --color-bg-primary: #f8fafc;
+  --color-bg-panel: #ffffff;
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+}
+
+@layer base {
+  :root {
+    --background: var(--color-bg-primary);
+    --foreground: var(--color-text-primary);
+  }
+
+  /* scroll-behavior: smooth removed — causes janky/delayed scrolling in
+     nested overflow containers on Windows WebView2 */
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Pointer cursor on all interactive elements */
+  button:not(:disabled),
+  [role="button"],
+  select,
+  label[for],
+  a[href] {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  /* Smooth transitions on interactive elements.
+     Only transition compositor-friendly properties (no layout-triggering ones)
+     to avoid scroll jank. Use will-change sparingly — only on :hover. */
+  button,
+  select,
+  a {
+    /* Only GPU-composited or cheap properties — no box-shadow/opacity
+       which force CPU repaints during hover on scroll */
+    transition: background-color 0.12s ease, color 0.12s ease;
+  }
+
+  /* Press feedback removed — transform on :active causes layout thrashing
+     and interferes with scroll momentum on Windows WebView2 */
+}
+
+@media print {
+  @page {
+    size: 8.5in 14in;
+    margin: 0.35in 0.45in 0.3in 0.45in;
+  }
+  body {
+    background: white !important;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-white border border-slate-200/60 shadow-xl;
+  }
+  .glass-header {
+    /* backdrop-blur removed — it's invisible at 95% opacity but causes scroll jank */
+    @apply bg-brand-900 border-b border-white/10 shadow-lg text-white;
+  }
+  .glass-card {
+    @apply bg-white border border-slate-100 shadow-sm;
+  }
+  .input-field {
+    @apply flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .label-text {
+    @apply text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 text-slate-700;
+  }
+
+  /* Remove number input spinners (modern UX standard) */
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(100%); }
+  to   { opacity: 1; transform: translateX(0); }
+}

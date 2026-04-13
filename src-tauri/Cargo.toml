@@ -1,0 +1,69 @@
+[package]
+name = "cops2"
+version = "3.0.5"
+description = "COPS — Customs Offence Processing System v2"
+authors = ["Customs, Chennai"]
+edition = "2021"
+
+[lib]
+name = "cops2_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri            = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs     = "2"
+tauri-plugin-shell  = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server embedded in Tauri process
+axum             = { version = "0.7", features = ["multipart"] }
+axum-extra       = { version = "0.9", features = ["typed-header"] }
+tower            = "0.4"
+tower-http       = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
+
+# Database — SQLCipher (AES-256 at rest, fully self-contained, no system libs needed)
+# bundled-sqlcipher-vendored-openssl = bundles both SQLCipher + OpenSSL from source.
+# First build is slow (~5-15 min); all subsequent builds use cargo's cache.
+# Raw-key PRAGMA skips PBKDF2 → zero KDF cost at connection open.
+rusqlite         = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "chrono", "backup"] }
+r2d2             = "0.8"
+r2d2_sqlite      = "0.24"
+
+# Auth / crypto
+jsonwebtoken     = "9"
+bcrypt           = "0.15"
+rand             = "0.8"
+sha2             = "0.10"
+pbkdf2           = "0.12"
+
+# Serialization
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+uuid             = { version = "1", features = ["v4"] }
+
+# Time
+chrono           = { version = "0.4", features = ["serde"] }
+
+# PDF — Typst for sub-100ms document compilation
+typst            = "0.13"
+typst-pdf        = "0.13"
+typst-assets     = { version = "0.13", features = ["fonts"] }
+
+# Utility
+anyhow           = "1"
+thiserror        = "1"
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+once_cell        = "1"
+regex            = "1"
+csv              = "1"
+zip              = { version = "2", features = ["aes-crypto"] }
+encoding_rs      = "0.8"
+calamine         = { version = "0.25", features = ["dates"] }
