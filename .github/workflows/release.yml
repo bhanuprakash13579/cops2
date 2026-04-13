@@ -55,6 +55,7 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: false
+          tauriScript: npx tauri
 
   build-ubuntu:
     name: Ubuntu (.deb + AppImage)
@@ -117,3 +118,4 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: false
+          tauriScript: npx tauri
