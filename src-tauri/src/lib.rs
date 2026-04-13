@@ -197,7 +197,7 @@ pub fn run() {
                 }
             };
 
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 axum::serve(
                     tokio::net::TcpListener::from_std(listener).unwrap(),
                     router,
