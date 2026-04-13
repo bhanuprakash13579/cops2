@@ -169,8 +169,23 @@ pub fn run() {
                 .layer(CompressionLayer::new());
 
             // Same port as cops1 so the existing frontend api.ts base URL works.
-            let listener = std::net::TcpListener::bind("127.0.0.1:8000")
-                .expect("port 8000 in use");
+            // If port 8000 is already bound (previous instance still in memory,
+            // or another app), show a dialog and bail out gracefully instead of
+            // panicking with an invisible window.
+            let listener = match std::net::TcpListener::bind("127.0.0.1:8000") {
+                Ok(l) => l,
+                Err(e) => {
+                    // Show the window first so the dialog has a parent.
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.show();
+                    }
+                    return Err(format!(
+                        "Port 8000 is already in use ({e}).\n\n\
+                         Another instance of COPS may already be running.\n\
+                         Please close it and try again."
+                    ).into());
+                }
+            };
 
             tokio::spawn(async move {
                 axum::serve(
