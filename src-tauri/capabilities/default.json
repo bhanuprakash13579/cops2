@@ -10,6 +10,6 @@
     "fs:default",
     "shell:allow-open",
     "updater:default",
-    "process:allow-relaunch"
+    "process:allow-restart"
   ]
 }
