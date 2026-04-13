@@ -40,18 +40,15 @@ export default function Login() {
     setLoading(true);
 
     try {
-      const formData = new URLSearchParams();
-      formData.append('username', username);
-      formData.append('password', password);
-      // Pass the requested module to backend to enforce RBAC during token generation
-      formData.append('module_type', moduleType || '');
-
-      const response = await api.post('/auth/login', formData, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      // cops2 backend expects JSON with { user_id, password }
+      // (cops1 used OAuth2 form-login — this is the Rust equivalent)
+      const response = await api.post('/auth/login', {
+        user_id: username,
+        password: password,
       });
 
-      const { access_token, user } = response.data;
-      login(access_token, user);
+      const { access_token, user_name, user_id, user_role, user_desig, user_status } = response.data;
+      login(access_token, { user_name, user_id, user_role, user_desig, user_status });
 
       // Navigate to the precise module dashboard instead of generic /modules
       if (isSDO) navigate('/sdo');

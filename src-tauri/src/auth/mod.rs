@@ -21,14 +21,27 @@ use crate::config::{JWT_EXPIRY_HOURS, JWT_SECRET};
 
 pub static ADMIN_USERNAME: &str = "sysadmin";
 
-/// Bcrypt hash of admin password.  Resolved once at process startup:
-///   1. ADMIN_PWD_HASH env var  (production — set by build/CI)
-///   2. ADMIN_PASSWORD env var  (dev — plaintext, hashed on first access)
-///   3. None                    (admin login disabled)
+/// Bcrypt hash of admin password.  Resolved once at process startup.
+///
+/// Priority:
+///   1. **Compile-time baked hash** (`ADMIN_PWD_HASH_BAKED` set by `build.rs`)
+///      — this is the production path.  The hash is embedded in the binary
+///      so no environment variable is needed on the user's machine.
+///   2. **Runtime `ADMIN_PASSWORD` env var** (local dev convenience only)
+///      — plaintext, hashed on first access.
+///   3. `None` — admin login is disabled.
+///
+/// To change the production admin password:
+///   1. Update the `ADMIN_PASSWORD` GitHub secret.
+///   2. Push a new tag to trigger CI.  `build.rs` will bake the new hash.
 pub static ADMIN_PWD_HASH: Lazy<Option<String>> = Lazy::new(|| {
-    if let Ok(h) = std::env::var("ADMIN_PWD_HASH") {
-        if !h.is_empty() { return Some(h); }
+    // 1. Compile-time baked hash (production builds via CI)
+    if let Some(h) = option_env!("ADMIN_PWD_HASH_BAKED") {
+        if !h.is_empty() {
+            return Some(h.to_string());
+        }
     }
+    // 2. Runtime env var (local development only)
     if let Ok(p) = std::env::var("ADMIN_PASSWORD") {
         if !p.is_empty() {
             if let Ok(h) = bcrypt::hash(&p, bcrypt::DEFAULT_COST) {
