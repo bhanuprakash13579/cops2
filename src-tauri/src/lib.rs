@@ -113,6 +113,7 @@ fn migrate_cops1(src_path: &Path, dst_path: &Path) -> anyhow::Result<()> {
     );
     Ok(())
 }
+use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
 
@@ -176,7 +177,8 @@ pub fn run() {
                 .allow_methods(Any)
                 .allow_headers(Any);
 
-            let router = api::build_router(pool_clone)
+            let router = Router::new()
+                .nest("/api", api::build_router(pool_clone))
                 .layer(cors)
                 .layer(CompressionLayer::new());
 
