@@ -1,5 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
+import { check, type Update } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { useQuery } from '@tanstack/react-query';
 import { queryKeys, fetchers } from './lib/queries';
 import api from './lib/api';
@@ -26,8 +28,75 @@ function ModuleLoader() {
   );
 }
 
-// Auto-updater not wired in cops2 yet — placeholder returns null
-function AutoUpdater() { return null; }
+// Checks for updates silently in the background 5 seconds after the app is
+// ready. Shows a non-intrusive corner banner only when a newer version exists.
+// All errors are swallowed — a failed update check must never affect the app.
+function AutoUpdater() {
+  const [update, setUpdate]         = useState<Update | null>(null);
+  const [dismissed, setDismissed]   = useState(false);
+  const [installing, setInstalling] = useState(false);
+
+  useEffect(() => {
+    // Only runs inside a real Tauri window — skip in browser dev mode.
+    if (!('__TAURI_INTERNALS__' in window)) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        const result = await check();
+        if (result?.available) setUpdate(result);
+      } catch {
+        // Network down, GitHub unreachable, dev build — all silently ignored.
+      }
+    }, 5_000);
+
+    return () => clearTimeout(timer);
+  }, []);
+
+  const handleInstall = useCallback(async () => {
+    if (!update) return;
+    setInstalling(true);
+    try {
+      await update.downloadAndInstall();
+      await relaunch();
+    } catch {
+      setInstalling(false);
+    }
+  }, [update]);
+
+  if (!update || dismissed) return null;
+
+  return (
+    <div className="fixed bottom-5 right-5 z-[9999] w-80 bg-slate-800 border border-blue-500/60 rounded-xl shadow-2xl p-4 animate-in slide-in-from-bottom-4 fade-in duration-300">
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 flex-shrink-0 w-8 h-8 rounded-full bg-blue-600/20 flex items-center justify-center">
+          <svg className="w-4 h-4 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+          </svg>
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-white text-sm font-semibold">Update available</p>
+          <p className="text-slate-400 text-xs mt-0.5">COPS {update.version} is ready to install.</p>
+          <div className="flex gap-2 mt-3">
+            <button
+              onClick={handleInstall}
+              disabled={installing}
+              className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 disabled:cursor-not-allowed text-white text-xs font-medium py-1.5 rounded-lg transition-colors"
+            >
+              {installing ? 'Installing…' : 'Update & Restart'}
+            </button>
+            <button
+              onClick={() => setDismissed(true)}
+              disabled={installing}
+              className="px-3 text-slate-400 hover:text-slate-200 text-xs transition-colors"
+            >
+              Later
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // SDO-only guard
 function SDORoute({ children }: { children: React.ReactNode }) {

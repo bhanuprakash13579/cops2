@@ -137,6 +137,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // ── Database ──────────────────────────────────────────────────────
             // Use app_local_data_dir (AppData\Local on Windows) to match cops1's
