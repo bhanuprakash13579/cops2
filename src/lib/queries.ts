@@ -53,7 +53,7 @@ export const fetchers = {
   },
 
   osList: async (params: OsListParams) => {
-    const r = await api.get('/os/', { params });
+    const r = await api.get('/os', { params });
     return r.data as { items: any[]; total: number };
   },
 
@@ -63,7 +63,8 @@ export const fetchers = {
   },
 
   offlinePending: async () => {
-    const r = await api.get('/os/offline-pending');
+    // No dedicated /os/offline-pending route — use the OS list with status filter
+    const r = await api.get('/os', { params: { status: 'offline_pending', page: 1, per_page: 200 } });
     return (Array.isArray(r.data) ? r.data : (r.data?.items ?? [])) as any[];
   },
 

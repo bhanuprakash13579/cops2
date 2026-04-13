@@ -683,10 +683,9 @@ export default function OffenceForm() {
     const ctrl = new AbortController();
     const timer = setTimeout(async () => {
       try {
-        const res = await api.get('/os/passports/search', {
-          params: { name: formData.pax_name, dob: formData.pax_date_of_birth },
-          signal: ctrl.signal,
-        });
+        const res = await api.post('/passports/search', {
+          name: formData.pax_name, dob: formData.pax_date_of_birth,
+        }, { signal: ctrl.signal });
         const data = res.data;
         if (data.passports && data.passports.length > 0) {
           const existing = (formData.old_passport_no || '').split(';').map((s: string) => s.trim()).filter(Boolean);
@@ -1060,7 +1059,7 @@ export default function OffenceForm() {
 
         await (isEditing
             ? api.put(`/os/${osNo}/${osYear}`, finalPayload)
-            : api.post('/os/', finalPayload));
+            : api.post('/os', finalPayload));
 
         navigate(goBackPath);
 
@@ -1236,7 +1235,7 @@ export default function OffenceForm() {
                                     osNoCheckTimer.current = setTimeout(async () => {
                                       try {
                                         const yr = formData.os_date ? new Date(formData.os_date).getFullYear() : new Date().getFullYear();
-                                        const { data: result } = await api.get(`/os/check-os-no/${sanitized}/${yr}`);
+                                        const { data: result } = await api.get('/os/check-os-no', { params: { os_no: sanitized, os_year: yr } });
                                         if (result.exists) setFieldError('os_no', `O.S. No. ${sanitized}/${yr} already exists!`);
                                       } catch { /* ignore network errors */ }
                                     }, 500);

@@ -328,10 +328,9 @@ export default function OfflineAdjudicationForm() {
     const ctrl = new AbortController();
     ppLookupAbort.current = ctrl;
     try {
-      const res = await api.get('/os/passports/lookup-by-pp', {
-        params: { passport_no: pp.trim().toUpperCase() },
-        signal: ctrl.signal,
-      });
+      const res = await api.post('/passports/lookup', {
+        passport_no: pp.trim().toUpperCase(),
+      }, { signal: ctrl.signal });
       const data = res.data;
       if (!data || !data.pax_name) return;
 
@@ -369,7 +368,7 @@ export default function OfflineAdjudicationForm() {
     osNoCheckTimer.current = setTimeout(async () => {
       try {
         const yr = formData.os_date ? new Date(formData.os_date).getFullYear() : new Date().getFullYear();
-        const { data: result } = await api.get(`/os/check-os-no/${sanitized}/${yr}`);
+        const { data: result } = await api.get('/os/check-os-no', { params: { os_no: sanitized, os_year: yr } });
         if (result.exists) setFieldError('os_no', `O.S. No. ${sanitized}/${yr} already exists!`);
       } catch { /* ignore */ }
     }, 500);

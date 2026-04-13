@@ -225,7 +225,7 @@ export default function RestoreBackup() {
 
   const toggleDeviceActive = async (id: number, label: string, currentActive: boolean) => {
     try {
-      await api.patch(`/admin/devices/${id}`, { is_active: !currentActive }, { headers: adminHeaders(adminToken) });
+      await api.put(`/admin/devices/${id}`, { is_active: !currentActive }, { headers: adminHeaders(adminToken) });
       setDeviceMsg(`'${label}' ${!currentActive ? 'enabled' : 'disabled'}.`);
       loadDevices();
     } catch (err: any) {
@@ -237,7 +237,7 @@ export default function RestoreBackup() {
     setFlagsLoading(true);
     setFlagsMsg('');
     try {
-      const res = await api.post('/admin/features', { apis_enabled: enable }, { headers: adminHeaders(adminToken) });
+      const res = await api.put('/admin/features', { apis_enabled: enable }, { headers: adminHeaders(adminToken) });
       setApisEnabled(!!res.data.apis_enabled);
       setFlagsMsg(enable ? 'COPS ↔ APIS module enabled.' : 'COPS ↔ APIS module disabled.');
     } catch (err: any) {
@@ -275,7 +275,7 @@ export default function RestoreBackup() {
     setRegLoading(true);
     setRegMsg('');
     try {
-      const res = await api.post('/admin/register-device', {}, { headers: adminHeaders(adminToken) });
+      const res = await api.post('/admin/devices', {}, { headers: adminHeaders(adminToken) });
       setDeviceInfo(res.data);
       setRegMsg('Device registered. This machine is now authorised.');
     } catch (err: any) {

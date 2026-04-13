@@ -43,7 +43,7 @@ export default function UserManagement({ moduleType }: { moduleType: 'sdo' | 'ad
     const finalRole = moduleType === 'sdo' ? 'SDO' : newUser.user_role;
     
     try {
-      await api.post('/auth/users', { ...newUser, user_role: finalRole, user_status: 'ACTIVE' }, { headers: { Authorization: `Bearer ${token}` } });
+      await api.post('/auth/users', { user_name: newUser.user_name, user_desig: newUser.user_desig, user_id: newUser.user_id, password: newUser.user_pwd, user_role: finalRole, user_status: 'ACTIVE' }, { headers: { Authorization: `Bearer ${token}` } });
       setMessage({ type: 'success', text: `User ${newUser.user_id} created successfully!` });
       setNewUser({ user_id: '', user_name: '', user_pwd: '', user_desig: '', user_role: moduleType === 'sdo' ? 'SDO' : 'AC' });
       fetchUsers();
@@ -70,7 +70,7 @@ export default function UserManagement({ moduleType }: { moduleType: 'sdo' | 'ad
   const handleUpgradeRole = async (userId: string) => {
     if (!window.confirm(`Upgrade user ${userId} from AC to DC?`)) return;
     try {
-      await api.put(`/auth/users/${userId}/upgrade-role`, {}, { headers: { Authorization: `Bearer ${token}` } });
+      await api.patch(`/auth/users/${userId}/role`, { user_role: 'DC' }, { headers: { Authorization: `Bearer ${token}` } });
       setMessage({ type: 'success', text: `User ${userId} upgraded to DC.` });
       fetchUsers();
     } catch (err: any) {
