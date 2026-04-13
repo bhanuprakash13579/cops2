@@ -5,7 +5,7 @@ pub static JWT_SECRET: Lazy<String> = Lazy::new(|| {
         .unwrap_or_else(|_| "cops-super-secret-jwt-key-change-in-production".to_string())
 });
 
-pub static APP_VERSION: &str = "3.0.5";
+pub static APP_VERSION: &str = "3.0.6";
 pub static APP_NAME: &str = "COPS";
 pub const JWT_EXPIRY_HOURS: i64 = 12;
 

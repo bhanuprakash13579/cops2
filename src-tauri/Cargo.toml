@@ -1,6 +1,6 @@
 [package]
 name = "cops2"
-version = "3.0.5"
+version = "3.0.6"
 description = "COPS — Customs Offence Processing System v2"
 authors = ["Customs, Chennai"]
 edition = "2021"
