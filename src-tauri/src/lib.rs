@@ -113,7 +113,6 @@ fn migrate_cops1(src_path: &Path, dst_path: &Path) -> anyhow::Result<()> {
     );
     Ok(())
 }
-use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
 
@@ -170,23 +169,24 @@ pub fn run() {
             let pool = Arc::new(pool);
 
             // ── Axum HTTP server embedded in Tauri process ────────────────────
-            // Same REST API shape as cops1 — frontend changes are minimal.
+            // All routes are defined in api/mod.rs and automatically prefixed
+            // with /api.  The frontend's api.ts uses the same port and prefix.
+            // See api/mod.rs for the full architecture documentation.
             let pool_clone = Arc::clone(&pool);
             let cors = CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any);
 
-            let router = Router::new()
-                .nest("/api", api::build_router(pool_clone))
+            let router = api::build_app(pool_clone)
                 .layer(cors)
                 .layer(CompressionLayer::new());
 
-            // Same port as cops1 so the existing frontend api.ts base URL works.
-            // If port 8000 is already bound (previous instance still in memory,
+            // If port is already bound (previous instance still in memory,
             // or another app), show a dialog and bail out gracefully instead of
             // panicking with an invisible window.
-            let listener = match std::net::TcpListener::bind("127.0.0.1:8000") {
+            let bind_addr = format!("127.0.0.1:{}", api::SERVER_PORT);
+            let listener = match std::net::TcpListener::bind(&bind_addr) {
                 Ok(l) => l,
                 Err(e) => {
                     // Show the window first so the dialog has a parent.
@@ -194,9 +194,10 @@ pub fn run() {
                         let _ = win.show();
                     }
                     return Err(format!(
-                        "Port 8000 is already in use ({e}).\n\n\
+                        "Port {} is already in use ({e}).\n\n\
                          Another instance of COPS may already be running.\n\
-                         Please close it and try again."
+                         Please close it and try again.",
+                        api::SERVER_PORT
                     ).into());
                 }
             };
@@ -210,7 +211,7 @@ pub fn run() {
                 .expect("axum server crashed");
             });
 
-            tracing::info!("COPS2 API → http://127.0.0.1:8000");
+            tracing::info!("COPS2 API → http://127.0.0.1:{}{}", api::SERVER_PORT, api::API_PREFIX);
 
             // Show the window now that the backend is ready and the webview has
             // had a chance to paint its first frame.  Starting with visible=false

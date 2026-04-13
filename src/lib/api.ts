@@ -1,17 +1,24 @@
 import axios from 'axios';
 
-// Tauri app (master PC): always use localhost sidecar.
-// Browser clients (LAN PCs): use the same host they navigated to — this
-// automatically resolves to the master PC's IP (e.g. http://192.168.1.100:8000).
+// Resolves the API base URL depending on the runtime environment.
+//
+// The backend Axum server runs on port 8000 with all routes under /api.
+// These values are defined as constants in `src-tauri/src/api/mod.rs`
+// (SERVER_PORT and API_PREFIX).  If you change them there, update them here too.
+//
+//   Tauri app    → http://127.0.0.1:8000/api  (direct to embedded server)
+//   Vite dev     → /api                        (proxied by vite.config.ts)
+//   LAN browser  → same-origin /api            (served by the master PC)
 function _resolveApiUrl(): string {
   if (typeof window === 'undefined') return 'http://127.0.0.1:8000/api';
   const host = window.location.hostname;
   const port = window.location.port;
   // Vite dev server: use relative URL so the Vite proxy handles it (avoids CORS)
   if (port === '5173') return '/api';
-  // Tauri webview always reports hostname as 'localhost', 'tauri.localhost', or
-  // '127.0.0.1' — never a real LAN IP. Use this instead of window.__TAURI__
-  // which may not be injected yet at module-load time.
+  // Tauri v2 WebView origins:
+  //   Linux  (WebKitGTK): tauri://localhost  → hostname = 'localhost'
+  //   Windows (WebView2): https://tauri.localhost → hostname = 'tauri.localhost'
+  //   macOS   (WKWebView): tauri://localhost  → hostname = 'localhost'
   const isTauri = host === 'localhost' || host === 'tauri.localhost' || host === '127.0.0.1';
   if (isTauri) return 'http://127.0.0.1:8000/api';
   // Browser on a LAN client machine — same origin as the page

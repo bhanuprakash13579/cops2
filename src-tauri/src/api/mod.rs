@@ -1,3 +1,20 @@
+//! REST API router for the embedded Axum HTTP server.
+//!
+//! ## Architecture
+//!
+//! All routes defined here are mounted under [`API_PREFIX`] (`/api`) by
+//! [`build_app`].  When adding a new route, define it in `build_routes()`
+//! using a path like `/foo` — it will be served at `/api/foo`.
+//!
+//! The frontend (`src/lib/api.ts`) uses `baseURL = http://127.0.0.1:{SERVER_PORT}/api`,
+//! so every `api.get('/foo')` call hits `http://127.0.0.1:8000/api/foo`.
+//!
+//! ## Adding a new route
+//!
+//! 1. Create a handler in the appropriate submodule (e.g. `offence.rs`).
+//! 2. Add `.route("/your-path", get(module::handler))` inside `build_routes()`.
+//! 3. The `/api` prefix is applied automatically — do NOT add it to the route path.
+
 mod auth;
 mod offence;
 mod masters;
@@ -15,7 +32,26 @@ use std::sync::Arc;
 use axum::{Router, routing::{get, post, put, delete, patch}};
 use crate::db::DbPool;
 
-pub fn build_router(pool: Arc<DbPool>) -> Router {
+/// The URL prefix for all API routes.  The frontend's `api.ts` must use the
+/// same prefix in its `baseURL`.  Change this in ONE place and both sides
+/// stay in sync (the frontend reads `http://127.0.0.1:{SERVER_PORT}{API_PREFIX}`).
+pub const API_PREFIX: &str = "/api";
+
+/// The port the embedded HTTP server listens on.  Must match the port in
+/// `src/lib/api.ts` (`_resolveApiUrl`).
+pub const SERVER_PORT: u16 = 8000;
+
+/// Build the full application router with the `/api` prefix applied.
+///
+/// This is the entry point called from `lib.rs`.  It wraps all routes under
+/// [`API_PREFIX`] so callers don't need to remember to nest manually.
+pub fn build_app(pool: Arc<DbPool>) -> Router {
+    Router::new().nest(API_PREFIX, build_routes(pool))
+}
+
+/// Internal: all API routes WITHOUT the `/api` prefix.
+/// The prefix is applied by [`build_app`] above.
+fn build_routes(pool: Arc<DbPool>) -> Router<()> {
     Router::new()
         // ── Auth (regular users) ──────────────────────────────────────────────
         .route("/auth/login",                    post(auth::login))
