@@ -44,8 +44,73 @@ jobs:
             ## COPS — Customs Offence Processing System
 
             ### Installation
-            - Download `COPS_x.x.x_x64-setup.exe` and run it on your Windows machine.
-            - If upgrading from OS_module_upgrade (cops1), the existing database will be automatically detected and migrated on first launch.
+            **Windows:** Download `COPS_x.x.x_x64-setup.exe` and run it.
+            **Ubuntu/Debian:** Download `cops_x.x.x_amd64.deb` and run `sudo dpkg -i cops_x.x.x_amd64.deb`.
+            **Linux (other):** Download the `.AppImage`, make it executable (`chmod +x`), and run it directly.
+
+            If upgrading from OS_module_upgrade (cops1), the existing database will be automatically detected and migrated on first launch.
+
+            ### What's new
+            See commit history for full details.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: false
+
+  build-ubuntu:
+    name: Ubuntu (.deb + AppImage)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'COPS v__VERSION__'
+          releaseBody: |
+            ## COPS — Customs Offence Processing System
+
+            ### Installation
+            **Windows:** Download `COPS_x.x.x_x64-setup.exe` and run it.
+            **Ubuntu/Debian:** Download `cops_x.x.x_amd64.deb` and run `sudo dpkg -i cops_x.x.x_amd64.deb`.
+            **Linux (other):** Download the `.AppImage`, make it executable (`chmod +x`), and run it directly.
+
+            If upgrading from OS_module_upgrade (cops1), the existing database will be automatically detected and migrated on first launch.
 
             ### What's new
             See commit history for full details.
