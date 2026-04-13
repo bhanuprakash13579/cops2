@@ -129,8 +129,13 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // ── Database ──────────────────────────────────────────────────────
-            let app_data = app.path().app_data_dir()
-                .expect("failed to get app data dir");
+            // Use app_local_data_dir (AppData\Local on Windows) to match cops1's
+            // storage location exactly.  cops1 stores cops_br_database.db there,
+            // so using the same directory means the first-boot migration finds it
+            // without any cross-directory searching.
+            // On Linux/macOS app_local_data_dir == app_data_dir, so no difference.
+            let app_data = app.path().app_local_data_dir()
+                .expect("failed to get app local data dir");
             std::fs::create_dir_all(&app_data)?;
 
             let db_path = resolve_db_path(&app_data);
