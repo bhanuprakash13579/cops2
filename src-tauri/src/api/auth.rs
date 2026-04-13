@@ -223,7 +223,7 @@ pub async fn admin_login(Json(req): Json<serde_json::Value>) -> Result<Json<Valu
     }
 
     let hash = ADMIN_PWD_HASH.as_deref().ok_or_else(|| {
-        err500("Admin password not configured. Set ADMIN_PASSWORD or ADMIN_PWD_HASH environment variable.")
+        err500("Admin password not configured. Rebuild with ADMIN_PASSWORD env var set.")
     })?;
 
     if !verify(password, hash).unwrap_or(false) {

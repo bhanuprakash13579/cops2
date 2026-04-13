@@ -43,6 +43,7 @@ interface AllowedDeviceRow {
 }
 
 interface UserRow {
+  id: number;
   user_id: string;
   user_name: string;
   user_desig: string;
@@ -88,7 +89,7 @@ export default function RestoreBackup() {
   const [createMsg, setCreateMsg] = useState('');
 
   // Edit user
-  const [editId, setEditId] = useState('');
+  const [editId, setEditId] = useState<number | null>(null);
   const [editData, setEditData] = useState({ user_name: '', user_desig: '', user_pwd: '', user_role: '', user_status: '' });
   const [showEditPwd, setShowEditPwd] = useState(false);
   const [editMsg, setEditMsg] = useState('');
@@ -291,7 +292,14 @@ export default function RestoreBackup() {
     setCreateErr('');
     setCreateMsg('');
     try {
-      await api.post('/admin/users', newUser, { headers: adminHeaders(adminToken) });
+      // Backend CreateUserRequest expects 'password', not 'user_pwd'
+      await api.post('/admin/users', {
+        user_name: newUser.user_name,
+        user_desig: newUser.user_desig || null,
+        user_id: newUser.user_id,
+        password: newUser.user_pwd,
+        user_role: newUser.user_role,
+      }, { headers: adminHeaders(adminToken) });
       setCreateMsg(`User '${newUser.user_id}' created.`);
       setNewUser({ user_id: '', user_name: '', user_desig: '', user_pwd: '', user_role: 'SDO' });
       setShowCreate(false);
@@ -308,31 +316,32 @@ export default function RestoreBackup() {
     const payload: any = {};
     if (editData.user_name)   payload.user_name   = editData.user_name;
     if (editData.user_desig)  payload.user_desig  = editData.user_desig;
-    if (editData.user_pwd)    payload.user_pwd    = editData.user_pwd;
+    if (editData.user_pwd)    payload.password    = editData.user_pwd;
     if (editData.user_role)   payload.user_role   = editData.user_role;
     if (editData.user_status) payload.user_status = editData.user_status;
     try {
-      await api.patch(`/admin/users/${encodeURIComponent(editId)}`, payload, { headers: adminHeaders(adminToken) });
+      // Backend uses numeric id (Path<i64>), not user_id string
+      await api.patch(`/admin/users/${editId}`, payload, { headers: adminHeaders(adminToken) });
       setEditMsg('Saved.');
-      setEditId('');
+      setEditId(null);
       loadUsers();
     } catch (err: any) {
       setEditMsg(err.response?.data?.detail || 'Update failed.');
     }
   };
 
-  const closeUser = async (userId: string) => {
-    if (!confirm(`Close account for ${userId}?`)) return;
+  const closeUser = async (id: number) => {
+    if (!confirm(`Close this account?`)) return;
     try {
-      await api.delete(`/admin/users/${encodeURIComponent(userId)}`, { headers: adminHeaders(adminToken) });
+      await api.delete(`/admin/users/${id}`, { headers: adminHeaders(adminToken) });
       loadUsers();
     } catch { }
   };
 
-  const hardDeleteUser = async (userId: string) => {
-    if (!confirm(`Permanently delete account ${userId}?\n\nThis completely removes it from the list. (OS records created by this user will remain safe).`)) return;
+  const hardDeleteUser = async (id: number) => {
+    if (!confirm(`Permanently delete this account?\n\nThis completely removes it from the list. (OS records created by this user will remain safe).`)) return;
     try {
-      await api.delete(`/admin/users/${encodeURIComponent(userId)}/hard`, { headers: adminHeaders(adminToken) });
+      await api.delete(`/admin/users/${id}/hard`, { headers: adminHeaders(adminToken) });
       loadUsers();
     } catch (err: any) {
       alert(err.response?.data?.detail || 'Failed to delete user.');
@@ -1005,24 +1014,24 @@ export default function RestoreBackup() {
                         </td>
                         <td className="py-2 px-2 flex gap-1 justify-end">
                           <button onClick={() => {
-                            setEditId(u.user_id);
+                            setEditId(u.id);
                             setEditData({ user_name: u.user_name, user_desig: u.user_desig, user_pwd: '', user_role: u.user_role, user_status: u.user_status });
                             setEditMsg(''); setShowEditPwd(false);
                           }} className="p-1 rounded hover:bg-slate-100" title="Edit User">
                             <Pencil size={12} className="text-slate-500" />
                           </button>
                           {u.user_status === 'ACTIVE' ? (
-                            <button onClick={() => closeUser(u.user_id)} className="p-1 rounded hover:bg-amber-50" title="Close Account">
+                            <button onClick={() => closeUser(u.id)} className="p-1 rounded hover:bg-amber-50" title="Close Account">
                               <X size={12} className="text-amber-500" />
                             </button>
                           ) : (
-                            <button onClick={() => hardDeleteUser(u.user_id)} className="p-1 rounded hover:bg-red-100" title="Permanently Delete">
+                            <button onClick={() => hardDeleteUser(u.id)} className="p-1 rounded hover:bg-red-100" title="Permanently Delete">
                               <ShieldAlert size={12} className="text-red-700" />
                             </button>
                           )}
                         </td>
                       </tr>
-                      {editId === u.user_id && (
+                      {editId === u.id && (
                         <tr key={`edit-${u.user_id}`} className="bg-slate-50">
                           <td colSpan={5} className="px-2 py-3">
                             <form onSubmit={saveEdit} className="grid grid-cols-2 gap-2">
@@ -1050,7 +1059,7 @@ export default function RestoreBackup() {
                               </select>
                               <div className="flex gap-2 items-center">
                                 <button type="submit" className="px-3 py-1 text-xs rounded bg-slate-800 text-white hover:bg-slate-700">Save</button>
-                                <button type="button" onClick={() => setEditId('')} className="px-3 py-1 text-xs rounded bg-slate-200 hover:bg-slate-300">Cancel</button>
+                                <button type="button" onClick={() => setEditId(null)} className="px-3 py-1 text-xs rounded bg-slate-200 hover:bg-slate-300">Cancel</button>
                                 {editMsg && <span className="text-xs text-emerald-700">{editMsg}</span>}
                               </div>
                             </form>
