@@ -118,6 +118,16 @@ use tower_http::compression::CompressionLayer;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Linux/Wayland compatibility ───────────────────────────────────────────
+    // Force X11 backend and disable DMA-BUF renderer so WebKit2GTK works on
+    // both X11 and Wayland sessions (including GNOME on Ubuntu 22.04/24.04).
+    // Without these, the app silently fails to open on many Wayland desktops.
+    #[cfg(target_os = "linux")]
+    {
+        std::env::set_var("GDK_BACKEND", "x11");
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter("cops2=debug")
         .init();
