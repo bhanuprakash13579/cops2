@@ -15,8 +15,9 @@ use tauri::Manager;
 /// Priority:
 ///   1. `cops.db`  — cops2's own database (created on first run, or already exists)
 ///   2. `cops_br_database.db` — cops1's database in the same app-data directory.
-///      If it exists and is a plain (unencrypted) SQLite file, it is copied into
-///      `cops.db` via the rusqlite backup API so cops2 starts with all existing data.
+///      If it exists, it is migrated into `cops.db` (handling both plain and
+///      encrypted cops1 formats).  After successful migration the old cops1
+///      database is securely wiped so sensitive data never sits unencrypted.
 ///   3. Fresh install — `cops.db` will be created empty by `create_pool`.
 fn resolve_db_path(app_data: &Path) -> PathBuf {
     let cops2_db  = app_data.join("cops.db");
@@ -28,18 +29,24 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
         return cops2_db;
     }
 
-    // Check for cops1 database (plain SQLite — encrypted databases are skipped).
+    // Check for cops1 database (handles both plain and encrypted).
     if cops1_db.exists() {
         tracing::info!("Found cops1 database at {:?} — attempting migration…", cops1_db);
         match migrate_cops1(&cops1_db, &cops2_db) {
             Ok(()) => {
                 tracing::info!("cops1 → cops2 migration complete. Using {:?}", cops2_db);
+
+                // ── SECURITY: Wipe old cops1 database ─────────────────────
+                // The old DB may be plain-text (unencrypted) — a security
+                // threat for sensitive customs data.  Overwrite with zeros
+                // then delete so it can't be recovered.
+                secure_delete_cops1_files(app_data);
+
                 return cops2_db;
             }
             Err(e) => {
                 tracing::warn!(
                     "cops1 migration skipped ({}). \
-                     Likely encrypted with SQLCipher — starting fresh. \
                      Use the admin panel to restore from a cops1 backup.",
                     e
                 );
@@ -49,6 +56,52 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
     }
 
     cops2_db
+}
+
+/// Securely wipe old cops1 database files after successful migration.
+///
+/// Steps:
+///   1. Overwrite the file with zeros (prevents casual undelete recovery).
+///   2. Delete the zeroed file.
+///   3. Remove associated WAL/SHM journal files.
+///   4. Remove the `.enc.bak` backup copy if present.
+fn secure_delete_cops1_files(app_data: &Path) {
+    let files_to_wipe = [
+        "cops_br_database.db",
+        "cops_br_database.db-wal",
+        "cops_br_database.db-shm",
+        "cops_br_database.db.enc.bak",
+    ];
+
+    for name in &files_to_wipe {
+        let path = app_data.join(name);
+        if !path.exists() { continue; }
+
+        // Overwrite with zeros for security
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let size = meta.len();
+            if size > 0 {
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                    use std::io::Write;
+                    let zeros = vec![0u8; 65536]; // 64 KB chunks
+                    let mut remaining = size;
+                    while remaining > 0 {
+                        let chunk = remaining.min(zeros.len() as u64) as usize;
+                        if f.write_all(&zeros[..chunk]).is_err() { break; }
+                        remaining -= chunk as u64;
+                    }
+                    let _ = f.flush();
+                    let _ = f.sync_all();
+                }
+            }
+        }
+
+        // Delete the zeroed file
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!("Securely wiped old cops1 file: {name}"),
+            Err(e) => tracing::warn!("Could not delete {name}: {e}"),
+        }
+    }
 }
 
 /// Open the cops1 database for reading, handling both plain and encrypted files.
