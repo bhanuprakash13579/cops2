@@ -168,6 +168,74 @@ fn migrate_cops1(src_path: &Path, dst_path: &Path) -> anyhow::Result<()> {
 }
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
+use tauri::Emitter;
+
+// ── Windows-only: raw Win32 FFI (no extra crate — user32.dll is always present)
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::ffi::c_void;
+    pub type HWND   = *mut c_void;
+    pub type LPARAM = isize;
+    pub type BOOL   = i32;
+    pub const GWL_EXSTYLE:      i32 = -20;
+    pub const WS_EX_TOOLWINDOW: i32 = 0x0000_0080_u32 as i32;
+    pub const WS_EX_APPWINDOW:  i32 = 0x0004_0000_u32 as i32;
+    /// Show without activating — foreground app keeps focus.
+    pub const SW_SHOWNOACTIVATE: i32 = 4;
+    pub const TRUE: BOOL = 1;
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
+        pub fn GetWindowLongW(hwnd: HWND, n_index: i32) -> i32;
+        pub fn SetWindowLongW(hwnd: HWND, n_index: i32, dw_new_long: i32) -> i32;
+        pub fn GetClassNameW(hwnd: HWND, lp_class_name: *mut u16, n_max_count: i32) -> i32;
+        pub fn EnumChildWindows(
+            hwnd_parent:  HWND,
+            lp_enum_func: Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>,
+            l_param:      LPARAM,
+        ) -> BOOL;
+    }
+}
+
+// ── Tauri command: show window without stealing focus on Windows ───────────────
+// Called by main.tsx once the webview has painted its first frame.
+// On Windows uses SW_SHOWNOACTIVATE so COPS appears without yanking focus from
+// Chrome or other apps.  On Linux/macOS falls back to normal show().
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                win32::ShowWindow(hwnd as usize as win32::HWND, win32::SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = window.show(); }
+}
+
+// ── Windows helper: hide WebView2 child window from taskbar grouping ──────────
+// WebView2 creates Chrome_WidgetWin_1 under the Tauri HWND. Windows 11 DWM
+// shows it as a second thumbnail (the "double tab" effect). Setting
+// WS_EX_TOOLWINDOW on it removes it from the taskbar group.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn hide_webview2_thumbnail(
+    hwnd: win32::HWND, _: win32::LPARAM,
+) -> win32::BOOL {
+    let mut buf = [0u16; 256];
+    let len = win32::GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+    if len > 0 {
+        let class = String::from_utf16_lossy(&buf[..len as usize]);
+        if class.starts_with("Chrome_WidgetWin") {
+            let ex = win32::GetWindowLongW(hwnd, win32::GWL_EXSTYLE);
+            win32::SetWindowLongW(hwnd, win32::GWL_EXSTYLE,
+                (ex | win32::WS_EX_TOOLWINDOW) & !win32::WS_EX_APPWINDOW);
+        }
+    }
+    win32::TRUE
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -186,6 +254,7 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![show_main_window])
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -195,36 +264,81 @@ pub fn run() {
         .setup(|app| {
             // ── Database ──────────────────────────────────────────────────────
             // Use app_local_data_dir (AppData\Local on Windows) to match cops1's
-            // storage location exactly.  cops1 stores cops_br_database.db there,
-            // so using the same directory means the first-boot migration finds it
-            // without any cross-directory searching.
-            // On Linux/macOS app_local_data_dir == app_data_dir, so no difference.
-            let app_data = app.path().app_local_data_dir()
-                .expect("failed to get app local data dir");
-            std::fs::create_dir_all(&app_data)?;
+            // storage location exactly — cops1 stores cops_br_database.db there.
+            // On Linux/macOS app_local_data_dir == app_data_dir.
+            let app_data = match app.path().app_local_data_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[cops2] FATAL: cannot resolve app data dir: {e}");
+                    let _ = app.handle().emit("sidecar-startup-failed",
+                        format!("Cannot determine app data directory: {e}. Try reinstalling COPS."));
+                    return Ok(());
+                }
+            };
+
+            if let Err(e) = std::fs::create_dir_all(&app_data) {
+                eprintln!("[cops2] FATAL: cannot create app data dir: {e}");
+                let _ = app.handle().emit("sidecar-startup-failed",
+                    format!("Cannot create app data directory: {e}. Check folder permissions."));
+                return Ok(());
+            }
 
             let db_path = resolve_db_path(&app_data);
 
             // ── Detect and encrypt existing plain-SQLite databases ─────────────
-            // If cops2 has a plain (unencrypted) database from an earlier build
-            // before SQLCipher was added, encrypt it in-place now.
             if db_path.exists() && security::is_plain_sqlite(&db_path) {
                 tracing::info!("Detected plain-SQLite database — encrypting in-place…");
-                security::encrypt_plain_db_inplace(&db_path)
-                    .expect("failed to encrypt existing plain database");
+                if let Err(e) = security::encrypt_plain_db_inplace(&db_path) {
+                    eprintln!("[cops2] FATAL: in-place DB encryption failed: {e}");
+                    let _ = app.handle().emit("sidecar-startup-failed",
+                        format!("Database encryption failed: {e}. Contact support."));
+                    return Ok(());
+                }
             }
 
-            let pool = db::create_pool(&db_path)
-                .expect("failed to create database pool");
-            db::run_migrations(&pool)
-                .expect("failed to run migrations");
+            let pool = match db::create_pool(&db_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[cops2] FATAL: cannot open database: {e}");
+                    let _ = app.handle().emit("sidecar-startup-failed",
+                        format!("Cannot open database: {e}. \
+                            The database file may be corrupt. Try restoring from a backup."));
+                    return Ok(());
+                }
+            };
+
+            if let Err(e) = db::run_migrations(&pool) {
+                eprintln!("[cops2] FATAL: migrations failed: {e}");
+                let _ = app.handle().emit("sidecar-startup-failed",
+                    format!("Database migration failed: {e}. Try reinstalling COPS."));
+                return Ok(());
+            }
 
             let pool = Arc::new(pool);
 
+            // ── Windows: fix WebView2 double-taskbar thumbnail ────────────────
+            // After 800 ms (WebView2 init time), enumerate child windows and set
+            // WS_EX_TOOLWINDOW on Chrome_WidgetWin_* to hide them from the
+            // taskbar group so only one thumbnail appears on hover.
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(main_win) = app.get_webview_window("main") {
+                    if let Ok(main_hwnd) = main_win.hwnd() {
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                            unsafe {
+                                win32::EnumChildWindows(
+                                    main_hwnd as usize as win32::HWND,
+                                    Some(hide_webview2_thumbnail),
+                                    0,
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+
             // ── Axum HTTP server embedded in Tauri process ────────────────────
-            // All routes are defined in api/mod.rs and automatically prefixed
-            // with /api.  The frontend's api.ts uses the same port and prefix.
-            // See api/mod.rs for the full architecture documentation.
             let pool_clone = Arc::clone(&pool);
             let cors = CorsLayer::new()
                 .allow_origin(Any)
@@ -235,17 +349,12 @@ pub fn run() {
                 .layer(cors)
                 .layer(CompressionLayer::new());
 
-            // If port is already bound (previous instance still in memory,
-            // or another app), show a dialog and bail out gracefully instead of
-            // panicking with an invisible window.
+            // If port is already bound (another instance running), show the
+            // window so the user can see the error dialog, then bail.
             let bind_addr = format!("127.0.0.1:{}", api::SERVER_PORT);
             let listener = match std::net::TcpListener::bind(&bind_addr) {
                 Ok(l) => l,
                 Err(e) => {
-                    // Show the window first so the dialog has a parent.
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.show();
-                    }
                     return Err(format!(
                         "Port {} is already in use ({e}).\n\n\
                          Another instance of COPS may already be running.\n\
@@ -255,25 +364,33 @@ pub fn run() {
                 }
             };
 
+            let app_handle_for_axum = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                axum::serve(
-                    tokio::net::TcpListener::from_std(listener).unwrap(),
-                    router,
-                )
-                .await
-                .expect("axum server crashed");
+                let tcp = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("[cops2] FATAL: TcpListener conversion failed: {e}");
+                        let _ = app_handle_for_axum.emit("sidecar-startup-failed",
+                            format!("Internal server error: {e}. Please restart COPS."));
+                        return;
+                    }
+                };
+                if let Err(e) = axum::serve(tcp, router).await {
+                    eprintln!("[cops2] Axum server stopped: {e}");
+                    let _ = app_handle_for_axum.emit("sidecar-startup-failed",
+                        format!("The internal API server stopped unexpectedly: {e}. Please restart COPS."));
+                }
             });
 
             tracing::info!("COPS2 API → http://127.0.0.1:{}{}", api::SERVER_PORT, api::API_PREFIX);
 
-            // Show the window now that the backend is ready and the webview has
-            // had a chance to paint its first frame.  Starting with visible=false
-            // prevents the split-second where Windows DWM sees the native host
-            // frame and the WebView2 compositor surface as two separate surfaces
-            // (the "two screens" taskbar thumbnail flicker on Windows 11).
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-            }
+            // ── Window show is handled from JS (main.tsx → show_main_window) ──
+            // DO NOT call win.show() here. setup() runs before the webview
+            // renders its first frame, so showing here causes a white-flash DWM
+            // flicker on Windows (visible: false provides no benefit if you show
+            // before WebView2 paints).  The JS-side call in main.tsx fires after
+            // React renders and uses SW_SHOWNOACTIVATE on Windows so COPS appears
+            // without stealing focus from other apps.
 
             Ok(())
         })
