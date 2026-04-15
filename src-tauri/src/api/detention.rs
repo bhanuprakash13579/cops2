@@ -133,12 +133,13 @@ pub async fn create_dr(
     conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
     let write_result: Result<(), Err> = (|| {
         conn.execute(
-            "INSERT INTO dr_master (dr_no, dr_year, dr_date, location_code, pax_name, pax_nationality,
+            "INSERT INTO dr_master (dr_no, dr_year, dr_date, dr_type, location_code, pax_name, pax_nationality,
              passport_no, passport_date, pax_date_of_birth, flight_no, flight_date, booked_by,
              os_no, os_year, dr_printed, total_items_value)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rusqlite::params![
                 dr_no, dr_year, dr_date,
+                req.get("dr_type").and_then(|v| v.as_str()).unwrap_or("GOODS"),
                 req.get("location_code").and_then(|v| v.as_str()),
                 req.get("pax_name").and_then(|v| v.as_str()),
                 req.get("pax_nationality").and_then(|v| v.as_str()),

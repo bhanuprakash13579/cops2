@@ -272,6 +272,35 @@ fn match_passengers(conn: &rusqlite::Connection, passengers: &[Passenger]) -> Re
         })
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
+    // Bulk-load ALL items for ALL cases in one query — avoids an N×M query loop
+    // (previously load_case_items was called once per match, per passenger).
+    let mut all_items: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    if let Ok(mut istmt) = conn.prepare(
+        "SELECT os_no, os_year, items_sno, items_desc, items_qty, items_uqc, items_value, items_duty
+         FROM cops_items WHERE entry_deleted='N' ORDER BY os_no, os_year, items_sno"
+    ) {
+        let _ = istmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                json!({
+                    "sno":   r.get::<_, Option<i64>>(2)?,
+                    "desc":  r.get::<_, Option<String>>(3)?,
+                    "qty":   r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    "uqc":   r.get::<_, Option<String>>(5)?,
+                    "value": r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                    "duty":  r.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                }),
+            ))
+        }).map(|rows| {
+            for row in rows.filter_map(|r| r.ok()) {
+                let (os_no, _, item) = row;
+                all_items.entry(os_no).or_default().push(item);
+            }
+        });
+    }
+
     let mut results: Vec<Value> = Vec::new();
 
     for pax in passengers {
@@ -307,9 +336,7 @@ fn match_passengers(conn: &rusqlite::Connection, passengers: &[Passenger]) -> Re
 
             if score < 0.6 { continue; }
 
-            // Load items for this case
-            let items = load_case_items(conn, &case.os_no, case.os_year.unwrap_or(0))
-                .unwrap_or_default();
+            let items = all_items.get(&case.os_no).cloned().unwrap_or_default();
 
             cops_matches.push(json!({
                 "cops_id":           case.id,
@@ -360,27 +387,6 @@ fn match_passengers(conn: &rusqlite::Connection, passengers: &[Passenger]) -> Re
     }
 
     Ok(results)
-}
-
-// ── Load seized items for a single COPS case ─────────────────────────────────
-
-fn load_case_items(conn: &rusqlite::Connection, os_no: &str, os_year: i64) -> rusqlite::Result<Vec<Value>> {
-    let mut stmt = conn.prepare(
-        "SELECT items_sno, items_desc, items_qty, items_uqc, items_value, items_duty
-         FROM cops_items WHERE os_no=? AND os_year=? AND entry_deleted='N'
-         ORDER BY items_sno"
-    )?;
-    let rows: Vec<Value> = stmt.query_map(rusqlite::params![os_no, os_year], |r| {
-        Ok(json!({
-            "sno":   r.get::<_, Option<i64>>(0)?,
-            "desc":  r.get::<_, Option<String>>(1)?,
-            "qty":   r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-            "uqc":   r.get::<_, Option<String>>(3)?,
-            "value": r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-            "duty":  r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-        }))
-    })?.filter_map(|r| r.ok()).collect();
-    Ok(rows)
 }
 
 // ── Name similarity (Jaccard token overlap) ───────────────────────────────────

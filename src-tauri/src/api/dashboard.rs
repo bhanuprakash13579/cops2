@@ -21,13 +21,23 @@ pub async fn stats(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err>
         [], |r| r.get(0)
     ).unwrap_or(0);
 
+    // Mirrors sidebar_counts: only count cases that actually have pending items
+    // (items_release_category IN ('Under OS','Under Duty')).  Without this guard
+    // the dashboard count exceeds the adjudication queue count.
     let pending_os: i64 = conn.query_row(
         "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
          AND adjudication_date IS NULL AND adj_offr_name IS NULL
          AND (adjn_offr_remarks IS NULL OR adjn_offr_remarks='')
          AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y')
          AND (is_offline_adjudication IS NULL OR is_offline_adjudication!='Y')
-         AND (is_legacy IS NULL OR is_legacy!='Y')",
+         AND (is_legacy IS NULL OR is_legacy!='Y')
+         AND EXISTS (
+             SELECT 1 FROM cops_items ci
+             WHERE ci.os_no = cops_master.os_no
+               AND ci.os_year = cops_master.os_year
+               AND ci.items_release_category IN ('Under OS', 'Under Duty')
+               AND (ci.entry_deleted IS NULL OR ci.entry_deleted != 'Y')
+         )",
         [], |r| r.get(0)
     ).unwrap_or(0);
 

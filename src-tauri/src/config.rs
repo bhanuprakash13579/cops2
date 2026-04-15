@@ -57,7 +57,7 @@ fn hostname() -> String {
         .to_lowercase()
 }
 
-pub static APP_VERSION: &str = "3.0.6";
+pub static APP_VERSION: &str = "3.0.7";
 pub static APP_NAME: &str = "COPS";
 pub const JWT_EXPIRY_HOURS: i64 = 12;
 

@@ -135,7 +135,7 @@ fn generate_os_register(conn: &rusqlite::Connection, from: &str, to: &str) -> Re
 fn generate_dr_register(conn: &rusqlite::Connection, from: &str, to: &str) -> Result<(String, String), Err> {
     let mut stmt = conn.prepare(
         "SELECT dr_no, dr_year, dr_date, pax_name, passport_no, pax_nationality,
-                pax_date_of_birth, flight_no, flight_date, location_code, login_id,
+                pax_date_of_birth, flight_no, flight_date, location_code, booked_by,
                 total_items_value, dr_printed, os_no, os_year
          FROM dr_master WHERE dr_date >= ? AND dr_date <= ? AND entry_deleted='N'
          ORDER BY dr_date, dr_no"

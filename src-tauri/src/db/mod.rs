@@ -43,6 +43,13 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
     let col_migrations = [
         ("cops_master",         "adjn_section_ref", "TEXT"),
         ("cops_master_deleted", "adjn_section_ref", "TEXT"),
+        // dr_master: columns added in cops2 that were missing from the original cops1 schema
+        ("dr_master", "pax_nationality", "VARCHAR(100)"),
+        ("dr_master", "booked_by",       "VARCHAR(200)"),
+        ("dr_master", "os_year",         "INTEGER"),
+        // dr_items: columns added in cops2 that were missing from the original cops1 schema
+        ("dr_items",  "dr_year",         "INTEGER"),
+        ("dr_items",  "items_category",  "VARCHAR(50)"),
     ];
     for (table, col, col_type) in &col_migrations {
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type);

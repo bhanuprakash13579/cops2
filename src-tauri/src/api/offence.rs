@@ -544,6 +544,11 @@ pub async fn delete_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
 
     if adj_date.is_some() { return Err(e400("Cannot delete an adjudicated case via this route.")); }
 
+    // Archive + soft-delete in a single transaction so a crash between the two
+    // operations cannot leave a record permanently stuck in limbo.
+    conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+    let write_result: Result<(), Err> = (|| {
+
     // Archive snapshot: explicit column list because cops_master has more columns
     // (shift, detention_date, case_type, is_draft, quashed, rejected, etc.) than
     // cops_master_deleted.  SELECT * would produce a column-count mismatch error.
@@ -596,6 +601,13 @@ pub async fn delete_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
         "UPDATE cops_items SET entry_deleted='Y' WHERE os_no=? AND os_year=?",
         rusqlite::params![os_no, os_year],
     ).map_err(|e| e500(&e.to_string()))?;
+
+    Ok(())
+    })();
+    match write_result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?,
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+    }
 
     Ok(Json(json!({ "message": "O/S case deleted.", "os_no": os_no, "os_year": os_year })))
 }
@@ -669,17 +681,28 @@ pub async fn complete_offline(State(pool): Db, auth: AdjnUser, Path((os_no, os_y
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
+    // Compute total_payable the same way adjudicate() does
+    let base_duty: f64 = conn.query_row(
+        "SELECT COALESCE(total_duty_amount, 0) FROM cops_master WHERE os_no=? AND os_year=?",
+        rusqlite::params![os_no, os_year], |r| r.get(0)
+    ).unwrap_or(0.0);
+    let rf   = req.rf_amount.unwrap_or(0.0);
+    let pp   = req.pp_amount.unwrap_or(0.0);
+    let refv = req.ref_amount.unwrap_or(0.0);
+    let total_payable = base_duty + rf + pp + refv;
+
     conn.execute(
         "UPDATE cops_master SET adj_offr_name=?, adj_offr_designation=?, adjudication_date=?,
          adjudication_time=?, adjn_offr_remarks=?, rf_amount=?, pp_amount=?, ref_amount=?,
-         confiscated_value=?, redeemed_value=?, re_export_value=?, closure_ind=?
+         confiscated_value=?, redeemed_value=?, re_export_value=?, total_payable=?, closure_ind=?
          WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![
             req.adj_offr_name, req.adj_offr_designation,
             req.adjudication_date.unwrap_or(today), now_ts,
-            req.adjn_offr_remarks, req.rf_amount.unwrap_or(0.0), req.pp_amount.unwrap_or(0.0),
-            req.ref_amount.unwrap_or(0.0), req.confiscated_value.unwrap_or(0.0),
+            req.adjn_offr_remarks, rf, pp, refv,
+            req.confiscated_value.unwrap_or(0.0),
             req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),
+            total_payable,
             if req.close_case.unwrap_or(false) { Some("Y") } else { None },
             os_no, os_year,
         ],
@@ -699,10 +722,59 @@ pub async fn quash_os(State(pool): Db, auth: AdjnUser, Path((os_no, os_year)): P
     if adj_date.is_none() { return Err(e400("Cannot quash an un-adjudicated case.")); }
     if !within_edit_window(&adj_time) { return Err(e400("24-hour deletion window has expired.")); }
 
-    conn.execute("DELETE FROM cops_items WHERE os_no=? AND os_year=?", rusqlite::params![os_no, os_year])
-        .map_err(|e| e500(&e.to_string()))?;
-    conn.execute("DELETE FROM cops_master WHERE os_no=? AND os_year=?", rusqlite::params![os_no, os_year])
-        .map_err(|e| e500(&e.to_string()))?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+    let write_result: Result<(), Err> = (|| {
+        // Archive to cops_master_deleted before hard-deleting so there is always
+        // an audit trail even for quashed cases.
+        conn.execute(
+            "INSERT INTO cops_master_deleted (
+                 id, os_no, os_date, os_year, location_code, booked_by, pax_name, pax_nationality,
+                 passport_no, passport_date, pax_address1, pax_address2, pax_address3, pax_date_of_birth,
+                 pax_status, residence_at, country_of_departure, flight_no, flight_date, total_items,
+                 total_items_value, dutiable_value, redeemed_value, re_export_value, confiscated_value,
+                 total_duty_amount, rf_amount, pp_amount, ref_amount, br_amount, total_payable,
+                 adjudication_date, adj_offr_name, adj_offr_designation, adjn_offr_remarks, adjn_offr_remarks1,
+                 adjn_section_ref, online_adjn, os_printed, os_category, online_os, unique_no,
+                 entry_deleted, bkup_taken, detained_by, seal_no, nationality, seizure_date,
+                 pax_name_modified_by_vig, pax_image_filename, total_fa_value, wh_amount, other_amount,
+                 br_no_str, br_no_num, br_date_str, br_amount_str, dr_no, dr_year, total_drs,
+                 previous_os_details, previous_visits, father_name, old_passport_no, total_pkgs,
+                 supdts_remarks, supdt_remarks2, closure_ind, adjudication_time,
+                 deleted_by, deleted_reason, deleted_on,
+                 post_adj_br_entries, post_adj_dr_no, post_adj_dr_date,
+                 is_legacy, is_offline_adjudication, file_spot
+             )
+             SELECT
+                 id, os_no, os_date, os_year, location_code, booked_by, pax_name, pax_nationality,
+                 passport_no, passport_date, pax_address1, pax_address2, pax_address3, pax_date_of_birth,
+                 pax_status, residence_at, country_of_departure, flight_no, flight_date, total_items,
+                 total_items_value, dutiable_value, redeemed_value, re_export_value, confiscated_value,
+                 total_duty_amount, rf_amount, pp_amount, ref_amount, br_amount, total_payable,
+                 adjudication_date, adj_offr_name, adj_offr_designation, adjn_offr_remarks, adjn_offr_remarks1,
+                 adjn_section_ref, online_adjn, os_printed, os_category, online_os, unique_no,
+                 entry_deleted, bkup_taken, detained_by, seal_no, nationality, seizure_date,
+                 pax_name_modified_by_vig, pax_image_filename, total_fa_value, wh_amount, other_amount,
+                 br_no_str, br_no_num, br_date_str, br_amount_str, dr_no, dr_year, total_drs,
+                 previous_os_details, previous_visits, father_name, old_passport_no, total_pkgs,
+                 supdts_remarks, supdt_remarks2, closure_ind, adjudication_time,
+                 ?, 'Quashed by adjudicating officer', ?,
+                 post_adj_br_entries, post_adj_dr_no, post_adj_dr_date,
+                 is_legacy, is_offline_adjudication, file_spot
+             FROM cops_master WHERE os_no=? AND os_year=?",
+            rusqlite::params![auth.0.sub, today, os_no, os_year],
+        ).map_err(|e| e500(&format!("Audit archive failed — quash aborted: {e}")))?;
+
+        conn.execute("DELETE FROM cops_items WHERE os_no=? AND os_year=?", rusqlite::params![os_no, os_year])
+            .map_err(|e| e500(&e.to_string()))?;
+        conn.execute("DELETE FROM cops_master WHERE os_no=? AND os_year=?", rusqlite::params![os_no, os_year])
+            .map_err(|e| e500(&e.to_string()))?;
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?,
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+    }
 
     Ok(Json(json!({ "message": "Case permanently deleted.", "os_no": os_no, "os_year": os_year })))
 }
@@ -1193,7 +1265,7 @@ fn get_case_json(conn: &rusqlite::Connection, os_no: &str, os_year: i64) -> rusq
 
 // ── classify-item ─────────────────────────────────────────────────────────────
 
-pub async fn classify_item(Query(params): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+pub async fn classify_item(_auth: AuthUser, Query(params): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
     let desc = params.get("description").map(|s| s.as_str()).unwrap_or("").to_uppercase();
     let (duty_type, uqc) = classify_description(&desc);
     Json(json!({ "duty_type": duty_type, "uqc": uqc }))
@@ -1262,7 +1334,7 @@ fn classify_description(desc: &str) -> (&'static str, &'static str) {
 
 // ── check-os-no ───────────────────────────────────────────────────────────────
 
-pub async fn check_os_no(State(pool): Db, Query(params): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+pub async fn check_os_no(State(pool): Db, _auth: AuthUser, Query(params): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
     let os_no = params.get("os_no").map(|s| s.as_str()).unwrap_or("");
     let os_year = params.get("os_year").and_then(|v| v.parse::<i64>().ok())
         .unwrap_or_else(|| chrono::Local::now().year() as i64);
