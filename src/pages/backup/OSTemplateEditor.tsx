@@ -30,6 +30,7 @@ const TODAY = new Date().toISOString().split('T')[0];
 
 // Base keys whose text contains {placeholder} tokens
 const PLACEHOLDER_BASE_KEYS = new Set([
+  'legal_para_2',
   'order_para_rf', 'order_para_ref', 'order_para_abs_conf', 'order_para_pp',
 ]);
 
@@ -65,10 +66,10 @@ const ARRIVAL_DEFAULTS: Record<string, string> = {
   inventory_heading:   'INVENTORY OF THE GOODS IMPORTED',
   waiver_text_1:       'The Charges have been orally communicated to me in respect of the goods mentioned overleaf and imported by me. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing.',
   legal_para_1:        "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992 read with the Rules framed thereunder, also read with Section 11(2)(u) of Customs Act, 1962, import of 'goods in commercial quantity / goods in the nature of non-bonafide baggage' is not permitted without a valid import licence, though exemption exists under clause 3(h) of the Foreign Trade (Exemption from application of Rules in certain cases) order 1993 for import of goods by a passenger from abroad only to the extent admissible under the Baggage Rules framed under Section 79 of the Customs Act, 1962.",
-  legal_para_2:        "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.",
-  order_para_rf:       'I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of Foreign Trade (D&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.',
+  legal_para_2:        'Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.',
+  order_para_rf:       'I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref} read with Section 3(3) of Foreign Trade (D&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.',
   order_para_ref:      'However, I give an option to reship the goods{ref_slnos_text} valued at Rs.{re_exp_value}/- on a fine of Rs.{ref_amount}/- (Rupees {ref_words} Only) under Section 125 of the Customs Act 1962 within 1 Month from the date of this Order.',
-  order_para_abs_conf: 'I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (D&R) Act, 1992.',
+  order_para_abs_conf: 'I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (D&R) Act, 1992.',
   order_para_pp:       'I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 112(a) of the Customs Act, 1962.',
 };
 
@@ -77,9 +78,9 @@ const EXPORT_DEFAULTS: Record<string, string> = {
   inventory_heading:   'INVENTORY OF THE GOODS DETAINED FOR EXPORT',
   waiver_text_1:       'The Charges have been orally communicated to me in respect of the goods mentioned overleaf and detained at the time of my departure. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing.',
   legal_para_1:        'In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.',
-  legal_para_2:        'Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under Section 113 of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.',
-  order_para_rf:       'I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under Section 113 of the Customs Act, 1962, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.',
-  order_para_abs_conf: 'I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under Section 113 of the Customs Act, 1962.',
+  legal_para_2:        'Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.',
+  order_para_rf:       'I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref}, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.',
+  order_para_abs_conf: 'I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref}.',
   order_para_pp:       'I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 114 of the Customs Act, 1962.',
 };
 
@@ -546,6 +547,125 @@ export default function OSTemplateEditor({ adminToken }: OSTemplateEditorProps) 
               {v('received_order_text', 'Received the Order-in-Original')}
             </ES>
           </div>
+        </div>
+
+        {/* ── Adjudication: Confiscation Section Reference ─────────────────── */}
+        {/* These 6 keys control the section numbers + subsection chips shown   */}
+        {/* in the Adjudication module. They are versioned like all other PTC   */}
+        {/* entries and are read via the /admin/config/pit endpoint.            */}
+        <div className="bg-white border border-slate-300 shadow-sm p-4 mt-4 rounded-lg">
+          <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-100">
+            <span className="text-xs font-bold text-slate-700">⚖ Adjudication — Confiscation Section Reference</span>
+            <span className="text-[9px] text-slate-400 ml-1">Controls the section number and subsection buttons shown in the Adjudication page. Click any value to edit.</span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-6">
+            {/* ── Arrival / Import column ──────────────────────────────────── */}
+            <div className="space-y-2.5">
+              <div className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider flex items-center gap-1 mb-1">
+                <PlaneLanding size={10}/> Arrival / Import Cases
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-slate-500 w-36 shrink-0">Section Number</span>
+                <ES fieldKey="confiscation_section_import" onEdit={openEdit} selected={sel === 'confiscation_section_import'}>
+                  <span className="text-xs font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded cursor-pointer">
+                    {storedVal('confiscation_section_import', '111')}
+                  </span>
+                </ES>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-slate-500 w-36 shrink-0">Fixed Subsections</span>
+                <ES fieldKey="confiscation_fixed_subs_import" onEdit={openEdit} selected={sel === 'confiscation_fixed_subs_import'}>
+                  <span className="text-xs font-mono text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded cursor-pointer">
+                    {storedVal('confiscation_fixed_subs_import', 'd,l,m')}
+                  </span>
+                </ES>
+                <span className="text-[9px] text-slate-400">comma-separated</span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-slate-500 w-36 shrink-0">Optional Subsections</span>
+                <ES fieldKey="confiscation_optional_subs_import" onEdit={openEdit} selected={sel === 'confiscation_optional_subs_import'}>
+                  <span className="text-xs font-mono text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded cursor-pointer">
+                    {storedVal('confiscation_optional_subs_import', 'i,o')}
+                  </span>
+                </ES>
+                <span className="text-[9px] text-slate-400">shown as dashed toggles</span>
+              </div>
+
+              <div className="bg-slate-50 rounded px-2.5 py-1.5 text-[9px] text-slate-500 font-mono border border-slate-100 leading-relaxed">
+                Preview: <span className="font-semibold text-amber-700">
+                  Section {storedVal('confiscation_section_import', '111')}
+                  {' '}
+                  {(() => {
+                    const fixed = storedVal('confiscation_fixed_subs_import', 'd,l,m').split(',').map(s => s.trim()).filter(Boolean);
+                    const parts = fixed.map(s => `(${s})`);
+                    if (parts.length === 0) return '';
+                    if (parts.length === 1) return parts[0];
+                    return parts.slice(0, -1).join(', ') + ' & ' + parts[parts.length - 1];
+                  })()}
+                </span>
+                <span className="text-slate-400"> [optional: {storedVal('confiscation_optional_subs_import', 'i,o')}]</span>
+              </div>
+            </div>
+
+            {/* ── Export / Departure column ────────────────────────────────── */}
+            <div className="space-y-2.5 border-l border-slate-100 pl-6">
+              <div className="text-[10px] font-bold text-violet-600 uppercase tracking-wider flex items-center gap-1 mb-1">
+                <PlaneTakeoff size={10}/> Export / Departure Cases
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-slate-500 w-36 shrink-0">Section Number</span>
+                <ES fieldKey="confiscation_section_export" onEdit={openEdit} selected={sel === 'confiscation_section_export'}>
+                  <span className="text-xs font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded cursor-pointer">
+                    {storedVal('confiscation_section_export', '113')}
+                  </span>
+                </ES>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-slate-500 w-36 shrink-0">Fixed Subsections</span>
+                <ES fieldKey="confiscation_fixed_subs_export" onEdit={openEdit} selected={sel === 'confiscation_fixed_subs_export'}>
+                  <span className="text-xs font-mono text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded cursor-pointer">
+                    {storedVal('confiscation_fixed_subs_export', 'd,h,i')}
+                  </span>
+                </ES>
+                <span className="text-[9px] text-slate-400">comma-separated</span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-slate-500 w-36 shrink-0">Optional Subsections</span>
+                <ES fieldKey="confiscation_optional_subs_export" onEdit={openEdit} selected={sel === 'confiscation_optional_subs_export'}>
+                  <span className="text-xs font-mono text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded cursor-pointer">
+                    {storedVal('confiscation_optional_subs_export', 'e')}
+                  </span>
+                </ES>
+                <span className="text-[9px] text-slate-400">shown as dashed toggles</span>
+              </div>
+
+              <div className="bg-slate-50 rounded px-2.5 py-1.5 text-[9px] text-slate-500 font-mono border border-slate-100 leading-relaxed">
+                Preview: <span className="font-semibold text-amber-700">
+                  Section {storedVal('confiscation_section_export', '113')}
+                  {' '}
+                  {(() => {
+                    const fixed = storedVal('confiscation_fixed_subs_export', 'd,h,i').split(',').map(s => s.trim()).filter(Boolean);
+                    const parts = fixed.map(s => `(${s})`);
+                    if (parts.length === 0) return '';
+                    if (parts.length === 1) return parts[0];
+                    return parts.slice(0, -1).join(', ') + ' & ' + parts[parts.length - 1];
+                  })()}
+                </span>
+                <span className="text-slate-400"> [optional: {storedVal('confiscation_optional_subs_export', 'e')}]</span>
+              </div>
+            </div>
+          </div>
+
+          <p className="text-[9px] text-slate-400 mt-3 pt-2 border-t border-slate-100">
+            Subsections must be comma-separated lowercase letters (e.g. <code className="bg-slate-100 px-0.5 rounded">d,h,i</code>). Alphabetical order is enforced automatically at adjudication time. Effective-date versioning applies — adjudications from the effective date onwards will use the updated sections.
+          </p>
         </div>
       </div>
 

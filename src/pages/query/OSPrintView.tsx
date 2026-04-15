@@ -126,6 +126,25 @@ export default function OSPrintView() {
   // Export / Arrival distinction — mirrors backend is_export logic in offence.py
   const isExportCase = (data.case_type || '').trim().toUpperCase() === 'EXPORT CASE';
 
+  // ── Confiscation section reference ────────────────────────────────────────
+  // If saved at adjudication time (new cases), use that directly.
+  // Otherwise compute from PIT config so the fallback matches the configured defaults.
+  const _parseCsv = (s: string) => s.split(',').map((x: string) => x.trim().toLowerCase()).filter(Boolean);
+  const _fmtSubs = (subs: string[]): string => {
+    if (subs.length === 0) return '';
+    const parts = subs.map(s => `(${s})`);
+    if (parts.length === 1) return parts[0];
+    return parts.slice(0, -1).join(', ') + ' & ' + parts[parts.length - 1];
+  };
+  const confiscationRef: string = (() => {
+    if (data.adjn_section_ref) return data.adjn_section_ref;
+    const secNo   = isExportCase ? pitText('confiscation_section_export',        '113') : pitText('confiscation_section_import',        '111');
+    const fixCsv  = isExportCase ? pitText('confiscation_fixed_subs_export',     '')    : pitText('confiscation_fixed_subs_import',     'd,l,m');
+    const optCsv  = isExportCase ? pitText('confiscation_optional_subs_export',  '')    : pitText('confiscation_optional_subs_import',  'i,o');
+    const allSubs = [..._parseCsv(fixCsv), ..._parseCsv(optCsv)].sort();
+    return `Section ${secNo}${_fmtSubs(allSubs)} of the Customs Act, 1962`;
+  })();
+
   const colFaHeading     = pitText('col_fa_heading',     "Goods Allowed Free Under Rule 5 / Rule 13 of Baggage Rules, 1994");
   const colLiableHeading = pitText('col_liable_heading', "Goods Liable to Action Under FEMA / Foreign Trade Act, 1992 & Customs Act, 1962");
 
@@ -150,17 +169,17 @@ export default function OSPrintView() {
     ? pitText('export_legal_para_1', "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.")
     : pitText('legal_para_1', "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992 read with the Rules framed thereunder, also read with Section 11(2)(u) of Customs Act, 1962, import of 'goods in commercial quantity / goods in the nature of non-bonafide baggage' is not permitted without a valid import licence, though exemption exists under clause 3(h) of the Foreign Trade (Exemption from application of Rules in certain cases) order 1993 for import of goods by a passenger from abroad only to the extent admissible under the Baggage Rules framed under Section 79 of the Customs Act, 1962.");
   const legalPara2      = isExportCase
-    ? pitText('export_legal_para_2', "Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under Section 113 of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.")
-    : pitText('legal_para_2', "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.");
+    ? pitText('export_legal_para_2', "Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.")
+    : pitText('legal_para_2', "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.");
   const recordHeading   = pitText('record_heading',    "RECORD OF PERSONAL HEARING & FINDINGS");
   const orderHeading    = pitText('order_heading',     "ORDER");
   const orderParaRfTpl      = isExportCase
-    ? pitText('export_order_para_rf', "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under Section 113 of the Customs Act, 1962, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.")
-    : pitText('order_para_rf', "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of Foreign Trade (D&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.");
+    ? pitText('export_order_para_rf', "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref}, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.")
+    : pitText('order_para_rf', "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref} read with Section 3(3) of Foreign Trade (D&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.");
   const orderParaRefTpl     = pitText('order_para_ref',      "However, I give an option to reship the goods{ref_slnos_text} valued at Rs.{re_exp_value}/- on a fine of Rs.{ref_amount}/- (Rupees {ref_words} Only) under Section 125 of the Customs Act 1962 within 1 Month from the date of this Order.");
   const orderParaAbsConfTpl = isExportCase
-    ? pitText('export_order_para_abs_conf', "I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under Section 113 of the Customs Act, 1962.")
-    : pitText('order_para_abs_conf', "I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (D&R) Act, 1992.");
+    ? pitText('export_order_para_abs_conf', "I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref}.")
+    : pitText('order_para_abs_conf', "I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (D&R) Act, 1992.");
   const orderParaPpTpl      = isExportCase
     ? pitText('export_order_para_pp', "I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 114 of the Customs Act, 1962.")
     : pitText('order_para_pp', "I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 112(a) of the Customs Act, 1962.");
@@ -577,7 +596,7 @@ export default function OSPrintView() {
 
           <div className="mb-2 space-y-1 text-justify">
             <p className="indent-8">{legalPara1}</p>
-            <p className="indent-8">{legalPara2}</p>
+            <p className="indent-8">{fillTpl(legalPara2, { confiscation_full_ref: confiscationRef })}</p>
           </div>
 
           <div className="font-bold underline text-center uppercase mb-1">{recordHeading}</div>
@@ -592,6 +611,7 @@ export default function OSPrintView() {
             {confValue > 0 && (data.rf_amount || 0) > 0 && (
               <p className="mb-1 indent-8">
                 {fillTpl(orderParaRfTpl, {
+                  confiscation_full_ref: confiscationRef,
                   rf_slnos_text: slnosText(rfSlNos),
                   conf_value: confValue,
                   rf_amount: data.rf_amount || 0,
@@ -612,6 +632,7 @@ export default function OSPrintView() {
             {absConfValue > 0 && (
               <p className="mb-1 indent-8">
                 {fillTpl(orderParaAbsConfTpl, {
+                  confiscation_full_ref: confiscationRef,
                   also_text: (confValue > 0 || reExpValue > 0) ? 'also ' : '',
                   abs_conf_slnos_text: slnosText(allAbsConfSlNos),
                   abs_conf_value: absConfValue,

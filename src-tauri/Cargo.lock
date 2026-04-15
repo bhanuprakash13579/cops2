@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "cops2"
-version = "3.0.5"
+version = "3.0.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -936,6 +936,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

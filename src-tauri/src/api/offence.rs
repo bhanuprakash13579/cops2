@@ -126,12 +126,27 @@ fn within_edit_window(adjudication_time: &Option<String>) -> bool {
 pub async fn sidebar_counts(State(pool): Db, _auth: AdjnUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
+    // Mirrors cops1 _pending_filters() exactly:
+    //   is_draft='N', adjudication_date IS NULL, adj_offr_name IS NULL,
+    //   adjn_offr_remarks IS NULL or '', quashed!='Y', rejected!='Y',
+    //   not offline, not legacy
+    // PLUS: must have at least one item in 'Under OS' or 'Under Duty' release category.
     let pending: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
-         AND adjudication_date IS NULL AND adj_offr_name IS NULL
-         AND (quashed IS NULL OR quashed != 'Y') AND (rejected IS NULL OR rejected != 'Y')
-         AND (is_offline_adjudication IS NULL OR is_offline_adjudication != 'Y')
-         AND (is_legacy IS NULL OR is_legacy != 'Y')",
+        "SELECT COUNT(*) FROM cops_master
+         WHERE entry_deleted='N' AND is_draft='N'
+           AND adjudication_date IS NULL AND adj_offr_name IS NULL
+           AND (adjn_offr_remarks IS NULL OR adjn_offr_remarks = '')
+           AND (quashed IS NULL OR quashed != 'Y')
+           AND (rejected IS NULL OR rejected != 'Y')
+           AND (is_offline_adjudication IS NULL OR is_offline_adjudication != 'Y')
+           AND (is_legacy IS NULL OR is_legacy != 'Y')
+           AND EXISTS (
+               SELECT 1 FROM cops_items ci
+               WHERE ci.os_no = cops_master.os_no
+                 AND ci.os_year = cops_master.os_year
+                 AND ci.items_release_category IN ('Under OS', 'Under Duty')
+                 AND (ci.entry_deleted IS NULL OR ci.entry_deleted != 'Y')
+           )",
         [], |r| r.get(0)
     ).unwrap_or(0);
 
@@ -144,16 +159,41 @@ pub async fn sidebar_counts(State(pool): Db, _auth: AdjnUser) -> Result<Json<Val
     Ok(Json(json!({ "pending": pending, "offline_pending": offline_pending })))
 }
 
+// 5-minute in-process cache for item descriptions — avoids a DB round-trip on
+// every keystroke in the item form.  Uses double-checked locking: fast path
+// reads the atomic timestamp without acquiring the mutex; slow path re-checks
+// under lock to prevent a thundering herd when the cache expires.
+static ITEM_DESC_CACHE: std::sync::OnceLock<std::sync::Mutex<(Vec<String>, std::time::Instant)>> = std::sync::OnceLock::new();
+const ITEM_DESC_TTL_SECS: u64 = 300;
+
 pub async fn item_descriptions(State(pool): Db) -> Result<Json<Value>, Err> {
+    let cache = ITEM_DESC_CACHE.get_or_init(|| {
+        std::sync::Mutex::new((Vec::new(), std::time::Instant::now() - std::time::Duration::from_secs(ITEM_DESC_TTL_SECS + 1)))
+    });
+
+    // Fast path: if cache is fresh, clone and return without hitting DB
+    {
+        let guard = cache.lock().unwrap();
+        if !guard.0.is_empty() && guard.1.elapsed().as_secs() < ITEM_DESC_TTL_SECS {
+            return Ok(Json(json!(guard.0.clone())));
+        }
+    }
+
+    // Slow path: refresh from DB, then store under lock
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT UPPER(items_desc) FROM cops_items
+        "SELECT UPPER(items_desc) FROM cops_items
          WHERE items_desc IS NOT NULL AND items_desc != '' AND entry_deleted='N'
          GROUP BY UPPER(items_desc) ORDER BY COUNT(*) DESC LIMIT 300"
     ).map_err(|e| e500(&e.to_string()))?;
     let descs: Vec<String> = stmt.query_map([], |r| r.get(0))
         .map_err(|e| e500(&e.to_string()))?
         .filter_map(|r| r.ok()).collect();
+
+    {
+        let mut guard = cache.lock().unwrap();
+        *guard = (descs.clone(), std::time::Instant::now());
+    }
     Ok(Json(json!(descs)))
 }
 
@@ -168,7 +208,8 @@ pub async fn list_os(State(pool): Db, auth: AuthUser, Query(params): Query<OsLis
     let search_filter = params.search.as_deref().unwrap_or("").trim().to_string();
     let year_filter = params.year;
 
-    let (count_sql, list_sql, search_params) = build_list_query(status, &search_filter, year_filter, offset, per_page, auth.0.is_sdo());
+    let br_dr_pending = params.br_dr_pending.unwrap_or(false);
+    let (count_sql, list_sql, search_params) = build_list_query(status, &search_filter, year_filter, br_dr_pending, offset, per_page, auth.0.is_sdo());
 
     let total: i64 = conn.query_row(&count_sql, rusqlite::params_from_iter(search_params.iter()), |r| r.get(0)).unwrap_or(0);
 
@@ -203,28 +244,40 @@ pub async fn list_os(State(pool): Db, auth: AuthUser, Query(params): Query<OsLis
     Ok(Json(json!({ "total": total, "page": page, "per_page": per_page, "items": cases })))
 }
 
-fn build_list_query(status: &str, search: &str, year: Option<i64>, offset: i64, per_page: i64, _is_sdo: bool) -> (String, String, Vec<String>) {
+fn build_list_query(status: &str, search: &str, year: Option<i64>, br_dr_pending: bool, offset: i64, per_page: i64, _is_sdo: bool) -> (String, String, Vec<String>) {
     let (search_sql, search_params): (&str, Vec<String>) = if search.is_empty() {
         ("1=1", vec![])
     } else {
         let p = format!("%{}%", search);
-        ("(os_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ? OR flight_no LIKE ?)",
-         vec![p.clone(), p.clone(), p.clone(), p])
+        // Include old_passport_no so renewing a passport doesn't hide prior cases
+        ("(os_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ? OR old_passport_no LIKE ? OR flight_no LIKE ?)",
+         vec![p.clone(), p.clone(), p.clone(), p.clone(), p])
     };
     // year is an i64 — safe to format directly as a numeric literal
     let year_sql = year.map_or("1=1".to_string(), |y| format!("os_year = {y}"));
 
     let base = match status {
         "draft"       => "entry_deleted='N' AND is_draft='Y'".to_string(),
-        "adjudicated" => "entry_deleted='N' AND is_draft='N' AND adjudication_date IS NOT NULL AND adj_offr_name IS NOT NULL".to_string(),
+        // Adjudicated = EITHER adjudication_date OR adj_offr_name is set (mirrors cops1 OR logic).
+        // Old MDB-imported records may have adj_offr_name without a date — using AND would make them
+        // invisible in both pending and adjudicated views.
+        "adjudicated" => "entry_deleted='N' AND is_draft='N' AND (adjudication_date IS NOT NULL OR adj_offr_name IS NOT NULL) AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y')".to_string(),
         "offline-pending" => "entry_deleted='N' AND is_draft='N' AND is_offline_adjudication='Y' AND adj_offr_name IS NULL".to_string(),
-        _             => "entry_deleted='N' AND is_draft='N' AND adjudication_date IS NULL AND adj_offr_name IS NULL AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y') AND (is_offline_adjudication IS NULL OR is_offline_adjudication!='Y') AND (is_legacy IS NULL OR is_legacy!='Y')".to_string(),
+        _             => "entry_deleted='N' AND is_draft='N' AND adjudication_date IS NULL AND adj_offr_name IS NULL AND (adjn_offr_remarks IS NULL OR adjn_offr_remarks='') AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y') AND (is_offline_adjudication IS NULL OR is_offline_adjudication!='Y') AND (is_legacy IS NULL OR is_legacy!='Y') AND EXISTS (SELECT 1 FROM cops_items ci WHERE ci.os_no=cops_master.os_no AND ci.os_year=cops_master.os_year AND ci.items_release_category IN ('Under OS','Under Duty') AND (ci.entry_deleted IS NULL OR ci.entry_deleted!='Y'))".to_string(),
     };
 
-    let where_clause = format!("{base} AND {search_sql} AND {year_sql}");
+    // br_dr_pending: adjudicated cases where SDO has not yet recorded BR/DR receipt data
+    let br_dr_sql = if br_dr_pending {
+        " AND adjudication_date IS NOT NULL AND post_adj_br_entries IS NULL AND post_adj_dr_no IS NULL"
+    } else {
+        ""
+    };
+
+    let where_clause = format!("{base}{br_dr_sql} AND {search_sql} AND {year_sql}");
     let cols = "id, os_no, os_date, os_year, pax_name, passport_no, flight_no, total_items_value, total_payable, adjudication_date, adj_offr_name, is_draft, is_offline_adjudication, entry_deleted, online_adjn, closure_ind, adjudication_time, post_adj_br_entries, post_adj_dr_no, booked_by, location_code, total_items";
     let count_sql = format!("SELECT COUNT(*) FROM cops_master WHERE {where_clause}");
-    let list_sql  = format!("SELECT {cols} FROM cops_master WHERE {where_clause} ORDER BY os_date DESC, os_no DESC LIMIT {per_page} OFFSET {offset}");
+    // CAST os_no to INTEGER for correct numeric order (os_no is VARCHAR; "9" > "10" lexicographically)
+    let list_sql  = format!("SELECT {cols} FROM cops_master WHERE {where_clause} ORDER BY os_date DESC, CAST(os_no AS INTEGER) DESC LIMIT {per_page} OFFSET {offset}");
     (count_sql, list_sql, search_params)
 }
 
@@ -283,34 +336,41 @@ pub async fn create_os(State(pool): Db, auth: AuthUser, Json(mut req): Json<Crea
     let os_year = req.os_year.unwrap_or_else(|| chrono::Local::now().year() as i64);
     let is_draft = req.is_draft.as_deref().unwrap_or("N");
 
-    conn.execute(
-        "INSERT INTO cops_master (os_no, os_date, os_year, location_code, shift, booked_by,
-         pax_name, pax_nationality, passport_no, passport_date, pp_issue_place,
-         pax_address1, pax_address2, pax_address3, pax_date_of_birth, pax_status,
-         residence_at, country_of_departure, port_of_dep_dest, date_of_departure,
-         stay_abroad_days, flight_no, flight_date, detained_by, seal_no, seizure_date,
-         father_name, old_passport_no, total_pkgs, supdts_remarks, supdt_remarks2,
-         previous_os_details, previous_visits, case_type, file_spot,
-         is_offline_adjudication, is_draft, entry_deleted, bkup_taken,
-         total_items, total_items_value, total_fa_value, total_duty_amount, total_payable)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        rusqlite::params![
-            req.os_no, os_date, os_year, req.location_code, req.shift, req.booked_by,
-            req.pax_name, req.pax_nationality, req.passport_no, req.passport_date, req.pp_issue_place,
-            req.pax_address1, req.pax_address2, req.pax_address3, req.pax_date_of_birth, req.pax_status,
-            req.residence_at, req.country_of_departure, req.port_of_dep_dest, req.date_of_departure,
-            req.stay_abroad_days, req.flight_no, req.flight_date, req.detained_by, req.seal_no, req.seizure_date,
-            req.father_name, req.old_passport_no, req.total_pkgs, req.supdts_remarks, req.supdt_remarks2,
-            req.previous_os_details, req.previous_visits, req.case_type, req.file_spot,
-            req.is_offline_adjudication.as_deref().unwrap_or("N"), is_draft, "N", "N",
-            req.items.len() as i64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
-        ],
-    ).map_err(|e| e500(&e.to_string()))?;
-
-    save_items(&conn, &req.os_no, os_year, &os_date, req.location_code.as_deref(), &req.items)?;
-
-    // Recalculate totals from saved items
-    recalc_totals(&conn, &req.os_no, os_year).map_err(|e| e500(&e.to_string()))?;
+    // Wrap all writes in a single transaction — reduces N+2 individual fsyncs
+    // (1 per item + master INSERT + recalc UPDATE) down to 1.
+    conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+    let write_result: Result<(), Err> = (|| {
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_date, os_year, location_code, shift, booked_by,
+             pax_name, pax_nationality, passport_no, passport_date, pp_issue_place,
+             pax_address1, pax_address2, pax_address3, pax_date_of_birth, pax_status,
+             residence_at, country_of_departure, port_of_dep_dest, date_of_departure,
+             stay_abroad_days, flight_no, flight_date, detained_by, seal_no, seizure_date,
+             father_name, old_passport_no, total_pkgs, supdts_remarks, supdt_remarks2,
+             previous_os_details, previous_visits, case_type, file_spot,
+             is_offline_adjudication, is_draft, entry_deleted, bkup_taken,
+             total_items, total_items_value, total_fa_value, total_duty_amount, total_payable)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                req.os_no, os_date, os_year, req.location_code, req.shift, req.booked_by,
+                req.pax_name, req.pax_nationality, req.passport_no, req.passport_date, req.pp_issue_place,
+                req.pax_address1, req.pax_address2, req.pax_address3, req.pax_date_of_birth, req.pax_status,
+                req.residence_at, req.country_of_departure, req.port_of_dep_dest, req.date_of_departure,
+                req.stay_abroad_days, req.flight_no, req.flight_date, req.detained_by, req.seal_no, req.seizure_date,
+                req.father_name, req.old_passport_no, req.total_pkgs, req.supdts_remarks, req.supdt_remarks2,
+                req.previous_os_details, req.previous_visits, req.case_type, req.file_spot,
+                req.is_offline_adjudication.as_deref().unwrap_or("N"), is_draft, "N", "N",
+                req.items.len() as i64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+            ],
+        ).map_err(|e| e500(&e.to_string()))?;
+        save_items(&conn, &req.os_no, os_year, &os_date, req.location_code.as_deref(), &req.items)?;
+        recalc_totals(&conn, &req.os_no, os_year).map_err(|e| e500(&e.to_string()))?;
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?,
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+    }
 
     let case_json = get_case_json(&conn, &req.os_no, os_year).map_err(|e| e500(&e.to_string()))?;
     Ok(Json(case_json))
@@ -335,32 +395,39 @@ pub async fn create_offline(State(pool): Db, _auth: SdoUser, Json(mut req): Json
     ).unwrap_or(0);
     if exists > 0 { return Err(e400("O.S. No. already exists for this year.")); }
 
-    conn.execute(
-        "INSERT INTO cops_master (os_no, os_date, os_year, location_code, shift, booked_by,
-         pax_name, pax_nationality, passport_no, passport_date, pp_issue_place,
-         pax_address1, pax_address2, pax_address3, pax_date_of_birth, pax_status,
-         residence_at, country_of_departure, port_of_dep_dest, date_of_departure,
-         stay_abroad_days, flight_no, flight_date, detained_by, seal_no, seizure_date,
-         father_name, old_passport_no, total_pkgs, supdts_remarks, supdt_remarks2,
-         previous_os_details, previous_visits, case_type, file_spot,
-         is_offline_adjudication, is_draft, entry_deleted, bkup_taken,
-         total_items, total_items_value, total_fa_value, total_duty_amount, total_payable)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        rusqlite::params![
-            req.os_no, os_date, os_year, req.location_code, req.shift, req.booked_by,
-            req.pax_name, req.pax_nationality, req.passport_no, req.passport_date, req.pp_issue_place,
-            req.pax_address1, req.pax_address2, req.pax_address3, req.pax_date_of_birth, req.pax_status,
-            req.residence_at, req.country_of_departure, req.port_of_dep_dest, req.date_of_departure,
-            req.stay_abroad_days, req.flight_no, req.flight_date, req.detained_by, req.seal_no, req.seizure_date,
-            req.father_name, req.old_passport_no, req.total_pkgs, req.supdts_remarks, req.supdt_remarks2,
-            req.previous_os_details, req.previous_visits, req.case_type, req.file_spot,
-            "Y", is_draft, "N", "N",
-            req.items.len() as i64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
-        ],
-    ).map_err(|e| e500(&e.to_string()))?;
-
-    save_items(&conn, &req.os_no, os_year, &os_date, req.location_code.as_deref(), &req.items)?;
-    recalc_totals(&conn, &req.os_no, os_year).map_err(|e| e500(&e.to_string()))?;
+    conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+    let write_result: Result<(), Err> = (|| {
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_date, os_year, location_code, shift, booked_by,
+             pax_name, pax_nationality, passport_no, passport_date, pp_issue_place,
+             pax_address1, pax_address2, pax_address3, pax_date_of_birth, pax_status,
+             residence_at, country_of_departure, port_of_dep_dest, date_of_departure,
+             stay_abroad_days, flight_no, flight_date, detained_by, seal_no, seizure_date,
+             father_name, old_passport_no, total_pkgs, supdts_remarks, supdt_remarks2,
+             previous_os_details, previous_visits, case_type, file_spot,
+             is_offline_adjudication, is_draft, entry_deleted, bkup_taken,
+             total_items, total_items_value, total_fa_value, total_duty_amount, total_payable)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                req.os_no, os_date, os_year, req.location_code, req.shift, req.booked_by,
+                req.pax_name, req.pax_nationality, req.passport_no, req.passport_date, req.pp_issue_place,
+                req.pax_address1, req.pax_address2, req.pax_address3, req.pax_date_of_birth, req.pax_status,
+                req.residence_at, req.country_of_departure, req.port_of_dep_dest, req.date_of_departure,
+                req.stay_abroad_days, req.flight_no, req.flight_date, req.detained_by, req.seal_no, req.seizure_date,
+                req.father_name, req.old_passport_no, req.total_pkgs, req.supdts_remarks, req.supdt_remarks2,
+                req.previous_os_details, req.previous_visits, req.case_type, req.file_spot,
+                "Y", is_draft, "N", "N",
+                req.items.len() as i64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+            ],
+        ).map_err(|e| e500(&e.to_string()))?;
+        save_items(&conn, &req.os_no, os_year, &os_date, req.location_code.as_deref(), &req.items)?;
+        recalc_totals(&conn, &req.os_no, os_year).map_err(|e| e500(&e.to_string()))?;
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?,
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+    }
 
     let case_json = get_case_json(&conn, &req.os_no, os_year).map_err(|e| e500(&e.to_string()))?;
     Ok(Json(case_json))
@@ -374,71 +441,92 @@ pub async fn update_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
 
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
-    let (adj_date, adj_time, is_draft_db): (Option<String>, Option<String>, Option<String>) = conn.query_row(
-        "SELECT adjudication_date, adjudication_time, is_draft FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
-        rusqlite::params![os_no, os_year], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    let (adj_date, adj_time, is_draft_db, os_printed): (Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+        "SELECT adjudication_date, adjudication_time, is_draft, os_printed FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
+        rusqlite::params![os_no, os_year], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     ).map_err(|_| e404("O.S. not found"))?;
 
-    // Role/window checks
+    // Role/window checks (mirrors cops1 update_os logic)
     if auth.0.is_adjn() {
+        // DC/AC: can only edit adjudicated cases within 24h window
         if adj_date.is_some() && !within_edit_window(&adj_time) {
             return Err(e400("Modification window has expired (24h from adjudication)."));
         }
-    } else if !auth.0.is_sdo() {
+    } else if auth.0.is_sdo() {
+        // SDO: can always edit pending cases; adjudicated = 24h window;
+        // non-adjudicated but already printed = blocked
+        if adj_date.is_some() {
+            if !within_edit_window(&adj_time) {
+                return Err(e400("Modification window has expired (24h from adjudication)."));
+            }
+        } else if os_printed.as_deref() == Some("Y") {
+            return Err(e400("Print Out Has Already Been Taken for The Entered O.S.No. Cannot Modify its details!"));
+        }
+    } else {
         return Err((StatusCode::FORBIDDEN, Json(json!({ "detail": "Permission denied." }))));
-    }
-
-    // If adjudicated, reset adjudication fields
-    if adj_date.is_some() {
-        conn.execute(
-            "UPDATE cops_master SET online_adjn='N', adjudication_date=NULL, adjudication_time=NULL,
-             adj_offr_name=NULL, adj_offr_designation=NULL, adjn_offr_remarks=NULL,
-             os_printed='N', confiscated_value=0, redeemed_value=0, re_export_value=0,
-             rf_amount=0, pp_amount=0, ref_amount=0, total_payable=0, closure_ind=NULL
-             WHERE os_no=? AND os_year=?",
-            rusqlite::params![os_no, os_year],
-        ).map_err(|e| e500(&e.to_string()))?;
     }
 
     let is_draft = req.is_draft.as_deref().unwrap_or(is_draft_db.as_deref().unwrap_or("N"));
 
-    conn.execute(
-        "UPDATE cops_master SET pax_name=?, pax_nationality=?, passport_no=?, passport_date=?,
-         pp_issue_place=?, pax_address1=?, pax_address2=?, pax_address3=?, pax_date_of_birth=?,
-         pax_status=?, residence_at=?, country_of_departure=?, port_of_dep_dest=?,
-         date_of_departure=?, stay_abroad_days=?, flight_no=?, flight_date=?,
-         detained_by=?, seal_no=?, seizure_date=?, father_name=?, old_passport_no=?,
-         total_pkgs=?, supdts_remarks=?, supdt_remarks2=?, previous_os_details=?,
-         previous_visits=?, case_type=?, file_spot=?, booked_by=?, shift=?, is_draft=?
-         WHERE os_no=? AND os_year=? AND entry_deleted='N'",
-        rusqlite::params![
-            req.pax_name, req.pax_nationality, req.passport_no, req.passport_date,
-            req.pp_issue_place, req.pax_address1, req.pax_address2, req.pax_address3, req.pax_date_of_birth,
-            req.pax_status, req.residence_at, req.country_of_departure, req.port_of_dep_dest,
-            req.date_of_departure, req.stay_abroad_days, req.flight_no, req.flight_date,
-            req.detained_by, req.seal_no, req.seizure_date, req.father_name, req.old_passport_no,
-            req.total_pkgs, req.supdts_remarks, req.supdt_remarks2, req.previous_os_details,
-            req.previous_visits, req.case_type, req.file_spot, req.booked_by, req.shift, is_draft,
-            os_no, os_year,
-        ],
-    ).map_err(|e| e500(&e.to_string()))?;
+    // Wrap all writes in a single transaction — saves N+3 individual fsyncs
+    // (optional adjudication reset + master UPDATE + item DELETE + N item INSERTs + recalc).
+    conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+    let write_result: Result<(), Err> = (|| {
+        // If adjudicated, reset adjudication fields before rewriting
+        if adj_date.is_some() {
+            conn.execute(
+                "UPDATE cops_master SET online_adjn='N', adjudication_date=NULL, adjudication_time=NULL,
+                 adj_offr_name=NULL, adj_offr_designation=NULL, adjn_offr_remarks=NULL,
+                 adjn_section_ref=NULL, os_printed='N', confiscated_value=0, redeemed_value=0,
+                 re_export_value=0, rf_amount=0, pp_amount=0, ref_amount=0, total_payable=0,
+                 closure_ind=NULL WHERE os_no=? AND os_year=?",
+                rusqlite::params![os_no, os_year],
+            ).map_err(|e| e500(&e.to_string()))?;
+        }
 
-    // Replace items
-    let os_date: String = conn.query_row(
-        "SELECT os_date FROM cops_master WHERE os_no=? AND os_year=?",
-        rusqlite::params![os_no, os_year], |r| r.get(0)
-    ).unwrap_or_else(|_| chrono::Local::now().format("%Y-%m-%d").to_string());
+        conn.execute(
+            "UPDATE cops_master SET pax_name=?, pax_nationality=?, passport_no=?, passport_date=?,
+             pp_issue_place=?, pax_address1=?, pax_address2=?, pax_address3=?, pax_date_of_birth=?,
+             pax_status=?, residence_at=?, country_of_departure=?, port_of_dep_dest=?,
+             date_of_departure=?, stay_abroad_days=?, flight_no=?, flight_date=?,
+             detained_by=?, seal_no=?, seizure_date=?, father_name=?, old_passport_no=?,
+             total_pkgs=?, supdts_remarks=?, supdt_remarks2=?, previous_os_details=?,
+             previous_visits=?, case_type=?, file_spot=?, booked_by=?, shift=?, is_draft=?
+             WHERE os_no=? AND os_year=? AND entry_deleted='N'",
+            rusqlite::params![
+                req.pax_name, req.pax_nationality, req.passport_no, req.passport_date,
+                req.pp_issue_place, req.pax_address1, req.pax_address2, req.pax_address3, req.pax_date_of_birth,
+                req.pax_status, req.residence_at, req.country_of_departure, req.port_of_dep_dest,
+                req.date_of_departure, req.stay_abroad_days, req.flight_no, req.flight_date,
+                req.detained_by, req.seal_no, req.seizure_date, req.father_name, req.old_passport_no,
+                req.total_pkgs, req.supdts_remarks, req.supdt_remarks2, req.previous_os_details,
+                req.previous_visits, req.case_type, req.file_spot, req.booked_by, req.shift, is_draft,
+                os_no, os_year,
+            ],
+        ).map_err(|e| e500(&e.to_string()))?;
 
-    conn.execute("DELETE FROM cops_items WHERE os_no=? AND os_year=?",
-        rusqlite::params![os_no, os_year]).map_err(|e| e500(&e.to_string()))?;
+        // Replace items
+        let os_date: String = conn.query_row(
+            "SELECT os_date FROM cops_master WHERE os_no=? AND os_year=?",
+            rusqlite::params![os_no, os_year], |r| r.get(0)
+        ).unwrap_or_else(|_| chrono::Local::now().format("%Y-%m-%d").to_string());
 
-    let loc: Option<String> = conn.query_row(
-        "SELECT location_code FROM cops_master WHERE os_no=? AND os_year=?",
-        rusqlite::params![os_no, os_year], |r| r.get(0)
-    ).unwrap_or(None);
+        conn.execute("DELETE FROM cops_items WHERE os_no=? AND os_year=?",
+            rusqlite::params![os_no, os_year]).map_err(|e| e500(&e.to_string()))?;
 
-    save_items(&conn, &os_no, os_year, &os_date, loc.as_deref(), &req.items)?;
-    recalc_totals(&conn, &os_no, os_year).map_err(|e| e500(&e.to_string()))?;
+        let loc: Option<String> = conn.query_row(
+            "SELECT location_code FROM cops_master WHERE os_no=? AND os_year=?",
+            rusqlite::params![os_no, os_year], |r| r.get(0)
+        ).unwrap_or(None);
+
+        save_items(&conn, &os_no, os_year, &os_date, loc.as_deref(), &req.items)?;
+        recalc_totals(&conn, &os_no, os_year).map_err(|e| e500(&e.to_string()))?;
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?,
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
+    }
 
     let case_json = get_case_json(&conn, &os_no, os_year).map_err(|e| e500(&e.to_string()))?;
     Ok(Json(case_json))
@@ -456,9 +544,45 @@ pub async fn delete_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
 
     if adj_date.is_some() { return Err(e400("Cannot delete an adjudicated case via this route.")); }
 
-    // Archive snapshot
+    // Archive snapshot: explicit column list because cops_master has more columns
+    // (shift, detention_date, case_type, is_draft, quashed, rejected, etc.) than
+    // cops_master_deleted.  SELECT * would produce a column-count mismatch error.
+    // deleted_by/reason/on are NULL here (copied before the update that sets them).
     conn.execute(
-        "INSERT INTO cops_master_deleted SELECT *, NULL, NULL, NULL FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
+        "INSERT INTO cops_master_deleted (
+             id, os_no, os_date, os_year, location_code, booked_by, pax_name, pax_nationality,
+             passport_no, passport_date, pax_address1, pax_address2, pax_address3, pax_date_of_birth,
+             pax_status, residence_at, country_of_departure, flight_no, flight_date, total_items,
+             total_items_value, dutiable_value, redeemed_value, re_export_value, confiscated_value,
+             total_duty_amount, rf_amount, pp_amount, ref_amount, br_amount, total_payable,
+             adjudication_date, adj_offr_name, adj_offr_designation, adjn_offr_remarks, adjn_offr_remarks1,
+             adjn_section_ref, online_adjn, os_printed, os_category, online_os, unique_no,
+             entry_deleted, bkup_taken, detained_by, seal_no, nationality, seizure_date,
+             pax_name_modified_by_vig, pax_image_filename, total_fa_value, wh_amount, other_amount,
+             br_no_str, br_no_num, br_date_str, br_amount_str, dr_no, dr_year, total_drs,
+             previous_os_details, previous_visits, father_name, old_passport_no, total_pkgs,
+             supdts_remarks, supdt_remarks2, closure_ind, adjudication_time,
+             deleted_by, deleted_reason, deleted_on,
+             post_adj_br_entries, post_adj_dr_no, post_adj_dr_date,
+             is_legacy, is_offline_adjudication, file_spot
+         )
+         SELECT
+             id, os_no, os_date, os_year, location_code, booked_by, pax_name, pax_nationality,
+             passport_no, passport_date, pax_address1, pax_address2, pax_address3, pax_date_of_birth,
+             pax_status, residence_at, country_of_departure, flight_no, flight_date, total_items,
+             total_items_value, dutiable_value, redeemed_value, re_export_value, confiscated_value,
+             total_duty_amount, rf_amount, pp_amount, ref_amount, br_amount, total_payable,
+             adjudication_date, adj_offr_name, adj_offr_designation, adjn_offr_remarks, adjn_offr_remarks1,
+             adjn_section_ref, online_adjn, os_printed, os_category, online_os, unique_no,
+             entry_deleted, bkup_taken, detained_by, seal_no, nationality, seizure_date,
+             pax_name_modified_by_vig, pax_image_filename, total_fa_value, wh_amount, other_amount,
+             br_no_str, br_no_num, br_date_str, br_amount_str, dr_no, dr_year, total_drs,
+             previous_os_details, previous_visits, father_name, old_passport_no, total_pkgs,
+             supdts_remarks, supdt_remarks2, closure_ind, adjudication_time,
+             NULL, NULL, NULL,
+             post_adj_br_entries, post_adj_dr_no, post_adj_dr_date,
+             is_legacy, is_offline_adjudication, file_spot
+         FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![os_no, os_year],
     ).map_err(|e| e500(&format!("Audit archive failed — deletion aborted: {e}")))?;
 
@@ -510,13 +634,15 @@ pub async fn adjudicate(State(pool): Db, auth: AdjnUser, Path((os_no, os_year)):
 
     conn.execute(
         "UPDATE cops_master SET adj_offr_name=?, adj_offr_designation=?, adjudication_date=?,
-         adjudication_time=?, adjn_offr_remarks=?, rf_amount=?, pp_amount=?, ref_amount=?,
+         adjudication_time=?, adjn_offr_remarks=?, adjn_section_ref=?,
+         rf_amount=?, pp_amount=?, ref_amount=?,
          confiscated_value=?, redeemed_value=?, re_export_value=?, total_payable=?,
          online_adjn='Y', closure_ind=?
          WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![
             req.adj_offr_name, desig, adj_date_val, stamp_time,
-            req.adjn_offr_remarks, rf, pp, refv,
+            req.adjn_offr_remarks, req.adjn_section_ref,
+            rf, pp, refv,
             req.confiscated_value.unwrap_or(0.0), req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),
             total_payable,
             if req.close_case.unwrap_or(false) { Some("Y") } else { None },
@@ -583,6 +709,16 @@ pub async fn quash_os(State(pool): Db, auth: AdjnUser, Path((os_no, os_year)): P
 
 pub async fn post_adj(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): Path<(String, i64)>, Json(req): Json<PostAdjRequest>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    // Guard: BR/DR details can only be recorded after the adjudication order is issued
+    let adj_date: Option<String> = conn.query_row(
+        "SELECT adjudication_date FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
+        rusqlite::params![os_no, os_year], |r| r.get(0)
+    ).map_err(|_| e404("O.S. case not found."))?;
+    if adj_date.is_none() {
+        return Err(e400("BR/DR details can only be added after the adjudication order is issued."));
+    }
+
     conn.execute(
         "UPDATE cops_master SET post_adj_br_entries=?, post_adj_dr_no=?, post_adj_dr_date=? WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![req.post_adj_br_entries, req.post_adj_dr_no, req.post_adj_dr_date, os_no, os_year],
@@ -611,16 +747,38 @@ pub async fn print_pdf(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
 
 pub async fn query_search(State(pool): Db, auth: AuthUser, Json(body): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
-    let search = body.get("search").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let page = body.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
-    let per_page = body.get("per_page").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 100);
+
+    // `limit` is an alias for `per_page` — OSPrintView sends `limit`.
+    let page     = body.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
+    let per_page = body.get("per_page")
+        .or_else(|| body.get("limit"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 100);
     let offset = (page - 1) * per_page;
 
-    let (where_clause, search_params): (&str, Vec<String>) = if search.is_empty() {
-        ("1=1", vec![])
+    // Exact lookup by os_no + os_year — returns full case JSON with items (used by OSPrintView).
+    let os_no_exact  = body.get("os_no").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+    let os_year_exact = body.get("os_year").and_then(|v| v.as_i64());
+
+    if let (Some(os_no), Some(os_year)) = (os_no_exact, os_year_exact) {
+        let case = get_case_json(&conn, &os_no, os_year)
+            .map_err(|e| e500(&e.to_string()))?;
+        return Ok(Json(json!({ "total": 1, "page": 1, "per_page": per_page, "items": [case] })));
+    }
+
+    // pax_name search — used by OSPrintView for prior-offence lookup.
+    let pax_name = body.get("pax_name").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+    let search   = body.get("search").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+
+    let (where_clause, search_params): (String, Vec<String>) = if let Some(ref name) = pax_name {
+        let p = format!("%{}%", name);
+        ("pax_name LIKE ? AND entry_deleted='N'".to_string(), vec![p])
+    } else if search.is_empty() {
+        ("entry_deleted='N'".to_string(), vec![])
     } else {
         let p = format!("%{}%", search);
-        ("(os_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ? OR flight_no LIKE ? OR adj_offr_name LIKE ?)",
+        ("(os_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ? OR flight_no LIKE ? OR adj_offr_name LIKE ?) AND entry_deleted='N'".to_string(),
          vec![p.clone(), p.clone(), p.clone(), p.clone(), p])
     };
 
@@ -662,10 +820,20 @@ pub async fn query_search(State(pool): Db, auth: AuthUser, Json(body): Json<serd
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
-    Ok(Json(json!({ "total": total, "page": page, "per_page": per_page, "items": rows })))
+    let total_pages = (total + per_page - 1) / per_page;
+    Ok(Json(json!({
+        "total":       total,
+        "total_count": total,
+        "page":        page,
+        "per_page":    per_page,
+        "total_pages": total_pages,
+        "has_next":    page < total_pages,
+        "has_prev":    page > 1,
+        "items":       rows,
+    })))
 }
 
-pub async fn monthly_report(State(pool): Db, auth: AuthUser, Query(params): Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, Err> {
+pub async fn monthly_report(State(pool): Db, _auth: AuthUser, Query(params): Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let month = params.get("month").and_then(|v| v.parse::<i64>().ok()).unwrap_or(chrono::Local::now().month() as i64);
     let year  = params.get("year").and_then(|v| v.parse::<i64>().ok()).unwrap_or(chrono::Local::now().year() as i64);
@@ -673,31 +841,288 @@ pub async fn monthly_report(State(pool): Db, auth: AuthUser, Query(params): Quer
     let from = format!("{year}-{month:02}-01");
     let to   = format!("{year}-{month:02}-31");
 
-    let mut stmt = conn.prepare(
-        "SELECT os_no, os_date, pax_name, passport_no, flight_no, total_items_value,
-         total_duty_amount, total_payable, adj_offr_name, adjudication_date, entry_deleted, is_draft
-         FROM cops_master WHERE os_date >= ? AND os_date <= ?
-         ORDER BY os_date, os_no"
+    // Load master rows — non-draft, non-deleted, ordered by OS no numerically
+    let mut mstmt = conn.prepare(
+        "SELECT os_no, os_date, os_year, booked_by, flight_no, pax_name, pax_nationality,
+                passport_no, pax_address1, pax_address2, pax_address3,
+                total_items_value, total_fa_value, rf_amount, ref_amount, pp_amount,
+                total_duty_amount, post_adj_br_entries, post_adj_dr_no, post_adj_dr_date,
+                file_spot, adj_offr_name, adj_offr_designation, case_type, adjudication_date,
+                wh_amount, other_amount
+         FROM cops_master
+         WHERE os_date >= ? AND os_date <= ? AND entry_deleted='N' AND is_draft='N'
+         ORDER BY CAST(os_no AS INTEGER)"
     ).map_err(|e| e500(&e.to_string()))?;
 
-    let rows: Vec<Value> = stmt.query_map(rusqlite::params![from, to], |r| {
-        Ok(json!({
-            "os_no": r.get::<_, String>(0)?,
-            "os_date": r.get::<_, Option<String>>(1)?,
-            "pax_name": r.get::<_, Option<String>>(2)?,
-            "passport_no": r.get::<_, Option<String>>(3)?,
-            "flight_no": r.get::<_, Option<String>>(4)?,
-            "total_items_value": r.get::<_, Option<f64>>(5)?,
-            "total_duty_amount": r.get::<_, Option<f64>>(6)?,
-            "total_payable": r.get::<_, Option<f64>>(7)?,
-            "adj_offr_name": r.get::<_, Option<String>>(8)?,
-            "adjudication_date": r.get::<_, Option<String>>(9)?,
-            "entry_deleted": r.get::<_, Option<String>>(10)?,
-            "is_draft": r.get::<_, Option<String>>(11)?,
-        }))
+    struct MasterRow {
+        os_no: String, os_date: Option<String>, os_year: Option<i64>,
+        booked_by: Option<String>, flight_no: Option<String>,
+        pax_name: Option<String>, nationality: Option<String>, passport_no: Option<String>,
+        addr1: Option<String>, addr2: Option<String>, addr3: Option<String>,
+        total_value: f64, fa_value: f64,
+        rf: f64, ref_amt: f64, pp: f64, duty: f64,
+        br_entries_json: Option<String>, dr_no: Option<String>, dr_date: Option<String>,
+        file_spot: Option<String>, adj_name: Option<String>, adj_desig: Option<String>,
+        case_type: Option<String>, adj_date: Option<String>,
+        wh: f64, other: f64,
+    }
+
+    let masters: Vec<MasterRow> = mstmt.query_map(rusqlite::params![from, to], |r| {
+        Ok(MasterRow {
+            os_no:           r.get(0)?,
+            os_date:         r.get(1)?,
+            os_year:         r.get(2)?,
+            booked_by:       r.get(3)?,
+            flight_no:       r.get(4)?,
+            pax_name:        r.get(5)?,
+            nationality:     r.get(6)?,
+            passport_no:     r.get(7)?,
+            addr1:           r.get(8)?,
+            addr2:           r.get(9)?,
+            addr3:           r.get(10)?,
+            total_value:     r.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+            fa_value:        r.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+            rf:              r.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+            ref_amt:         r.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
+            pp:              r.get::<_, Option<f64>>(15)?.unwrap_or(0.0),
+            duty:            r.get::<_, Option<f64>>(16)?.unwrap_or(0.0),
+            br_entries_json: r.get(17)?,
+            dr_no:           r.get(18)?,
+            dr_date:         r.get(19)?,
+            file_spot:       r.get(20)?,
+            adj_name:        r.get(21)?,
+            adj_desig:       r.get(22)?,
+            case_type:       r.get(23)?,
+            adj_date:        r.get(24)?,
+            wh:              r.get::<_, Option<f64>>(25)?.unwrap_or(0.0),
+            other:           r.get::<_, Option<f64>>(26)?.unwrap_or(0.0),
+        })
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
+    if masters.is_empty() {
+        return Ok(Json(json!({ "month": month, "year": year, "items": [] })));
+    }
+
+    // Bulk-load items for all cases in this month via a parameterized JOIN (no N+1, no injection)
+    let mut items_map: std::collections::HashMap<String, Vec<(f64, String, String, String, String)>> =
+        std::collections::HashMap::new();
+
+    if let Ok(mut istmt) = conn.prepare(
+        "SELECT i.os_no, i.os_year, i.items_qty, i.items_uqc, i.items_desc,
+                i.items_duty_type, i.items_release_category
+         FROM cops_items i
+         INNER JOIN cops_master m ON i.os_no = m.os_no AND i.os_year = m.os_year
+         WHERE m.os_date >= ? AND m.os_date <= ?
+           AND m.entry_deleted='N' AND m.is_draft='N'
+           AND (i.entry_deleted IS NULL OR i.entry_deleted='N')
+         ORDER BY i.os_no, i.os_year, i.items_sno"
+    ) {
+        let _ = istmt.query_map(rusqlite::params![from, to], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            ))
+        }).map(|rows| {
+            for row in rows.filter_map(|r| r.ok()) {
+                let (os_no, qty, uqc, desc, duty_type, rel_cat) = row;
+                items_map.entry(os_no).or_default()
+                    .push((qty, uqc, desc, duty_type, rel_cat));
+            }
+        });
+    }
+
+    let rows: Vec<Value> = masters.into_iter().map(|m| {
+        let items = items_map.get(&m.os_no).map(|v| v.as_slice()).unwrap_or(&[]);
+
+        // Address
+        let address = [m.addr1.as_deref(), m.addr2.as_deref(), m.addr3.as_deref()]
+            .iter().filter_map(|s| *s).map(str::trim).filter(|s| !s.is_empty())
+            .collect::<Vec<_>>().join(" ");
+
+        // Item description: "qty uqc desc, ..."
+        let item_description = items.iter().map(|(qty, uqc, desc, _, _)| {
+            let qty_s = if *qty == 0.0 { "0".to_string() } else { format!("{}", qty) };
+            format!("{qty_s} {uqc} {desc}").trim().to_string()
+        }).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
+
+        // Tags
+        let mut seen_tags: Vec<String> = Vec::new();
+        let mut seen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, _, desc, duty_type, _) in items {
+            let tag = tag_from_duty_type(duty_type)
+                .or_else(|| if !desc.is_empty() { Some(tag_from_desc(desc)) } else { None })
+                .unwrap_or_else(|| "Miscellaneous Goods (With Different Unit Qty Codes)".to_string());
+            if seen_set.insert(tag.clone()) { seen_tags.push(tag); }
+        }
+        let tags = seen_tags.join(", ");
+
+        // Confiscation label
+        let mut conf_cats: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (_, _, _, _, rel_cat) in items {
+            match rel_cat.to_uppercase().trim() {
+                "CONFS" => { conf_cats.insert("Absolute Confiscation"); }
+                "REF"   => { conf_cats.insert("Re-Export"); }
+                "RF"    => { conf_cats.insert("Confiscation"); }
+                _ => {}
+            }
+        }
+        let column1 = if conf_cats.is_empty() { None } else { Some(conf_cats.into_iter().collect::<Vec<_>>().join(" & ")) };
+
+        // Financial
+        let rf_ref = m.rf + m.ref_amt;
+        let total  = rf_ref + m.pp + m.duty;
+        let value_in_rs = (m.total_value - m.fa_value).max(0.0);
+        let other_charges = m.wh + m.other;
+
+        // BR entries: parse JSON → (br_nos_str, br_dates_str)
+        let (br_no, br_date) = parse_br_entries(m.br_entries_json.as_deref());
+
+        // DR remarks
+        let remarks = format_dr_remarks(m.dr_no.as_deref(), m.dr_date.as_deref());
+
+        // Export/Import
+        let export_import = if m.case_type.as_deref().unwrap_or("").trim().to_uppercase() == "EXPORT CASE" {
+            "Export"
+        } else {
+            "Import"
+        };
+
+        // O-in-O (adjudication order number = OS no itself in this system)
+        let oino_no   = m.os_no.clone();
+        let oino_date = m.adj_date.clone().unwrap_or_default();
+
+        json!({
+            "os_no":                m.os_no,
+            "os_date":              m.os_date,
+            "batch_aiu":            m.booked_by,
+            "flt_no":               m.flight_no,
+            "pax_name":             m.pax_name,
+            "nationality":          m.nationality,
+            "passport_no":          m.passport_no,
+            "address":              if address.is_empty() { Value::Null } else { json!(address) },
+            "item_description":     if item_description.is_empty() { Value::Null } else { json!(item_description) },
+            "tags":                 if tags.is_empty() { Value::Null } else { json!(tags) },
+            "quantity":             if item_description.is_empty() { Value::Null } else { json!(item_description) },
+            "value_in_rs":          value_in_rs,
+            "oinO_no":              oino_no,
+            "date_of_oinO":         oino_date,
+            "rf_ref":               rf_ref,
+            "penalty":              m.pp,
+            "duty_rs":              m.duty,
+            "other_charges":        other_charges,
+            "total":                total,
+            "br_no":                if br_no.is_empty() { Value::Null } else { json!(br_no) },
+            "br_date":              if br_date.is_empty() { Value::Null } else { json!(br_date) },
+            "remarks":              if remarks.is_empty() { Value::Null } else { json!(remarks) },
+            "file_spot":            m.file_spot.unwrap_or_else(|| "Spot".to_string()),
+            "adjudicated_by_ac_dc": m.adj_name.or(m.adj_desig),
+            "adjudicated_by_jc_adc": "",
+            "export_import":        export_import,
+            "column1":              column1,
+        })
+    }).collect();
+
     Ok(Json(json!({ "month": month, "year": year, "items": rows })))
+}
+
+// ── Monthly report helpers ────────────────────────────────────────────────────
+
+fn tag_from_duty_type(dt: &str) -> Option<String> {
+    let d = dt.to_lowercase();
+    if d.is_empty() { return None; }
+    Some(if d.contains("gold") || d.contains("jewellery") || d.contains("jewelry") || d.contains("necklace") || d.contains("bangle") || d.contains("yellow metal") {
+        "Gold (Primary & Jewellery Forms)"
+    } else if d.contains("silver") { "Silver"
+    } else if d.contains("liquor") { "Liquor"
+    } else if d.contains("e-cig") || d.contains("electronic cig") { "E-CIGARETTES"
+    } else if d.contains("cigarette") { "Cigarettes"
+    } else if d.contains("cell phone") || d.contains("mobile phone") || d.contains("smartphone") || d.contains("iphone") || d.contains("camera") || d.contains("television") || d.contains("dvd player") || d.contains("tablet") || d.contains("headphone") || d.contains("power bank") || d.contains("smartwatch") {
+        "Consumer Electronics (Cameras,Televisions,Cell Phones,DVD Players Etc)"
+    } else if d.contains("walkman") || d.contains("calculator") || d.contains("audio cd") || d.contains("video cd") {
+        "Misc. Electronic Items (CDs,DVDs,Walkman,Calculator,Digital Diary etc)"
+    } else if d.contains("watch part") || d.contains("watch movement") { "Watch_Parts"
+    } else if d.contains("watch") { "Watches"
+    } else if d.contains("ganja") || d.contains("cannabis") { "Ganja"
+    } else if d.contains("heroin") || d.contains("brown sugar") { "Heroin"
+    } else if d.contains("cocaine") { "Cocaine"
+    } else if d.contains("morphine") { "Morphine"
+    } else if d.contains("opium") { "Opium"
+    } else if d.contains("hashish") || d.contains("charas") { "Hashish / Charas"
+    } else if d.contains("mandrax") || d.contains("methaqualone") { "Mandrax / Methaqualone"
+    } else if d.contains("poppy") { "Poppy Seeds"
+    } else if d.contains("narcotic") || d.contains("ndps") || d.contains("methamphetamine") { "Other Narcotics"
+    } else if d.contains("ficn") || d.contains("counterfeit curr") { "Indian Fake Currency Notes (FICN)- Face Value in Rs."
+    } else if d.contains("foreign currency") || d.contains("fema") || d.contains("foreign exchange") || d.contains("currency") {
+        "Foreign Currency (Equivalent to Indian Rs.)"
+    } else if d.contains("wildlife") || d.contains("ivory") || d.contains("pangolin") || d.contains("coral") { "Wild Life / Flora / Fauna"
+    } else if d.contains("precious stone") || d.contains("diamond") || d.contains("sapphire") || d.contains("gemstone") || d.contains("ruby") || d.contains("emerald") || d.contains("pearl") {
+        "Diamonds & Precious Stones"
+    } else if d.contains("garment") { "Garments"
+    } else if d.contains("textile") || d.contains("fabric") { "Fabrics"
+    } else if d.contains("antique") { "Antiquities"
+    } else if d.contains("medicine") || d.contains("pharmaceutical") || d.contains("drug") || d.contains("capsule") || d.contains("steroid") {
+        "Pharmaceutical Drugs / Medicines"
+    } else if d.contains("chemical") { "Chemicals"
+    } else {
+        return None; // fall through to desc-based classification
+    }.to_string())
+}
+
+fn tag_from_desc(desc: &str) -> String {
+    let d = desc.to_lowercase();
+    if d.contains("gold") || d.contains("jewel") || d.contains("necklace") || d.contains("bangle") || d.contains("yellow metal") {
+        return "Gold (Primary & Jewellery Forms)".to_string();
+    }
+    if d.contains("silver") { return "Silver".to_string(); }
+    if d.contains("liquor") || d.contains("whisky") || d.contains("whiskey") || d.contains("vodka") || d.contains("brandy") || d.contains("rum") { return "Liquor".to_string(); }
+    if d.contains("e-cigarette") || d.contains("e cigarette") || d.contains("vape") { return "E-CIGARETTES".to_string(); }
+    if d.contains("cigarette") { return "Cigarettes".to_string(); }
+    if d.contains("mobile") || d.contains("phone") || d.contains("camera") || d.contains("laptop") || d.contains("tablet") || d.contains("ipad") || d.contains("iphone") || d.contains("television") || d.contains("tv") {
+        return "Consumer Electronics (Cameras,Televisions,Cell Phones,DVD Players Etc)".to_string();
+    }
+    if d.contains("watch") { return "Watches".to_string(); }
+    if d.contains("ganja") || d.contains("cannabis") || d.contains("marijuana") { return "Ganja".to_string(); }
+    if d.contains("heroin") { return "Heroin".to_string(); }
+    if d.contains("cocaine") { return "Cocaine".to_string(); }
+    if d.contains("currency") || d.contains("dollars") || d.contains("euro") || d.contains("forex") { return "Foreign Currency (Equivalent to Indian Rs.)".to_string(); }
+    if d.contains("diamond") || d.contains("precious stone") || d.contains("sapphire") || d.contains("ruby") { return "Diamonds & Precious Stones".to_string(); }
+    if d.contains("garment") || d.contains("clothing") || d.contains("shirt") || d.contains("trouser") { return "Garments".to_string(); }
+    "Miscellaneous Goods (With Different Unit Qty Codes)".to_string()
+}
+
+fn parse_br_entries(json_str: Option<&str>) -> (String, String) {
+    let s = match json_str { Some(s) if !s.is_empty() => s, _ => return (String::new(), String::new()) };
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(s) else { return (String::new(), String::new()) };
+    let mut numbers: Vec<String> = Vec::new();
+    let mut dates:   Vec<String> = Vec::new();
+    for e in &entries {
+        if let Some(no) = e.get("no").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            numbers.push(no.to_string());
+        }
+        if let Some(d) = e.get("date").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            // Convert YYYY-MM-DD → DD-MM-YYYY
+            let formatted = if d.len() >= 10 && d.as_bytes()[4] == b'-' {
+                format!("{}-{}-{}", &d[8..10], &d[5..7], &d[0..4])
+            } else { d.to_string() };
+            dates.push(formatted);
+        }
+    }
+    (numbers.join(", "), dates.join(", "))
+}
+
+fn format_dr_remarks(dr_no: Option<&str>, dr_date: Option<&str>) -> String {
+    let no = match dr_no { Some(s) if !s.trim().is_empty() => s.trim(), _ => return String::new() };
+    let mut parts = vec![format!("DR.No.{no}")];
+    if let Some(d) = dr_date.filter(|s| s.len() >= 10) {
+        if d.as_bytes()[4] == b'-' {
+            parts.push(format!("dt.{}.{}.{}", &d[8..10], &d[5..7], &d[0..4]));
+        }
+    }
+    parts.join(" ")
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -933,16 +1358,19 @@ pub async fn passport_lookup_by_pp(State(pool): Db, _auth: AuthUser, Json(body):
     if passport_no.is_empty() { return Ok(Json(json!({ "items": [] }))); }
 
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
-    let pp = passport_no.replace('\'', "''").to_uppercase();
+    // Passport numbers are stored uppercase (normalize_passport on every save), so
+    // UPPER() wrapper is redundant and defeats ix_cops_master_passport_no.
+    // Use a parameterized LIKE — lets SQLite use the index for the leading characters.
+    let pp_like = format!("%{}%", passport_no.to_uppercase());
 
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare(
         "SELECT os_no, os_date, os_year, pax_name, passport_no, pax_date_of_birth,
                 pax_nationality, flight_no, adjudication_date, adj_offr_name, total_payable
-         FROM cops_master WHERE UPPER(passport_no) LIKE '%{pp}%' AND entry_deleted='N'
+         FROM cops_master WHERE passport_no LIKE ? AND entry_deleted='N'
          ORDER BY os_date DESC LIMIT 50"
-    )).map_err(|e| e500(&e.to_string()))?;
+    ).map_err(|e| e500(&e.to_string()))?;
 
-    let mut rows: Vec<Value> = stmt.query_map([], |r| {
+    let mut rows: Vec<Value> = stmt.query_map(rusqlite::params![pp_like], |r| {
         Ok(json!({
             "os_no":              r.get::<_, String>(0)?,
             "os_date":            r.get::<_, Option<String>>(1)?,

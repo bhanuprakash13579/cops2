@@ -65,6 +65,7 @@ interface OSCase {
   adj_offr_name?: string;
   adj_offr_designation?: string;
   adjn_offr_remarks?: string;
+  adjn_section_ref?: string;
   adjudication_time?: string;
   online_adjn?: string;
   closure_ind?: string;
@@ -387,6 +388,76 @@ export default function AdjudicationForm() {
   const [confirmSave, setConfirmSave] = useState(false);
   const [isReAdjudicating, setIsReAdjudicating] = useState(false);
 
+  // ── Section reference — loaded from admin PIT config, hardcoded fallbacks ────
+  // Config keys (set in OS Template Editor → Confiscation Section Reference):
+  //   confiscation_section_import / confiscation_section_export
+  //   confiscation_fixed_subs_import / confiscation_fixed_subs_export   (csv)
+  //   confiscation_optional_subs_import / confiscation_optional_subs_export (csv)
+  interface SectionConfig {
+    importSection: string; exportSection: string;
+    importFixed: string[]; exportFixed: string[];
+    importOptional: string[]; exportOptional: string[];
+  }
+  const parseSubs = (csv: string): string[] =>
+    csv.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+  const [sectionCfg, setSectionCfg] = useState<SectionConfig>({
+    importSection: '111', exportSection: '113',
+    importFixed: ['d', 'l', 'm'], exportFixed: ['d', 'h', 'i'],
+    importOptional: ['i', 'o'], exportOptional: ['e'],
+  });
+
+  // Fetch once on mount — always use today so we get the CURRENT legal reference
+  // (not the case's os_date; sections apply at adjudication time, not detection time)
+  useEffect(() => {
+    const today = new Date().toISOString().split('T')[0];
+    api.get('/admin/config/pit', { params: { ref_date: today } })
+      .then(res => {
+        const ptc: Record<string, { field_value: string }> = res.data?.print_template ?? {};
+        const get = (key: string, fb: string) => ptc[key]?.field_value?.trim() || fb;
+        setSectionCfg({
+          importSection:  get('confiscation_section_import',        '111'),
+          exportSection:  get('confiscation_section_export',        '113'),
+          importFixed:    parseSubs(get('confiscation_fixed_subs_import',    'd,l,m')),
+          exportFixed:    parseSubs(get('confiscation_fixed_subs_export',    'd,h,i')),
+          importOptional: parseSubs(get('confiscation_optional_subs_import', 'i,o')),
+          exportOptional: parseSubs(get('confiscation_optional_subs_export', 'e')),
+        });
+      })
+      .catch(() => { /* keep defaults silently */ });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [selectedOptionals, setSelectedOptionals] = useState<string[]>([]);
+
+  // Pre-fill optional chips from saved adjn_section_ref when a case loads/changes.
+  // Extracts (x) subsection letters and restores the ones that are still in optionalSubs.
+  useEffect(() => {
+    if (!osCase?.adjn_section_ref) { setSelectedOptionals([]); return; }
+    const saved = (osCase.adjn_section_ref.match(/\(([a-z])\)/g) || [])
+      .map((m: string) => m.slice(1, -1));
+    // Store all parsed subs — safeOptionals filters to valid ones once sectionCfg loads.
+    // Filtering here would silently drop selections if optionalSubs hasn't populated yet (race).
+    setSelectedOptionals(saved);
+  }, [osCase?.id, osCase?.adjn_section_ref]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const isExportCase = osCase?.case_type === 'Export Case';
+  const sectionNo    = isExportCase ? sectionCfg.exportSection  : sectionCfg.importSection;
+  const fixedSubs    = isExportCase ? sectionCfg.exportFixed    : sectionCfg.importFixed;
+  const optionalSubs = isExportCase ? sectionCfg.exportOptional : sectionCfg.importOptional;
+
+  // Drop any selection that is no longer in optionalSubs (handles config updates & case type switch)
+  const safeOptionals = selectedOptionals.filter(s => optionalSubs.includes(s));
+
+  // Merge fixed + valid optionals, sort alphabetically, format with & before last
+  const allSubs = [...fixedSubs, ...safeOptionals].sort();
+  const formatSubs = (subs: string[]): string => {
+    if (subs.length === 0) return '';
+    const parts = subs.map(s => `(${s})`);
+    if (parts.length === 1) return parts[0];
+    return parts.slice(0, -1).join(', ') + ' & ' + parts[parts.length - 1];
+  };
+  const sectionText = `Section ${sectionNo}${formatSubs(allSubs)} of the Customs Act, 1962`;
+
   // Styled confirmation modals (replaces native window.confirm / window.prompt)
   const [showDeleteModal, setShowDeleteModal] = useState(false);
 
@@ -496,6 +567,7 @@ export default function AdjudicationForm() {
         adj_offr_designation: offrDesig,
         adjudication_date: adjDate,
         adjn_offr_remarks: remarks,
+        adjn_section_ref: sectionText,
         rf_amount: rfAmt,
         ref_amount: refAmt,
         pp_amount: ppAmt,
@@ -881,6 +953,58 @@ export default function AdjudicationForm() {
               </button>
             </div>
             <div className="p-4 bg-white">
+
+              {/* ── Section reference (Section 113 / 111 subsections) ────────── */}
+              {osCase && (
+                <div className="mb-4 pb-3 border-b border-amber-100">
+                  <div className="flex flex-wrap items-center gap-2 mb-2">
+                    <span className="text-xs font-bold text-slate-500 uppercase tracking-wider mr-1">
+                      Liable Under
+                    </span>
+                    {/* Section number badge */}
+                    <span className="text-xs font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded">
+                      Section {sectionNo}
+                    </span>
+                    {/* Fixed subsections — always present, non-removable */}
+                    {fixedSubs.map(s => (
+                      <span
+                        key={s}
+                        title="Fixed subsection"
+                        className="text-xs font-bold text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded select-none"
+                      >
+                        ({s})
+                      </span>
+                    ))}
+                    {/* Optional subsections — toggleable */}
+                    {optionalSubs.map(s => {
+                      const active = safeOptionals.includes(s);
+                      return (
+                        <button
+                          key={s}
+                          type="button"
+                          title={active ? `Remove (${s})` : `Add (${s})`}
+                          onClick={() => setSelectedOptionals(prev =>
+                            active ? prev.filter(x => x !== s) : [...prev, s]
+                          )}
+                          className={`text-xs font-bold px-2 py-0.5 rounded border transition-colors ${
+                            active
+                              ? 'bg-amber-600 text-white border-amber-700 shadow-sm'
+                              : 'bg-white text-slate-400 border-dashed border-slate-300 hover:bg-amber-50 hover:text-amber-700 hover:border-amber-400'
+                          }`}
+                        >
+                          ({s})
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {/* Preview of the fully-formatted section string */}
+                  <p className="text-xs text-slate-500 font-mono leading-relaxed">
+                    <span className="font-semibold text-amber-700">{sectionText}</span>
+                    {' '}— click the dashed buttons above to include optional subsections
+                  </p>
+                </div>
+              )}
+
               <div className="flex items-center justify-between mb-1.5">
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider">
                   Order Findings

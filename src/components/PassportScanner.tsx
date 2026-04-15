@@ -1,12 +1,27 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars */
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Scan, X, AlertCircle } from 'lucide-react';
 
 interface PassportScannerProps {
     onScan: (scannedData: any) => void;
+    /** Button label. Defaults to "Scan Document". */
+    label?: string;
+    /** Modal header title. Auto-derived from label if omitted. */
+    modalTitle?: string;
+    /** Instruction paragraph inside the modal. Accepts a string or JSX. */
+    description?: React.ReactNode;
 }
 
-export default function PassportScanner({ onScan }: PassportScannerProps) {
+export default function PassportScanner({ onScan, label, modalTitle, description }: PassportScannerProps) {
+    const btnLabel   = label ?? 'Scan Document';
+    const dlgTitle   = modalTitle ?? (
+        label === 'Scan Passport'      ? 'Passport Reader'      :
+        label === 'Scan Boarding Pass' ? 'Boarding Pass Reader' :
+        'Document Reader'
+    );
+    const dlgDesc    = description ?? (
+        <>Place the cursor in the field below and use your barcode scanner to read the <b>Passport MRZ</b> or <b>Boarding Pass</b> standard barcode.</>
+    );
     const [isOpen, setIsOpen] = useState(false);
     const [scanBuffer, setScanBuffer] = useState('');
     const [error, setError] = useState('');
@@ -139,7 +154,7 @@ export default function PassportScanner({ onScan }: PassportScannerProps) {
                 onClick={() => setIsOpen(true)}
                 className="flex items-center px-4 py-2 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md hover:bg-indigo-100 transition-colors font-medium shadow-sm text-sm"
             >
-                <Scan size={18} className="mr-2" /> Scan Document
+                <Scan size={18} className="mr-2" /> {btnLabel}
             </button>
 
             {isOpen && (
@@ -147,7 +162,7 @@ export default function PassportScanner({ onScan }: PassportScannerProps) {
                     <div className="bg-white rounded-xl shadow-xl w-full max-w-lg border border-slate-200 overflow-hidden">
                         <div className="flex justify-between items-center p-4 border-b border-slate-100 bg-slate-50">
                             <h3 className="font-bold text-slate-800 flex items-center">
-                                <Scan size={20} className="mr-2 text-indigo-600" /> Document Reader
+                                <Scan size={20} className="mr-2 text-indigo-600" /> {dlgTitle}
                             </h3>
                             <button onClick={() => setIsOpen(false)} className="text-slate-400 hover:text-slate-600">
                                 <X size={20} />
@@ -161,7 +176,7 @@ export default function PassportScanner({ onScan }: PassportScannerProps) {
                             
                             <h4 className="text-xl font-bold text-slate-800 mb-2">Ready to Scan</h4>
                             <p className="text-slate-500 max-w-sm mb-6">
-                                Place the cursor in the field below and use your barcode scanner to read the <b>Passport MRZ</b> or <b>Boarding Pass</b> standard barcode.
+                                {dlgDesc}
                             </p>
 
                             <input 

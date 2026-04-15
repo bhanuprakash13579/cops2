@@ -40,10 +40,10 @@ pub async fn generate(
 fn generate_br_register(conn: &rusqlite::Connection, from: &str, to: &str) -> Result<(String, String), Err> {
     let mut stmt = conn.prepare(
         "SELECT br_no, br_year, br_date, pax_name, passport_no, pax_nationality,
-                pax_date_of_birth, flight_no, flight_date, location_code, booked_by,
+                pax_date_of_birth, flight_no, flight_date, location_code, login_id,
                 total_items_value, total_duty_amount, total_payable, br_printed,
                 os_no, os_year
-         FROM br_master WHERE br_date >= ? AND br_date <= ?
+         FROM br_master WHERE br_date >= ? AND br_date <= ? AND entry_deleted='N'
          ORDER BY br_date, br_no"
     ).map_err(|e| e500(&e.to_string()))?;
 
@@ -135,9 +135,9 @@ fn generate_os_register(conn: &rusqlite::Connection, from: &str, to: &str) -> Re
 fn generate_dr_register(conn: &rusqlite::Connection, from: &str, to: &str) -> Result<(String, String), Err> {
     let mut stmt = conn.prepare(
         "SELECT dr_no, dr_year, dr_date, pax_name, passport_no, pax_nationality,
-                pax_date_of_birth, flight_no, flight_date, location_code, booked_by,
+                pax_date_of_birth, flight_no, flight_date, location_code, login_id,
                 total_items_value, dr_printed, os_no, os_year
-         FROM dr_master WHERE dr_date >= ? AND dr_date <= ?
+         FROM dr_master WHERE dr_date >= ? AND dr_date <= ? AND entry_deleted='N'
          ORDER BY dr_date, dr_no"
     ).map_err(|e| e500(&e.to_string()))?;
 

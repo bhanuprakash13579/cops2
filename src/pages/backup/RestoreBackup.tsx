@@ -172,13 +172,11 @@ export default function RestoreBackup() {
   // ── Load on login ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!adminToken) return;
-    api.get('/admin/device-info', { headers: adminHeaders(adminToken) })
-      .then(r => setDeviceInfo(r.data)).catch(() => {});
     loadUsers();
     api.get('/admin/features', { headers: adminHeaders(adminToken) })
-      .then(r => setApisEnabled(!!r.data.apis_enabled)).catch(() => {});
+      .then(r => setApisEnabled(r.data.apis_enabled === 'true')).catch(() => {});
     api.get('/admin/mode', { headers: adminHeaders(adminToken) })
-      .then(r => { setProdMode(!!r.data.prod_mode); })
+      .then(r => { setProdMode(r.data.mode !== undefined && r.data.mode !== 'sdo'); })
       .catch(() => {});
     loadDevices();
   }, [adminToken]);
@@ -238,8 +236,8 @@ export default function RestoreBackup() {
     setFlagsLoading(true);
     setFlagsMsg('');
     try {
-      const res = await api.put('/admin/features', { apis_enabled: enable }, { headers: adminHeaders(adminToken) });
-      setApisEnabled(!!res.data.apis_enabled);
+      await api.put('/admin/features', { apis_enabled: enable ? 'true' : 'false' }, { headers: adminHeaders(adminToken) });
+      setApisEnabled(enable);
       setFlagsMsg(enable ? 'COPS ↔ APIS module enabled.' : 'COPS ↔ APIS module disabled.');
     } catch (err: any) {
       setFlagsMsg(err.response?.data?.detail || 'Failed to update feature flag.');

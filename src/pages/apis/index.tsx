@@ -154,7 +154,7 @@ function UploadZone({
       <input
         ref={inputRef}
         type="file"
-        accept=".xlsx,.xls"
+        accept=".xlsx,.xls,.csv"
         className="hidden"
         onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
       />
@@ -174,7 +174,7 @@ function UploadZone({
         <p className="text-sm text-slate-500 mt-1">
           {loading
             ? 'Matching against COPS database, please wait'
-            : 'or click to browse — accepts .xlsx / .xls'}
+            : 'or click to browse — accepts .xlsx / .xls / .csv'}
         </p>
       </div>
 

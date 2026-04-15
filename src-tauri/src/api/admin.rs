@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use axum::{extract::{Path, State}, http::StatusCode, Json};
+use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde_json::{json, Value};
 use crate::{auth::{AuthUser, AdminUser, ADMIN_USERNAME, ADMIN_PWD_HASH}, db::DbPool};
 
@@ -21,7 +21,7 @@ pub async fn get_mode(State(pool): Db) -> Result<Json<Value>, Err> {
     Ok(Json(json!({ "mode": mode })))
 }
 
-pub async fn set_mode(State(pool): Db, _auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
+pub async fn set_mode(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let mode = req.get("mode").and_then(|v| v.as_str()).ok_or_else(|| e400("mode required"))?;
     let valid = ["sdo", "adjudication", "query", "apis"];
     if !valid.contains(&mode) {
@@ -55,7 +55,7 @@ pub async fn get_features(State(pool): Db) -> Result<Json<Value>, Err> {
     Ok(Json(Value::Object(map)))
 }
 
-pub async fn set_features(State(pool): Db, _auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
+pub async fn set_features(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     if let Some(obj) = req.as_object() {
         for (k, v) in obj {
@@ -76,17 +76,18 @@ pub async fn set_features(State(pool): Db, _auth: AuthUser, Json(req): Json<serd
 pub async fn get_print_template(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, template_key, template_value, effective_from, created_by
-         FROM print_template_config ORDER BY effective_from DESC"
+        "SELECT id, field_key, field_label, field_value, effective_from, created_by
+         FROM print_template_config ORDER BY field_key, effective_from DESC"
     ).map_err(|e| e500(&e.to_string()))?;
 
     let rows: Vec<Value> = stmt.query_map([], |r| {
         Ok(json!({
             "id":             r.get::<_, i64>(0)?,
-            "template_key":   r.get::<_, String>(1)?,
-            "template_value": r.get::<_, Option<String>>(2)?,
-            "effective_from": r.get::<_, Option<String>>(3)?,
-            "created_by":     r.get::<_, Option<String>>(4)?,
+            "field_key":      r.get::<_, String>(1)?,
+            "field_label":    r.get::<_, Option<String>>(2)?,
+            "field_value":    r.get::<_, Option<String>>(3)?,
+            "effective_from": r.get::<_, Option<String>>(4)?,
+            "created_by":     r.get::<_, Option<String>>(5)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
@@ -95,17 +96,17 @@ pub async fn get_print_template(State(pool): Db, _auth: AuthUser) -> Result<Json
 
 pub async fn upsert_print_template(State(pool): Db, auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
-    let key = req.get("template_key").and_then(|v| v.as_str()).ok_or_else(|| e400("template_key required"))?;
-    let val = req.get("template_value").and_then(|v| v.as_str());
-    let from = req.get("effective_from").and_then(|v| v.as_str())
-        .unwrap_or_else(|| Box::leak(chrono::Local::now().format("%Y-%m-%d").to_string().into_boxed_str()));
+    let key = req.get("field_key")
+        .and_then(|v| v.as_str()).ok_or_else(|| e400("field_key required"))?;
+    let label = req.get("field_label").and_then(|v| v.as_str());
+    let val   = req.get("field_value").and_then(|v| v.as_str()).unwrap_or("");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let from  = req.get("effective_from").and_then(|v| v.as_str()).unwrap_or(&today);
 
     conn.execute(
-        "INSERT INTO print_template_config (template_key, template_value, effective_from, created_by)
-         VALUES (?,?,?,?)
-         ON CONFLICT(template_key) DO UPDATE SET template_value=excluded.template_value,
-         effective_from=excluded.effective_from, created_by=excluded.created_by",
-        rusqlite::params![key, val, from, auth.0.sub],
+        "INSERT INTO print_template_config (field_key, field_label, field_value, effective_from, created_by)
+         VALUES (?,?,?,?,?)",
+        rusqlite::params![key, label, val, from, auth.0.sub],
     ).map_err(|e| e500(&e.to_string()))?;
 
     Ok(Json(json!({ "message": "Template config saved." })))
@@ -116,42 +117,42 @@ pub async fn upsert_print_template(State(pool): Db, auth: AuthUser, Json(req): J
 pub async fn get_baggage_rules(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, rule_key, rule_value, pax_type, item_category, effective_from
-         FROM baggage_rules_config ORDER BY effective_from DESC"
+        "SELECT id, rule_key, rule_label, rule_value, rule_uqc, effective_from, created_by
+         FROM baggage_rules_config ORDER BY rule_key, effective_from DESC"
     ).map_err(|e| e500(&e.to_string()))?;
 
     let rows: Vec<Value> = stmt.query_map([], |r| {
         Ok(json!({
             "id":             r.get::<_, i64>(0)?,
             "rule_key":       r.get::<_, String>(1)?,
-            "rule_value":     r.get::<_, Option<String>>(2)?,
-            "pax_type":       r.get::<_, Option<String>>(3)?,
-            "item_category":  r.get::<_, Option<String>>(4)?,
+            "rule_label":     r.get::<_, Option<String>>(2)?,
+            "rule_value":     r.get::<_, Option<f64>>(3)?,
+            "rule_uqc":       r.get::<_, Option<String>>(4)?,
             "effective_from": r.get::<_, Option<String>>(5)?,
+            "created_by":     r.get::<_, Option<String>>(6)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     Ok(Json(json!(rows)))
 }
 
-pub async fn upsert_baggage_rules(State(pool): Db, _auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
+pub async fn upsert_baggage_rules(State(pool): Db, auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let key = req.get("rule_key").and_then(|v| v.as_str()).ok_or_else(|| e400("rule_key required"))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let from = req.get("effective_from").and_then(|v| v.as_str()).unwrap_or(&today);
 
+    // Versioned: INSERT a new row (multiple rows per key supported for history)
     conn.execute(
-        "INSERT INTO baggage_rules_config (rule_key, rule_value, pax_type, item_category, effective_from)
-         VALUES (?,?,?,?,?)
-         ON CONFLICT(rule_key) DO UPDATE SET rule_value=excluded.rule_value,
-         pax_type=excluded.pax_type, item_category=excluded.item_category,
-         effective_from=excluded.effective_from",
+        "INSERT INTO baggage_rules_config (rule_key, rule_label, rule_value, rule_uqc, effective_from, created_by)
+         VALUES (?,?,?,?,?,?)",
         rusqlite::params![
             key,
-            req.get("rule_value").and_then(|v| v.as_str()),
-            req.get("pax_type").and_then(|v| v.as_str()),
-            req.get("item_category").and_then(|v| v.as_str()),
+            req.get("rule_label").and_then(|v| v.as_str()),
+            req.get("rule_value").and_then(|v| v.as_f64()),
+            req.get("rule_uqc").and_then(|v| v.as_str()),
             from,
+            auth.0.sub,
         ],
     ).map_err(|e| e500(&e.to_string()))?;
 
@@ -163,42 +164,40 @@ pub async fn upsert_baggage_rules(State(pool): Db, _auth: AuthUser, Json(req): J
 pub async fn get_special_allowances(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, item_description, allowance_qty, allowance_value, uqc,
-                pax_type, duty_rate, effective_from
-         FROM special_item_allowances ORDER BY item_description"
+        "SELECT id, item_name, keywords, allowance_qty, allowance_uqc, effective_from, active
+         FROM special_item_allowances ORDER BY item_name"
     ).map_err(|e| e500(&e.to_string()))?;
 
     let rows: Vec<Value> = stmt.query_map([], |r| {
         Ok(json!({
-            "id":               r.get::<_, i64>(0)?,
-            "item_description": r.get::<_, Option<String>>(1)?,
-            "allowance_qty":    r.get::<_, Option<f64>>(2)?,
-            "allowance_value":  r.get::<_, Option<f64>>(3)?,
-            "uqc":              r.get::<_, Option<String>>(4)?,
-            "pax_type":         r.get::<_, Option<String>>(5)?,
-            "duty_rate":        r.get::<_, Option<f64>>(6)?,
-            "effective_from":   r.get::<_, Option<String>>(7)?,
+            "id":            r.get::<_, i64>(0)?,
+            "item_name":     r.get::<_, Option<String>>(1)?,
+            "keywords":      r.get::<_, Option<String>>(2)?,
+            "allowance_qty": r.get::<_, Option<f64>>(3)?,
+            "allowance_uqc": r.get::<_, Option<String>>(4)?,
+            "effective_from":r.get::<_, Option<String>>(5)?,
+            "active":        r.get::<_, Option<String>>(6)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     Ok(Json(json!(rows)))
 }
 
-pub async fn create_special_allowance(State(pool): Db, _auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
+pub async fn create_special_allowance(State(pool): Db, auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     conn.execute(
-        "INSERT INTO special_item_allowances (item_description, allowance_qty, allowance_value,
-         uqc, pax_type, duty_rate, effective_from) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO special_item_allowances (item_name, keywords, allowance_qty, allowance_uqc,
+         effective_from, active, created_by) VALUES (?,?,?,?,?,?,?)",
         rusqlite::params![
-            req.get("item_description").and_then(|v| v.as_str()),
+            req.get("item_name").and_then(|v| v.as_str()),
+            req.get("keywords").and_then(|v| v.as_str()),
             req.get("allowance_qty").and_then(|v| v.as_f64()),
-            req.get("allowance_value").and_then(|v| v.as_f64()),
-            req.get("uqc").and_then(|v| v.as_str()),
-            req.get("pax_type").and_then(|v| v.as_str()),
-            req.get("duty_rate").and_then(|v| v.as_f64()),
+            req.get("allowance_uqc").and_then(|v| v.as_str()),
             req.get("effective_from").and_then(|v| v.as_str()).unwrap_or(&today),
+            "Y",
+            auth.0.sub,
         ],
     ).map_err(|e| e500(&e.to_string()))?;
 
@@ -215,83 +214,128 @@ pub async fn delete_special_allowance(State(pool): Db, _auth: AuthUser, Path(id)
 
 // ── PIT (Point-in-time config snapshot) ──────────────────────────────────────
 
-pub async fn get_pit_config(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
+pub async fn get_pit_config(
+    State(pool): Db,
+    _auth: AuthUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let ref_date = params.get("ref_date").map(|s| s.as_str()).unwrap_or(today.as_str()).to_string();
 
-    // Return latest versioned config for each key
+    // Latest effective row per field_key as of ref_date
     let mut stmt = conn.prepare(
-        "SELECT config_key, config_value, effective_from
+        "SELECT field_key, field_label, field_value, effective_from
          FROM print_template_config
-         ORDER BY config_key, effective_from DESC"
+         WHERE effective_from <= ?
+           AND effective_from = (
+               SELECT MAX(p2.effective_from)
+               FROM print_template_config p2
+               WHERE p2.field_key = print_template_config.field_key
+                 AND p2.effective_from <= ?
+           )"
     ).map_err(|e| e500(&e.to_string()))?;
 
-    let rows: Vec<Value> = stmt.query_map([], |r| {
-        Ok(json!({
-            "config_key":     r.get::<_, String>(0)?,
-            "config_value":   r.get::<_, Option<String>>(1)?,
-            "effective_from": r.get::<_, Option<String>>(2)?,
-        }))
-    }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+    let mut map = serde_json::Map::new();
+    let rows = stmt.query_map(rusqlite::params![ref_date, ref_date], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    }).map_err(|e| e500(&e.to_string()))?;
 
-    Ok(Json(json!(rows)))
+    for row in rows.filter_map(|r| r.ok()) {
+        let (key, label, val, eff_from) = row;
+        map.insert(key.clone(), json!({
+            "field_key":      key,
+            "field_label":    label,
+            "field_value":    val.unwrap_or_default(),
+            "effective_from": eff_from,
+        }));
+    }
+
+    Ok(Json(json!({ "print_template": map })))
 }
 
 // ── Allowed devices ───────────────────────────────────────────────────────────
 
-pub async fn list_devices(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
+pub async fn list_devices(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, device_name, device_mac, device_ip, location_code, is_active, created_on
-         FROM allowed_devices ORDER BY device_name"
+        "SELECT id, label, ip_address, mac_address, hostname, is_active, added_on, notes
+         FROM allowed_devices ORDER BY label"
     ).map_err(|e| e500(&e.to_string()))?;
 
     let rows: Vec<Value> = stmt.query_map([], |r| {
         Ok(json!({
-            "id":            r.get::<_, i64>(0)?,
-            "device_name":   r.get::<_, Option<String>>(1)?,
-            "device_mac":    r.get::<_, Option<String>>(2)?,
-            "device_ip":     r.get::<_, Option<String>>(3)?,
-            "location_code": r.get::<_, Option<String>>(4)?,
-            "is_active":     r.get::<_, Option<String>>(5)?,
-            "created_on":    r.get::<_, Option<String>>(6)?,
+            "id":          r.get::<_, i64>(0)?,
+            "label":       r.get::<_, Option<String>>(1)?,
+            "ip_address":  r.get::<_, Option<String>>(2)?,
+            "mac_address": r.get::<_, Option<String>>(3)?,
+            "hostname":    r.get::<_, Option<String>>(4)?,
+            "is_active":   r.get::<_, i64>(5).unwrap_or(1) != 0,
+            "added_on":    r.get::<_, Option<String>>(6)?,
+            "notes":       r.get::<_, Option<String>>(7)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     Ok(Json(json!(rows)))
 }
 
-pub async fn create_device(State(pool): Db, _auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
+pub async fn create_device(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    // Reject duplicate active IP addresses.
+    if let Some(ip) = req.get("ip_address").and_then(|v| v.as_str()) {
+        if !ip.trim().is_empty() {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM allowed_devices WHERE ip_address=? AND is_active=1",
+                rusqlite::params![ip], |r| r.get(0),
+            ).unwrap_or(0);
+            if exists > 0 {
+                return Err(e400("This IP address is already registered as an active device."));
+            }
+        }
+    }
+
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     conn.execute(
-        "INSERT INTO allowed_devices (device_name, device_mac, device_ip, location_code, is_active, created_on)
-         VALUES (?,?,?,?,?,?)",
+        "INSERT INTO allowed_devices (label, ip_address, mac_address, hostname, is_active, added_on, notes)
+         VALUES (?,?,?,?,1,?,?)",
         rusqlite::params![
-            req.get("device_name").and_then(|v| v.as_str()),
-            req.get("device_mac").and_then(|v| v.as_str()),
-            req.get("device_ip").and_then(|v| v.as_str()),
-            req.get("location_code").and_then(|v| v.as_str()),
-            "Y", today,
+            req.get("label").and_then(|v| v.as_str()),
+            req.get("ip_address").and_then(|v| v.as_str()),
+            req.get("mac_address").and_then(|v| v.as_str()),
+            req.get("hostname").and_then(|v| v.as_str()),
+            today,
+            req.get("notes").and_then(|v| v.as_str()),
         ],
     ).map_err(|e| e400(&e.to_string()))?;
 
     Ok(Json(json!({ "message": "Device registered." })))
 }
 
-pub async fn update_device(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
+pub async fn update_device(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    // is_active comes from frontend as boolean; convert to INTEGER for SQLite
+    let is_active: Option<i64> = req.get("is_active").and_then(|v| v.as_bool())
+        .map(|b| if b { 1 } else { 0 });
     let affected = conn.execute(
-        "UPDATE allowed_devices SET device_name=COALESCE(?,device_name),
-         device_mac=COALESCE(?,device_mac), device_ip=COALESCE(?,device_ip),
-         location_code=COALESCE(?,location_code), is_active=COALESCE(?,is_active)
+        "UPDATE allowed_devices SET label=COALESCE(?,label),
+         ip_address=COALESCE(?,ip_address), mac_address=COALESCE(?,mac_address),
+         hostname=COALESCE(?,hostname), is_active=COALESCE(?,is_active),
+         notes=COALESCE(?,notes)
          WHERE id=?",
         rusqlite::params![
-            req.get("device_name").and_then(|v| v.as_str()),
-            req.get("device_mac").and_then(|v| v.as_str()),
-            req.get("device_ip").and_then(|v| v.as_str()),
-            req.get("location_code").and_then(|v| v.as_str()),
-            req.get("is_active").and_then(|v| v.as_str()),
+            req.get("label").and_then(|v| v.as_str()),
+            req.get("ip_address").and_then(|v| v.as_str()),
+            req.get("mac_address").and_then(|v| v.as_str()),
+            req.get("hostname").and_then(|v| v.as_str()),
+            is_active,
+            req.get("notes").and_then(|v| v.as_str()),
             id,
         ],
     ).map_err(|e| e500(&e.to_string()))?;
@@ -299,10 +343,10 @@ pub async fn update_device(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>
     Ok(Json(json!({ "message": "Device updated." })))
 }
 
-pub async fn delete_device(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, Err> {
+pub async fn delete_device(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let affected = conn.execute(
-        "UPDATE allowed_devices SET is_active='N' WHERE id=?",
+        "UPDATE allowed_devices SET is_active=0 WHERE id=?",
         rusqlite::params![id],
     ).map_err(|e| e500(&e.to_string()))?;
     if affected == 0 { return Err(e404("Device not found.")); }
@@ -314,10 +358,12 @@ pub async fn delete_device(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>
 pub async fn update_print_template_row(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let affected = conn.execute(
-        "UPDATE print_template_config SET template_value=COALESCE(?,template_value),
+        "UPDATE print_template_config SET field_value=COALESCE(?,field_value),
+         field_label=COALESCE(?,field_label),
          effective_from=COALESCE(?,effective_from) WHERE id=?",
         rusqlite::params![
-            req.get("template_value").and_then(|v| v.as_str()),
+            req.get("field_value").and_then(|v| v.as_str()),
+            req.get("field_label").and_then(|v| v.as_str()),
             req.get("effective_from").and_then(|v| v.as_str()),
             id,
         ],
@@ -339,13 +385,13 @@ pub async fn delete_print_template_row(State(pool): Db, _admin: AdminUser, Path(
 pub async fn update_baggage_rules_row(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let affected = conn.execute(
-        "UPDATE baggage_rules_config SET rule_value=COALESCE(?,rule_value),
-         pax_type=COALESCE(?,pax_type), item_category=COALESCE(?,item_category),
+        "UPDATE baggage_rules_config SET rule_label=COALESCE(?,rule_label),
+         rule_value=COALESCE(?,rule_value), rule_uqc=COALESCE(?,rule_uqc),
          effective_from=COALESCE(?,effective_from) WHERE id=?",
         rusqlite::params![
-            req.get("rule_value").and_then(|v| v.as_str()),
-            req.get("pax_type").and_then(|v| v.as_str()),
-            req.get("item_category").and_then(|v| v.as_str()),
+            req.get("rule_label").and_then(|v| v.as_str()),
+            req.get("rule_value").and_then(|v| v.as_f64()),
+            req.get("rule_uqc").and_then(|v| v.as_str()),
             req.get("effective_from").and_then(|v| v.as_str()),
             id,
         ],
@@ -367,17 +413,16 @@ pub async fn delete_baggage_rules_row(State(pool): Db, _admin: AdminUser, Path(i
 pub async fn update_special_allowance(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let affected = conn.execute(
-        "UPDATE special_item_allowances SET item_description=COALESCE(?,item_description),
-         allowance_qty=COALESCE(?,allowance_qty), allowance_value=COALESCE(?,allowance_value),
-         uqc=COALESCE(?,uqc), pax_type=COALESCE(?,pax_type), duty_rate=COALESCE(?,duty_rate),
+        "UPDATE special_item_allowances SET item_name=COALESCE(?,item_name),
+         keywords=COALESCE(?,keywords), allowance_qty=COALESCE(?,allowance_qty),
+         allowance_uqc=COALESCE(?,allowance_uqc), active=COALESCE(?,active),
          effective_from=COALESCE(?,effective_from) WHERE id=?",
         rusqlite::params![
-            req.get("item_description").and_then(|v| v.as_str()),
+            req.get("item_name").and_then(|v| v.as_str()),
+            req.get("keywords").and_then(|v| v.as_str()),
             req.get("allowance_qty").and_then(|v| v.as_f64()),
-            req.get("allowance_value").and_then(|v| v.as_f64()),
-            req.get("uqc").and_then(|v| v.as_str()),
-            req.get("pax_type").and_then(|v| v.as_str()),
-            req.get("duty_rate").and_then(|v| v.as_f64()),
+            req.get("allowance_uqc").and_then(|v| v.as_str()),
+            req.get("active").and_then(|v| v.as_str()),
             req.get("effective_from").and_then(|v| v.as_str()),
             id,
         ],
@@ -388,22 +433,27 @@ pub async fn update_special_allowance(State(pool): Db, _admin: AdminUser, Path(i
 
 // ── Remarks templates ─────────────────────────────────────────────────────────
 
-pub async fn get_remarks_templates(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
+pub async fn get_remarks_templates(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, template_key, template_text, updated_on FROM remarks_templates ORDER BY template_key"
+        "SELECT id, template_key, template_text FROM remarks_templates ORDER BY template_key"
     ).map_err(|e| e500(&e.to_string()))?;
 
-    let rows: Vec<Value> = stmt.query_map([], |r| {
-        Ok(json!({
-            "id":            r.get::<_, i64>(0)?,
-            "template_key":  r.get::<_, String>(1)?,
-            "template_text": r.get::<_, Option<String>>(2)?,
-            "updated_on":    r.get::<_, Option<String>>(3)?,
-        }))
-    }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+    }).map_err(|e| e500(&e.to_string()))?;
 
-    Ok(Json(json!(rows)))
+    // Return as Record<string, {id, label, value}> keyed by template_key
+    let mut map = serde_json::Map::new();
+    for row in rows.filter_map(|r| r.ok()) {
+        let (id, key, text) = row;
+        map.insert(key.clone(), json!({
+            "id":    id,
+            "label": key,
+            "value": text.unwrap_or_default(),
+        }));
+    }
+    Ok(Json(Value::Object(map)))
 }
 
 pub async fn upsert_remarks_template(State(pool): Db, _admin: AdminUser, Path(key): Path<String>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
@@ -464,11 +514,16 @@ pub async fn purge_os(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_
     del("DELETE FROM dr_items WHERE dr_no IN (SELECT dr_no FROM dr_master WHERE os_no=?)", &[&os_no]);
     del("DELETE FROM dr_master WHERE os_no=?", &[&os_no]);
 
+    let total_rows_deleted: i64 = deleted.values()
+        .filter_map(|v| v.as_i64())
+        .sum();
+
     tracing::warn!("ADMIN HARD-PURGE: OS {os_no}/{os_year} permanently deleted. Breakdown: {:?}", deleted);
 
     Ok(Json(json!({
         "message": format!("OS {os_no}/{os_year} permanently purged."),
-        "deleted": deleted,
+        "total_rows_deleted": total_rows_deleted,
+        "breakdown": deleted,
     })))
 }
 
@@ -478,23 +533,27 @@ pub async fn get_os_config(State(pool): Db, _auth: AuthUser) -> Result<Json<Valu
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
     // Latest arrival and departure template configs
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut stmt = conn.prepare(
-        "SELECT template_key, template_value, effective_from FROM print_template_config
-         ORDER BY template_key, effective_from DESC"
+        "SELECT field_key, field_value, effective_from FROM print_template_config
+         WHERE effective_from <= ?
+           AND effective_from = (
+               SELECT MAX(p2.effective_from) FROM print_template_config p2
+               WHERE p2.field_key = print_template_config.field_key
+                 AND p2.effective_from <= ?
+           )
+         ORDER BY field_key"
     ).map_err(|e| e500(&e.to_string()))?;
 
     let mut arrival = serde_json::Map::new();
     let mut departure = serde_json::Map::new();
-    let seen_keys = std::cell::RefCell::new(std::collections::HashSet::new());
 
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(rusqlite::params![today, today], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
     }).map_err(|e| e500(&e.to_string()))?;
 
     for row in rows.filter_map(|r| r.ok()) {
-        let (key, val, eff_from) = row;
-        if seen_keys.borrow().contains(&key) { continue; }
-        seen_keys.borrow_mut().insert(key.clone());
+        let (key, val, _eff_from) = row;
         let v = json!(val.unwrap_or_default());
         if key.starts_with("departure_") || key.contains("export") {
             departure.insert(key, v);

@@ -29,6 +29,9 @@ pub struct UserOut {
 pub struct LoginRequest {
     pub user_id: String,
     pub password: String,
+    /// Optional: "sdo" | "adjudication" | "query" | "apis"
+    /// When provided, validates that the user's role is permitted for this module.
+    pub module_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

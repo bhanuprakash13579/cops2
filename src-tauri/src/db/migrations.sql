@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS cops_master (
     adj_offr_designation VARCHAR(200),
     adjn_offr_remarks TEXT,
     adjn_offr_remarks1 TEXT,
+    adjn_section_ref TEXT,
     online_adjn VARCHAR(5),
     unique_no INTEGER,
     entry_deleted VARCHAR(5) DEFAULT 'N',
@@ -290,6 +291,7 @@ CREATE TABLE IF NOT EXISTS cops_master_deleted (
     adj_offr_designation VARCHAR(200),
     adjn_offr_remarks TEXT,
     adjn_offr_remarks1 TEXT,
+    adjn_section_ref TEXT,
     online_adjn VARCHAR(5),
     os_printed VARCHAR(5),
     os_category TEXT,
@@ -572,11 +574,12 @@ CREATE TABLE IF NOT EXISTS legal_statutes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_legal_statutes_keyword ON legal_statutes (keyword);
 
--- ── Feature Flags ─────────────────────────────────────────────────────────────
+-- ── Feature Flags (key-value store) ──────────────────────────────────────────
+-- Note: This is a key-value store. Old schema used boolean columns — the correct
+-- schema is config_key/config_value to allow arbitrary flags and APP_MODE storage.
 CREATE TABLE IF NOT EXISTS feature_flags (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    apis_enabled INTEGER NOT NULL DEFAULT 0,
-    session_timeout_minutes INTEGER NOT NULL DEFAULT 480
+    config_key   TEXT PRIMARY KEY,
+    config_value TEXT NOT NULL DEFAULT ''
 );
 
 -- ── Print Template Config (versioned) ─────────────────────────────────────────
@@ -664,3 +667,12 @@ CREATE TABLE IF NOT EXISTS cops_items_deleted (
     entry_deleted VARCHAR(1) DEFAULT 'Y',
     deleted_on DATE
 );
+
+-- ── Performance Indexes (cops_master) ────────────────────────────────────────
+-- Mirrors the v3 migration indexes from cops1 for consistent query performance
+CREATE INDEX IF NOT EXISTS ix_cops_master_adj_offr_name       ON cops_master (adj_offr_name);
+CREATE INDEX IF NOT EXISTS ix_cops_master_online_adjn         ON cops_master (online_adjn);
+CREATE INDEX IF NOT EXISTS ix_cops_master_adjudication_time   ON cops_master (adjudication_time);
+CREATE INDEX IF NOT EXISTS ix_cops_master_closure_ind         ON cops_master (closure_ind);
+CREATE INDEX IF NOT EXISTS ix_cops_master_pending_composite   ON cops_master (entry_deleted, is_draft, adjudication_date, adj_offr_name);
+CREATE INDEX IF NOT EXISTS ix_cops_master_os_date             ON cops_master (os_date);

@@ -1305,9 +1305,13 @@ export default function OffenceForm() {
                     <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider flex items-center">
                         <User className="mr-2 text-blue-500" size={16} /> Passenger & Passport Information
                     </h2>
-                    <PassportScanner onScan={handleScan} />
+                    <PassportScanner
+                        onScan={handleScan}
+                        label="Scan Passport"
+                        description={<>Scan the <b>Machine Readable Zone (MRZ)</b> — the two lines of encoded text at the bottom of the biographical data page. Auto-fills name, nationality, passport number, date of birth and expiry.</>}
+                    />
                 </div>
-                
+
                 <div className="grid grid-cols-5 gap-4">
                     <div className="col-span-2">
                         <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Passenger Name</label>
@@ -1419,8 +1423,12 @@ export default function OffenceForm() {
                 <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider flex items-center">
                     <Plane className="mr-2 text-emerald-500" size={16} /> Interception & Travel Details
                 </h2>
-                {/* Reuse scanner here so officers can scan boarding passes directly in the flight section */}
-                <PassportScanner onScan={handleScan} />
+                {/* Officers can scan boarding passes directly in the flight section */}
+                <PassportScanner
+                    onScan={handleScan}
+                    label="Scan Boarding Pass"
+                    description={<>Scan the <b>IATA BCBP barcode</b> on the physical or mobile boarding pass. Auto-fills passenger name, PNR, flight number, origin, destination and date.</>}
+                />
             </div>
             <div className="grid grid-cols-4 gap-4">
                 <div>

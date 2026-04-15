@@ -347,15 +347,15 @@ export default function BRDRLookupPage() {
     setDrDetail(null);
     setSearched(true);
     try {
-      const params: Record<string, string | number> = { page: p, limit: LIMIT };
-      if (q.trim()) params.q = q.trim();
+      const params: Record<string, string | number> = { page: p, per_page: LIMIT };
+      if (q.trim()) params.search = q.trim();
       const parsedYear = parseInt(year);
       if (year && !isNaN(parsedYear)) params.year = parsedYear;
       if (typeFilter) params[tab === 'br' ? 'br_type' : 'dr_type'] = typeFilter;
 
       const res = await api.get(`/os-query/${tab}/search`, { params });
-      if (tab === 'br') setBrResults(res.data.results);
-      else setDrResults(res.data.results);
+      if (tab === 'br') setBrResults(res.data.items);
+      else setDrResults(res.data.items);
       setTotal(res.data.total);
       setPage(p);
     } catch (err: any) {

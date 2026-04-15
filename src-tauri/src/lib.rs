@@ -20,10 +20,28 @@ use tauri::Manager;
 ///      database is securely wiped so sensitive data never sits unencrypted.
 ///   3. Fresh install — `cops.db` will be created empty by `create_pool`.
 fn resolve_db_path(app_data: &Path) -> PathBuf {
-    let cops2_db  = app_data.join("cops.db");
-    let cops1_db  = app_data.join("cops_br_database.db");
+    let cops2_db       = app_data.join("cops.db");
+    let cops1_db       = app_data.join("cops_br_database.db");
+    let migration_lock = app_data.join(".migration_lock");
 
-    // Already have a cops2 database — use it directly.
+    // ── Interrupted-migration recovery ────────────────────────────────────────
+    // If cops.db exists but the sentinel lock file is also present, the last
+    // migration run was interrupted before it could finish (e.g. force-quit,
+    // power loss).  The partially-written cops.db is unusable — delete it and
+    // its WAL/SHM companions so we fall through to a clean re-migration below.
+    if cops2_db.exists() && migration_lock.exists() {
+        tracing::warn!(
+            "Detected interrupted migration (lock file present). \
+             Removing partial cops.db and retrying migration…"
+        );
+        for name in &["cops.db", "cops.db-wal", "cops.db-shm"] {
+            let _ = std::fs::remove_file(app_data.join(name));
+        }
+        // Leave the lock file in place — it will be removed after a successful
+        // migration completes further below.
+    }
+
+    // Already have a fully-migrated cops2 database — use it directly.
     if cops2_db.exists() {
         tracing::info!("Using existing cops2 database: {:?}", cops2_db);
         return cops2_db;
@@ -32,6 +50,12 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
     // Check for cops1 database (handles both plain and encrypted).
     if cops1_db.exists() {
         tracing::info!("Found cops1 database at {:?} — attempting migration…", cops1_db);
+
+        // Write the sentinel BEFORE touching cops.db so that any interruption
+        // (force-quit, power loss) between now and the final cleanup is
+        // detected on the next startup and the partial DB is discarded.
+        let _ = std::fs::write(&migration_lock, b"migration in progress");
+
         match migrate_cops1(&cops1_db, &cops2_db) {
             Ok(()) => {
                 tracing::info!("cops1 → cops2 migration complete. Using {:?}", cops2_db);
@@ -42,6 +66,9 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
                 // then delete so it can't be recovered.
                 secure_delete_cops1_files(app_data);
 
+                // Remove the sentinel only after everything succeeded.
+                let _ = std::fs::remove_file(&migration_lock);
+
                 return cops2_db;
             }
             Err(e) => {
@@ -50,7 +77,13 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
                      Use the admin panel to restore from a cops1 backup.",
                     e
                 );
-                // Fall through: cops2_db doesn't exist yet, create_pool will create it.
+                // Clean up the partial cops.db (if any) and the sentinel so
+                // we don't loop on the recovery path next time.
+                for name in &["cops.db", "cops.db-wal", "cops.db-shm"] {
+                    let _ = std::fs::remove_file(app_data.join(name));
+                }
+                let _ = std::fs::remove_file(&migration_lock);
+                // Fall through: create_pool will create a fresh cops.db.
             }
         }
     }
@@ -175,6 +208,7 @@ use tauri::Emitter;
 mod win32 {
     use std::ffi::c_void;
     pub type HWND   = *mut c_void;
+    pub type WPARAM = usize;
     pub type LPARAM = isize;
     pub type BOOL   = i32;
     pub const GWL_EXSTYLE:      i32 = -20;
@@ -183,6 +217,9 @@ mod win32 {
     /// Show without activating — foreground app keeps focus.
     pub const SW_SHOWNOACTIVATE: i32 = 4;
     pub const TRUE: BOOL = 1;
+    /// WM_SYSCOMMAND + SC_MAXIMIZE maximizes without activating the window.
+    pub const WM_SYSCOMMAND: u32 = 0x0112;
+    pub const SC_MAXIMIZE: WPARAM = 0xF030;
     #[link(name = "user32")]
     extern "system" {
         pub fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
@@ -194,6 +231,7 @@ mod win32 {
             lp_enum_func: Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>,
             l_param:      LPARAM,
         ) -> BOOL;
+        pub fn PostMessageW(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> BOOL;
     }
 }
 
@@ -208,12 +246,18 @@ fn show_main_window(app: tauri::AppHandle) {
     {
         if let Ok(hwnd) = window.hwnd() {
             unsafe {
-                win32::ShowWindow(hwnd as usize as win32::HWND, win32::SW_SHOWNOACTIVATE);
+                win32::ShowWindow(hwnd.0, win32::SW_SHOWNOACTIVATE);
+                // Maximize without stealing focus: post WM_SYSCOMMAND + SC_MAXIMIZE.
+                win32::PostMessageW(hwnd.0, win32::WM_SYSCOMMAND, win32::SC_MAXIMIZE, 0);
             }
         }
     }
     #[cfg(not(target_os = "windows"))]
-    { let _ = window.show(); }
+    {
+        let _ = window.show();
+        // GTK/WebKit2GTK may not honour maximized:true for initially-hidden windows.
+        let _ = window.maximize();
+    }
 }
 
 // ── Windows helper: hide WebView2 child window from taskbar grouping ──────────
@@ -324,11 +368,14 @@ pub fn run() {
             {
                 if let Some(main_win) = app.get_webview_window("main") {
                     if let Ok(main_hwnd) = main_win.hwnd() {
+                        // *mut c_void is not Send — convert to usize before crossing thread
+                        // boundary, then cast back inside the async block.
+                        let hwnd_raw = main_hwnd.0 as usize;
                         tauri::async_runtime::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                             unsafe {
                                 win32::EnumChildWindows(
-                                    main_hwnd as usize as win32::HWND,
+                                    hwnd_raw as win32::HWND,
                                     Some(hide_webview2_thumbnail),
                                     0,
                                 );
@@ -349,20 +396,39 @@ pub fn run() {
                 .layer(cors)
                 .layer(CompressionLayer::new());
 
-            // If port is already bound (another instance running), show the
-            // window so the user can see the error dialog, then bail.
+            // ── Port binding with SO_REUSEADDR ────────────────────────────────
+            // Using socket2 to set SO_REUSEADDR before bind.  Without this,
+            // Windows keeps the port in TIME_WAIT for ~60 s after an abrupt
+            // crash, causing "port already in use" on an immediate restart even
+            // when no other instance is actually running.
             let bind_addr = format!("127.0.0.1:{}", api::SERVER_PORT);
-            let listener = match std::net::TcpListener::bind(&bind_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    return Err(format!(
-                        "Port {} is already in use ({e}).\n\n\
-                         Another instance of COPS may already be running.\n\
-                         Please close it and try again.",
-                        api::SERVER_PORT
-                    ).into());
-                }
+            let bind_sock_addr: std::net::SocketAddr = match bind_addr.parse() {
+                Ok(a) => a,
+                Err(e) => return Err(format!("Invalid bind address {bind_addr}: {e}").into()),
             };
+            let socket = match socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            ) {
+                Ok(s) => s,
+                Err(e) => return Err(format!("Failed to create TCP socket: {e}").into()),
+            };
+            if let Err(e) = socket.set_reuse_address(true) {
+                tracing::warn!("Could not set SO_REUSEADDR (non-fatal): {e}");
+            }
+            if let Err(e) = socket.bind(&bind_sock_addr.into()) {
+                return Err(format!(
+                    "Port {} is already in use ({e}).\n\n\
+                     Another instance of COPS may already be running.\n\
+                     Please close it and try again.",
+                    api::SERVER_PORT
+                ).into());
+            }
+            if let Err(e) = socket.listen(128) {
+                return Err(format!("Failed to listen on port {}: {e}", api::SERVER_PORT).into());
+            }
+            let listener: std::net::TcpListener = socket.into();
 
             let app_handle_for_axum = app.handle().clone();
             tauri::async_runtime::spawn(async move {

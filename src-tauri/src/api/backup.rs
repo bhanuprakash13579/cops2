@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zip::{write::SimpleFileOptions, CompressionMethod};
 
-use crate::{auth::{AdjnUser, AuthUser}, db::DbPool};
+use crate::{auth::{AdjnUser, AdminUser, AuthUser}, db::DbPool};
 
 type Db = State<Arc<DbPool>>;
 type Err = (StatusCode, Json<Value>);
@@ -36,7 +36,7 @@ const MASTER_COLS: &[&str] = &[
     "is_draft","is_legacy","is_offline_adjudication","file_spot",
     "os_printed","os_category","online_os",
     "adjudication_date","adjudication_time","adj_offr_name","adj_offr_designation",
-    "adjn_offr_remarks","adjn_offr_remarks1","online_adjn",
+    "adjn_offr_remarks","adjn_offr_remarks1","adjn_section_ref","online_adjn",
     "supdts_remarks","supdt_remarks2",
     "unique_no","entry_deleted","bkup_taken",
     "detained_by","seal_no","nationality","seizure_date",
@@ -123,7 +123,7 @@ fn parse_date(s: &str) -> String {
 
 // ── Export CSV (full database → ZIP) ─────────────────────────────────────────
 
-pub async fn export_csv(State(pool): Db, _auth: AuthUser) -> Result<impl IntoResponse, Err> {
+async fn inner_export_csv(pool: Arc<DbPool>) -> Result<impl IntoResponse, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let master_sql = format!("SELECT {} FROM cops_master ORDER BY os_date, os_no", MASTER_COLS.join(","));
     let items_sql  = format!("SELECT {} FROM cops_items  ORDER BY os_no, os_year, items_sno", ITEMS_COLS.join(","));
@@ -158,14 +158,17 @@ pub async fn export_csv(State(pool): Db, _auth: AuthUser) -> Result<impl IntoRes
     ))
 }
 
-// Alias for the admin panel route
-pub async fn admin_export_csv(State(pool): Db, auth: AuthUser) -> Result<impl IntoResponse, Err> {
-    export_csv(State(pool), auth).await
+pub async fn export_csv(State(pool): Db, _auth: AuthUser) -> Result<impl IntoResponse, Err> {
+    inner_export_csv(pool).await
+}
+
+pub async fn admin_export_csv(State(pool): Db, _admin: AdminUser) -> Result<impl IntoResponse, Err> {
+    inner_export_csv(pool).await
 }
 
 // ── Export DB (SQLite binary backup) ─────────────────────────────────────────
 
-pub async fn export_db(State(pool): Db, _auth: AuthUser) -> Result<impl IntoResponse, Err> {
+async fn inner_export_db(pool: Arc<DbPool>) -> Result<impl IntoResponse, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let src_path = db_path(&conn).map_err(|e| e500(&e.to_string()))?;
     drop(conn); // release before backup
@@ -194,16 +197,19 @@ pub async fn export_db(State(pool): Db, _auth: AuthUser) -> Result<impl IntoResp
     ))
 }
 
-// Alias for the admin panel route
-pub async fn admin_export_db(State(pool): Db, auth: AuthUser) -> Result<impl IntoResponse, Err> {
-    export_db(State(pool), auth).await
+pub async fn export_db(State(pool): Db, _auth: AuthUser) -> Result<impl IntoResponse, Err> {
+    inner_export_db(pool).await
+}
+
+pub async fn admin_export_db(State(pool): Db, _admin: AdminUser) -> Result<impl IntoResponse, Err> {
+    inner_export_db(pool).await
 }
 
 // ── Restore full DB from uploaded .db file ────────────────────────────────────
 
 pub async fn admin_restore_fulldb(
     State(pool): Db,
-    _auth: AuthUser,
+    _admin: AdminUser,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, Err> {
     let mut file_bytes: Option<Vec<u8>> = None;
@@ -247,7 +253,7 @@ pub async fn admin_restore_fulldb(
 
 pub async fn admin_upload_legacy(
     State(pool): Db,
-    _auth: AuthUser,
+    _admin: AdminUser,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, Err> {
     let bytes = extract_file(&mut multipart).await?;
@@ -316,7 +322,7 @@ pub async fn admin_upload_legacy(
 
 pub async fn admin_upload_legacy_items(
     State(pool): Db,
-    _auth: AuthUser,
+    _admin: AdminUser,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, Err> {
     let bytes = extract_file(&mut multipart).await?;
@@ -394,7 +400,7 @@ pub async fn admin_upload_legacy_items(
 
 pub async fn admin_restore(
     State(pool): Db,
-    _auth: AuthUser,
+    _admin: AdminUser,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, Err> {
     let bytes = extract_file(&mut multipart).await?;
@@ -479,7 +485,7 @@ pub async fn admin_restore(
                     is_draft, is_legacy, is_offline_adjudication, file_spot,
                     os_printed, os_category, online_os,
                     adjudication_date, adjudication_time, adj_offr_name, adj_offr_designation,
-                    adjn_offr_remarks, adjn_offr_remarks1, online_adjn,
+                    adjn_offr_remarks, adjn_offr_remarks1, adjn_section_ref, online_adjn,
                     supdts_remarks, supdt_remarks2, unique_no, entry_deleted, bkup_taken,
                     detained_by, seal_no, nationality, seizure_date,
                     dr_no, dr_year, total_drs, previous_os_details, total_pkgs, closure_ind,
@@ -488,7 +494,7 @@ pub async fn admin_restore(
                 ) VALUES (
                     ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                     ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )",
                 rusqlite::params![
                     os_no, os_year,
@@ -526,6 +532,7 @@ pub async fn admin_restore(
                     opt(get("online_os")), opt(get("adjudication_date")), opt(get("adjudication_time")),
                     opt(get("adj_offr_name")), opt(get("adj_offr_designation")),
                     opt(get("adjn_offr_remarks")), opt(get("adjn_offr_remarks1")),
+                    opt(get("adjn_section_ref")),
                     opt(get("online_adjn")), opt(get("supdts_remarks")), opt(get("supdt_remarks2")),
                     parse_i64(get("unique_no")), or_n(get("entry_deleted")), opt(get("bkup_taken")),
                     opt(get("detained_by")), opt(get("seal_no")), opt(get("nationality")),
@@ -615,7 +622,7 @@ pub async fn admin_restore(
 
 // ── MDB import — not supported in cops2 ──────────────────────────────────────
 
-pub async fn admin_import_mdb(_auth: AuthUser, mut multipart: Multipart) -> Result<Json<Value>, Err> {
+pub async fn admin_import_mdb(_admin: AdminUser, mut multipart: Multipart) -> Result<Json<Value>, Err> {
     // Drain the multipart body so the connection is properly closed
     while multipart.next_field().await.ok().flatten().is_some() {}
     Err((StatusCode::NOT_IMPLEMENTED, Json(json!({
@@ -638,6 +645,7 @@ const REPORT_MASTER_COLS: &[&str] = &[
     "br_amount","wh_amount","other_amount","total_payable",
     "br_no_num","br_date_str","br_amount_str","br_no_str",
     "adjudication_date","adj_offr_name","adj_offr_designation","adjn_offr_remarks",
+    "adjn_section_ref",
     "online_adjn","dr_no","dr_year","seizure_date","supdts_remarks",
     "post_adj_br_entries","post_adj_dr_no","post_adj_dr_date",
 ];
@@ -915,22 +923,22 @@ pub async fn adjudication_summary_pdf(
     ))
 }
 
-// ── upload/new — alias for admin restore (accepts CSV or ZIP) ─────────────────
+// ── upload/new and upload/legacy — destructive operations, require AdminUser ──
 
 pub async fn upload_new(
     State(pool): Db,
-    auth: AuthUser,
+    _admin: AdminUser,
     multipart: Multipart,
 ) -> Result<Json<Value>, Err> {
-    admin_restore(State(pool), auth, multipart).await
+    admin_restore(State(pool), _admin, multipart).await
 }
 
 pub async fn upload_legacy(
     State(pool): Db,
-    auth: AuthUser,
+    _admin: AdminUser,
     multipart: Multipart,
 ) -> Result<Json<Value>, Err> {
-    admin_upload_legacy(State(pool), auth, multipart).await
+    admin_upload_legacy(State(pool), _admin, multipart).await
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────

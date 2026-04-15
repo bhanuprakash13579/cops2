@@ -9,9 +9,33 @@ use crate::{
     models::user::*,
 };
 
+// ── Login rate limiting ───────────────────────────────────────────────────────
+// 10 failed attempts per user_id within a 5-minute rolling window.
+
+static LOGIN_ATTEMPTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>
+> = std::sync::OnceLock::new();
+
+const MAX_LOGIN_ATTEMPTS: u32 = 10;
+const LOGIN_WINDOW_SECS: u64 = 300;
+
 type Db = State<Arc<DbPool>>;
 
 pub async fn login(State(pool): Db, Json(req): Json<LoginRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // ── Rate limit check ─────────────────────────────────────────────────────
+    let limiter = LOGIN_ATTEMPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let mut map = limiter.lock().unwrap();
+        let entry = map.entry(req.user_id.clone()).or_insert((0, std::time::Instant::now()));
+        if entry.1.elapsed().as_secs() >= LOGIN_WINDOW_SECS {
+            *entry = (0, std::time::Instant::now());
+        }
+        if entry.0 >= MAX_LOGIN_ATTEMPTS {
+            return Err(err429("Too many login attempts. Please wait 5 minutes before trying again."));
+        }
+        entry.0 += 1;
+    }
+
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
 
     let user: Option<(String, String, String, Option<String>, Option<String>)> = conn
@@ -32,6 +56,24 @@ pub async fn login(State(pool): Db, Json(req): Json<LoginRequest>) -> Result<Jso
         return Err(err401("Invalid credentials"));
     }
 
+    // ── Module-type access control ───────────────────────────────────────────
+    // Prevent SDOs logging into the adjudication module and vice-versa.
+    if let Some(ref mt) = req.module_type {
+        let allowed: &[&str] = match mt.to_lowercase().as_str() {
+            "sdo"          => &["SDO"],
+            "adjudication" => &["DC", "AC"],
+            _              => &["SDO", "DC", "AC"],
+        };
+        if !allowed.contains(&role.as_str()) {
+            return Err(err403("Your role is not permitted to access this module."));
+        }
+    }
+
+    // ── Successful login: reset rate-limit counter ───────────────────────────
+    if let Ok(mut map) = limiter.lock() {
+        map.remove(&req.user_id);
+    }
+
     let name: String = conn
         .query_row("SELECT user_name FROM users WHERE user_id = ?", [&user_id], |r| r.get(0))
         .map_err(|e| err500(&e.to_string()))?;
@@ -50,10 +92,12 @@ pub async fn login(State(pool): Db, Json(req): Json<LoginRequest>) -> Result<Jso
     })))
 }
 
-pub async fn list_users(State(pool): Db, auth: AuthUser) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn list_users(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, user_name, user_desig, user_id, user_role, user_status, created_on FROM users ORDER BY user_role, user_name"
+        "SELECT id, user_name, user_desig, user_id, user_role, user_status, created_on
+         FROM users WHERE (user_status IS NULL OR user_status = 'ACTIVE')
+         ORDER BY user_role, user_name"
     ).map_err(|e| err500(&e.to_string()))?;
 
     let users: Vec<Value> = stmt.query_map([], |r| {
@@ -74,7 +118,19 @@ pub async fn list_users(State(pool): Db, auth: AuthUser) -> Result<Json<Value>, 
 }
 
 pub async fn create_user(State(pool): Db, _auth: AuthUser, Json(req): Json<CreateUserRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !["SDO", "DC", "AC"].contains(&req.user_role.as_str()) {
+        return Err(err400("Invalid role. Must be SDO, DC, or AC."));
+    }
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE user_id = ?",
+        [&req.user_id], |r| r.get(0),
+    ).unwrap_or(0);
+    if exists > 0 {
+        return Err(err409("A user with this login ID already exists."));
+    }
+
     let pwd_hash = hash(&req.password, DEFAULT_COST).map_err(|e| err500(&e.to_string()))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -100,8 +156,19 @@ pub async fn update_user(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>, 
     Ok(Json(json!({ "message": "User updated." })))
 }
 
-pub async fn delete_user(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn delete_user(State(pool): Db, auth: AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+
+    // Users may only close their own account.
+    let target_user_id: Option<String> = conn.query_row(
+        "SELECT user_id FROM users WHERE id = ?",
+        rusqlite::params![id], |r| r.get(0),
+    ).optional().map_err(|e| err500(&e.to_string()))?;
+    let target_user_id = target_user_id.ok_or_else(|| err404("User not found"))?;
+    if target_user_id != auth.0.sub {
+        return Err(err403("You may only close your own account."));
+    }
+
     conn.execute("UPDATE users SET user_status = 'CLOSED', closed_on = ? WHERE id = ?",
         rusqlite::params![chrono::Local::now().format("%Y-%m-%d").to_string(), id])
         .map_err(|e| err500(&e.to_string()))?;
@@ -192,10 +259,14 @@ pub async fn me(State(pool): Db, auth: AuthUser) -> Result<Json<Value>, (StatusC
 
 pub async fn upgrade_role(
     State(pool): Db,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(user_id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Only DC users are permitted to change roles.
+    if auth.0.role != "DC" {
+        return Err(err403("Only DC users can upgrade roles."));
+    }
     let new_role = req.get("user_role").and_then(|v| v.as_str())
         .ok_or_else(|| err400("user_role is required"))?;
     if !["SDO", "DC", "AC"].contains(&new_role) {
@@ -267,7 +338,19 @@ pub async fn admin_list_users(State(pool): Db, _admin: AdminUser) -> Result<Json
 }
 
 pub async fn admin_create_user(State(pool): Db, _admin: AdminUser, Json(req): Json<CreateUserRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !["SDO", "DC", "AC"].contains(&req.user_role.as_str()) {
+        return Err(err400("Invalid role. Must be SDO, DC, or AC."));
+    }
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE user_id = ?",
+        [&req.user_id], |r| r.get(0),
+    ).unwrap_or(0);
+    if exists > 0 {
+        return Err(err409("A user with this login ID already exists."));
+    }
+
     let pwd_hash = hash(&req.password, DEFAULT_COST).map_err(|e| err500(&e.to_string()))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -320,18 +403,33 @@ pub async fn admin_soft_delete_user(State(pool): Db, _admin: AdminUser, Path(id)
 
 pub async fn admin_hard_delete_user(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
-    let affected = conn.execute("DELETE FROM users WHERE id=?", rusqlite::params![id])
-        .map_err(|e| err500(&e.to_string()))?;
-    if affected == 0 {
-        return Err(err404("User not found."));
+
+    // Only CLOSED users may be permanently deleted — prevents accidental data loss.
+    let status: Option<Option<String>> = conn.query_row(
+        "SELECT user_status FROM users WHERE id=?",
+        rusqlite::params![id], |r| r.get(0),
+    ).optional().map_err(|e| err500(&e.to_string()))?;
+
+    match status {
+        None => return Err(err404("User not found.")),
+        Some(s) if s.as_deref() != Some("CLOSED") => {
+            return Err(err400("Only CLOSED users can be permanently deleted. Close the account first."));
+        }
+        _ => {}
     }
+
+    conn.execute("DELETE FROM users WHERE id=?", rusqlite::params![id])
+        .map_err(|e| err500(&e.to_string()))?;
     Ok(Json(json!({ "message": "User permanently deleted." })))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 fn err400(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::BAD_REQUEST,          Json(json!({ "detail": msg }))) }
 fn err401(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::UNAUTHORIZED,         Json(json!({ "detail": msg }))) }
+fn err403(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::FORBIDDEN,            Json(json!({ "detail": msg }))) }
 fn err404(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::NOT_FOUND,            Json(json!({ "detail": msg }))) }
+fn err409(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::CONFLICT,             Json(json!({ "detail": msg }))) }
+fn err429(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::TOO_MANY_REQUESTS,    Json(json!({ "detail": msg }))) }
 fn err500(msg: &str) -> (StatusCode, Json<Value>) { (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "detail": msg }))) }
 
 trait OptionalExt<T> {

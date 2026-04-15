@@ -109,7 +109,7 @@ export default function MonthlyReportPage() {
     setRows(null);
     try {
       const res = await api.get('/os-query/monthly-report', { params: { month, year } });
-      setRows(res.data || []);
+      setRows(res.data?.items || []);
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Failed to load report.';
       setError(msg);

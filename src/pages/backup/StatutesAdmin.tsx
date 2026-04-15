@@ -21,7 +21,7 @@ interface RemarksTemplate {
 export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
   const [statutes, setStatutes] = useState<Statute[]>([]);
   const [loading, setLoading] = useState(true);
-  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editingKey, setEditingKey] = useState<number | null>(null);
   const [editData, setEditData] = useState<Partial<Statute>>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState('');
@@ -46,7 +46,7 @@ export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
   }, []);
 
   const startEdit = (s: Statute) => {
-    setEditingKey(s.keyword);
+    setEditingKey(s.id);
     setEditData({
       display_name: s.display_name,
       is_prohibited: s.is_prohibited,
@@ -69,7 +69,7 @@ export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
       await api.put(`/statutes/${editingKey}`, editData, {
         headers: { Authorization: `Bearer ${adminToken}` },
       });
-      setStatutes(prev => prev.map(s => s.keyword === editingKey ? { ...s, ...editData } as Statute : s));
+      setStatutes(prev => prev.map(s => s.id === editingKey ? { ...s, ...editData } as Statute : s));
       setEditingKey(null);
       setEditData({});
     } catch (err: any) {
@@ -83,7 +83,7 @@ export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
     setSavingTpl(true);
     setTplSaveError('');
     try {
-      await api.put(`/admin/config/remarks-templates/${key}`, { value: tplDraft }, {
+      await api.put(`/admin/config/remarks-templates/${key}`, { template_text: tplDraft }, {
         headers: { Authorization: `Bearer ${adminToken}` },
       });
       setTemplates(prev => ({ ...prev, [key]: { ...prev[key], value: tplDraft } }));
@@ -287,7 +287,7 @@ export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
       </div>
 
       {statutes.map(s => (
-        <div key={s.keyword} className="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm">
+        <div key={s.id} className="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm">
           {/* Header */}
           <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200">
             <div className="flex items-center gap-2">
@@ -303,7 +303,7 @@ export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
                 </span>
               )}
             </div>
-            {editingKey !== s.keyword ? (
+            {editingKey !== s.id ? (
               <button
                 onClick={() => startEdit(s)}
                 className="text-[11px] px-2 py-1 bg-white border border-slate-300 text-slate-600 rounded hover:bg-slate-50 flex items-center gap-1 font-semibold"
@@ -331,7 +331,7 @@ export default function StatutesAdmin({ adminToken }: { adminToken: string }) {
           </div>
 
           {/* Body */}
-          {editingKey === s.keyword ? (
+          {editingKey === s.id ? (
             <div className="p-4 space-y-3">
               <div>
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Display Name</label>

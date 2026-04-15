@@ -191,6 +191,7 @@ pub struct OsListParams {
     pub search: Option<String>,
     pub status: Option<String>,    // "pending" | "adjudicated" | "draft"
     pub year: Option<i64>,
+    pub br_dr_pending: Option<bool>,  // adjudicated cases with no BR/DR receipt data yet
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +208,7 @@ pub struct AdjudicateRequest {
     pub adj_offr_designation: String,
     pub adjudication_date: Option<String>,
     pub adjn_offr_remarks: Option<String>,
+    pub adjn_section_ref: Option<String>,
     pub rf_amount: Option<f64>,
     pub pp_amount: Option<f64>,
     pub ref_amount: Option<f64>,

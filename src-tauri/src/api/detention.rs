@@ -21,30 +21,38 @@ pub async fn list_drs(
     let page     = params.get("page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).max(1);
     let per_page = params.get("per_page").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20).clamp(1, 100);
     let offset   = (page - 1) * per_page;
-    let search   = params.get("search").map(|s| s.as_str()).unwrap_or("").trim().to_string();
+    let search   = params.get("search").map(|s| s.trim().to_string()).unwrap_or_default();
+    let dr_type  = params.get("dr_type").map(|s| s.trim().to_uppercase());
 
-    let (search_sql, search_params): (&str, Vec<String>) = if search.is_empty() {
-        ("1=1", vec![])
-    } else {
+    let mut conditions: Vec<String> = vec!["entry_deleted='N'".to_string()];
+    let mut query_params: Vec<String> = Vec::new();
+
+    if !search.is_empty() {
         let p = format!("%{}%", search);
-        ("(dr_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)", vec![p.clone(), p.clone(), p])
-    };
+        conditions.push("(dr_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)".to_string());
+        query_params.extend([p.clone(), p.clone(), p]);
+    }
+    if let Some(dt) = dr_type {
+        conditions.push("UPPER(dr_type) = ?".to_string());
+        query_params.push(dt);
+    }
+    let where_sql = conditions.join(" AND ");
 
     let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM dr_master WHERE {search_sql}"),
-        rusqlite::params_from_iter(search_params.iter()),
+        &format!("SELECT COUNT(*) FROM dr_master WHERE {where_sql}"),
+        rusqlite::params_from_iter(query_params.iter()),
         |r| r.get(0)
     ).unwrap_or(0);
 
     let mut stmt = conn.prepare(&format!(
         "SELECT id, dr_no, dr_year, dr_date, pax_name, passport_no, flight_no,
                 total_items_value, dr_printed, os_no, os_year
-         FROM dr_master WHERE {search_sql}
-         ORDER BY dr_date DESC, dr_no DESC
+         FROM dr_master WHERE {where_sql}
+         ORDER BY dr_date DESC, CAST(dr_no AS INTEGER) DESC
          LIMIT {per_page} OFFSET {offset}"
     )).map_err(|e| e500(&e.to_string()))?;
 
-    let rows: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(search_params.iter()), |r| {
+    let rows: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(query_params.iter()), |r| {
         Ok(json!({
             "id":                r.get::<_, i64>(0)?,
             "dr_no":             r.get::<_, String>(1)?,
@@ -73,7 +81,7 @@ pub async fn get_dr(
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
     let case: Option<Value> = conn.query_row(
-        "SELECT * FROM dr_master WHERE dr_no=? AND dr_year=?",
+        "SELECT * FROM dr_master WHERE dr_no=? AND dr_year=? AND entry_deleted='N'",
         rusqlite::params![dr_no, dr_year],
         |r| {
             let n = r.as_ref().column_count();
@@ -117,51 +125,58 @@ pub async fn create_dr(
     let dr_date = req.get("dr_date").and_then(|v| v.as_str()).unwrap_or(&today);
 
     let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM dr_master WHERE dr_no=? AND dr_year=?",
+        "SELECT COUNT(*) FROM dr_master WHERE dr_no=? AND dr_year=? AND entry_deleted='N'",
         rusqlite::params![dr_no, dr_year], |r| r.get(0)
     ).unwrap_or(0);
     if exists > 0 { return Err(e400("DR No. already exists for this year.")); }
 
-    conn.execute(
-        "INSERT INTO dr_master (dr_no, dr_year, dr_date, location_code, pax_name, pax_nationality,
-         passport_no, passport_date, pax_date_of_birth, flight_no, flight_date, booked_by,
-         os_no, os_year, dr_printed, total_items_value)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        rusqlite::params![
-            dr_no, dr_year, dr_date,
-            req.get("location_code").and_then(|v| v.as_str()),
-            req.get("pax_name").and_then(|v| v.as_str()),
-            req.get("pax_nationality").and_then(|v| v.as_str()),
-            req.get("passport_no").and_then(|v| v.as_str()),
-            req.get("passport_date").and_then(|v| v.as_str()),
-            req.get("pax_date_of_birth").and_then(|v| v.as_str()),
-            req.get("flight_no").and_then(|v| v.as_str()),
-            req.get("flight_date").and_then(|v| v.as_str()),
-            req.get("booked_by").and_then(|v| v.as_str()),
-            req.get("os_no").and_then(|v| v.as_str()),
-            req.get("os_year").and_then(|v| v.as_i64()),
-            "N",
-            req.get("total_items_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        ],
-    ).map_err(|e| e500(&e.to_string()))?;
+    conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+    let write_result: Result<(), Err> = (|| {
+        conn.execute(
+            "INSERT INTO dr_master (dr_no, dr_year, dr_date, location_code, pax_name, pax_nationality,
+             passport_no, passport_date, pax_date_of_birth, flight_no, flight_date, booked_by,
+             os_no, os_year, dr_printed, total_items_value)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                dr_no, dr_year, dr_date,
+                req.get("location_code").and_then(|v| v.as_str()),
+                req.get("pax_name").and_then(|v| v.as_str()),
+                req.get("pax_nationality").and_then(|v| v.as_str()),
+                req.get("passport_no").and_then(|v| v.as_str()),
+                req.get("passport_date").and_then(|v| v.as_str()),
+                req.get("pax_date_of_birth").and_then(|v| v.as_str()),
+                req.get("flight_no").and_then(|v| v.as_str()),
+                req.get("flight_date").and_then(|v| v.as_str()),
+                req.get("booked_by").and_then(|v| v.as_str()),
+                req.get("os_no").and_then(|v| v.as_str()),
+                req.get("os_year").and_then(|v| v.as_i64()),
+                "N",
+                req.get("total_items_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            ],
+        ).map_err(|e| e500(&e.to_string()))?;
 
-    // Save items
-    if let Some(items) = req.get("items").and_then(|v| v.as_array()) {
-        for (i, item) in items.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO dr_items (dr_no, dr_year, items_sno, items_desc, items_qty,
-                 items_uqc, items_value, items_category)
-                 VALUES (?,?,?,?,?,?,?,?)",
-                rusqlite::params![
-                    dr_no, dr_year, (i + 1) as i64,
-                    item.get("items_desc").and_then(|v| v.as_str()),
-                    item.get("items_qty").and_then(|v| v.as_f64()),
-                    item.get("items_uqc").and_then(|v| v.as_str()),
-                    item.get("items_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    item.get("items_category").and_then(|v| v.as_str()),
-                ],
-            ).map_err(|e| e500(&e.to_string()))?;
+        if let Some(items) = req.get("items").and_then(|v| v.as_array()) {
+            for (i, item) in items.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO dr_items (dr_no, dr_year, items_sno, items_desc, items_qty,
+                     items_uqc, items_value, items_category)
+                     VALUES (?,?,?,?,?,?,?,?)",
+                    rusqlite::params![
+                        dr_no, dr_year, (i + 1) as i64,
+                        item.get("items_desc").and_then(|v| v.as_str()),
+                        item.get("items_qty").and_then(|v| v.as_f64()),
+                        item.get("items_uqc").and_then(|v| v.as_str()),
+                        item.get("items_value").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        item.get("items_category").and_then(|v| v.as_str()),
+                    ],
+                ).map_err(|e| e500(&e.to_string()))?;
+            }
         }
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?,
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
     Ok(Json(json!({ "message": "DR created.", "dr_no": dr_no, "dr_year": dr_year })))
@@ -176,7 +191,7 @@ pub async fn mark_dr_printed(
 ) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     conn.execute(
-        "UPDATE dr_master SET dr_printed='Y' WHERE dr_no=? AND dr_year=?",
+        "UPDATE dr_master SET dr_printed='Y' WHERE dr_no=? AND dr_year=? AND entry_deleted='N'",
         rusqlite::params![dr_no, dr_year],
     ).map_err(|e| e500(&e.to_string()))?;
     Ok(Json(json!({ "message": "DR marked as printed." })))
@@ -195,7 +210,7 @@ pub async fn print_dr_pdf(
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
     let case: Option<Value> = conn.query_row(
-        "SELECT * FROM dr_master WHERE dr_no=? AND dr_year=?",
+        "SELECT * FROM dr_master WHERE dr_no=? AND dr_year=? AND entry_deleted='N'",
         rusqlite::params![dr_no, dr_year],
         |r| {
             let n = r.as_ref().column_count();

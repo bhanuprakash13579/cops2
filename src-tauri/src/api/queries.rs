@@ -29,24 +29,25 @@ pub async fn cross_reference(
     let mut like_params: Vec<String> = Vec::new();
 
     if !passport.is_empty() {
-        conditions.push("UPPER(passport_no) LIKE ?");
+        conditions.push("passport_no LIKE ?");
         like_params.push(format!("%{}%", passport));
     }
     if !name.is_empty() {
-        conditions.push("UPPER(pax_name) LIKE ?");
+        conditions.push("pax_name LIKE ?");
         like_params.push(format!("%{}%", name));
     }
     if !flight.is_empty() {
-        conditions.push("UPPER(flight_no) LIKE ?");
+        conditions.push("flight_no LIKE ?");
         like_params.push(format!("%{}%", flight));
     }
     let where_sql = conditions.join(" OR ");
 
-    // OS cases
+    // OS cases — only active (not soft-deleted) records
+    let where_os = format!("({where_sql}) AND entry_deleted='N'");
     let mut os_stmt = conn.prepare(&format!(
         "SELECT os_no, os_year, os_date, pax_name, passport_no, flight_no,
                 total_payable, adjudication_date, adj_offr_name, entry_deleted, is_draft
-         FROM cops_master WHERE {where_sql} ORDER BY os_date DESC LIMIT 50"
+         FROM cops_master WHERE {where_os} ORDER BY os_date DESC LIMIT 50"
     )).map_err(|e| e500(&e.to_string()))?;
 
     let os_rows: Vec<Value> = os_stmt.query_map(rusqlite::params_from_iter(like_params.iter()), |r| {
@@ -66,10 +67,11 @@ pub async fn cross_reference(
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     // BR cases
+    let where_br = format!("({where_sql}) AND entry_deleted='N'");
     let mut br_stmt = conn.prepare(&format!(
         "SELECT br_no, br_year, br_date, pax_name, passport_no, flight_no,
                 total_payable, br_printed
-         FROM br_master WHERE {where_sql} ORDER BY br_date DESC LIMIT 50"
+         FROM br_master WHERE {where_br} ORDER BY br_date DESC LIMIT 50"
     )).map_err(|e| e500(&e.to_string()))?;
 
     let br_rows: Vec<Value> = br_stmt.query_map(rusqlite::params_from_iter(like_params.iter()), |r| {
@@ -86,10 +88,11 @@ pub async fn cross_reference(
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     // DR cases
+    let where_dr = format!("({where_sql}) AND entry_deleted='N'");
     let mut dr_stmt = conn.prepare(&format!(
         "SELECT dr_no, dr_year, dr_date, pax_name, passport_no, flight_no,
                 total_items_value, dr_printed
-         FROM dr_master WHERE {where_sql} ORDER BY dr_date DESC LIMIT 50"
+         FROM dr_master WHERE {where_dr} ORDER BY dr_date DESC LIMIT 50"
     )).map_err(|e| e500(&e.to_string()))?;
 
     let dr_rows: Vec<Value> = dr_stmt.query_map(rusqlite::params_from_iter(like_params.iter()), |r| {

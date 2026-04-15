@@ -24,6 +24,8 @@ pub async fn stats(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err>
     let pending_os: i64 = conn.query_row(
         "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
          AND adjudication_date IS NULL AND adj_offr_name IS NULL
+         AND (adjn_offr_remarks IS NULL OR adjn_offr_remarks='')
+         AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y')
          AND (is_offline_adjudication IS NULL OR is_offline_adjudication!='Y')
          AND (is_legacy IS NULL OR is_legacy!='Y')",
         [], |r| r.get(0)
@@ -81,8 +83,8 @@ pub async fn stats(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err>
     ).unwrap_or(0.0);
 
     // BR/DR counts
-    let total_br: i64 = conn.query_row("SELECT COUNT(*) FROM br_master", [], |r| r.get(0)).unwrap_or(0);
-    let total_dr: i64 = conn.query_row("SELECT COUNT(*) FROM dr_master", [], |r| r.get(0)).unwrap_or(0);
+    let total_br: i64 = conn.query_row("SELECT COUNT(*) FROM br_master WHERE entry_deleted='N'", [], |r| r.get(0)).unwrap_or(0);
+    let total_dr: i64 = conn.query_row("SELECT COUNT(*) FROM dr_master WHERE entry_deleted='N'", [], |r| r.get(0)).unwrap_or(0);
 
     // Top 5 item categories
     let mut cat_stmt = conn.prepare(

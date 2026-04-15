@@ -13,21 +13,20 @@ fn e500(m: &str) -> Err { (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "deta
 pub async fn list_statutes(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, statute_code, act_name, section_no, description, penalty_desc,
-                is_active, created_on
-         FROM legal_statutes ORDER BY act_name, section_no"
+        "SELECT id, keyword, display_name, is_prohibited,
+                supdt_goods_clause, adjn_goods_clause, legal_reference
+         FROM legal_statutes ORDER BY display_name"
     ).map_err(|e| e500(&e.to_string()))?;
 
     let rows: Vec<Value> = stmt.query_map([], |r| {
         Ok(json!({
-            "id":           r.get::<_, i64>(0)?,
-            "statute_code": r.get::<_, Option<String>>(1)?,
-            "act_name":     r.get::<_, Option<String>>(2)?,
-            "section_no":   r.get::<_, Option<String>>(3)?,
-            "description":  r.get::<_, Option<String>>(4)?,
-            "penalty_desc": r.get::<_, Option<String>>(5)?,
-            "is_active":    r.get::<_, Option<String>>(6)?,
-            "created_on":   r.get::<_, Option<String>>(7)?,
+            "id":                r.get::<_, i64>(0)?,
+            "keyword":           r.get::<_, String>(1)?,
+            "display_name":      r.get::<_, String>(2)?,
+            "is_prohibited":     r.get::<_, i64>(3)? != 0,
+            "supdt_goods_clause": r.get::<_, String>(4)?,
+            "adjn_goods_clause": r.get::<_, String>(5)?,
+            "legal_reference":   r.get::<_, String>(6)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
@@ -36,21 +35,24 @@ pub async fn list_statutes(State(pool): Db, _auth: AuthUser) -> Result<Json<Valu
 
 pub async fn create_statute(State(pool): Db, _auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let act_name = req.get("act_name").and_then(|v| v.as_str())
-        .ok_or_else(|| e400("act_name is required"))?;
+    let keyword = req.get("keyword").and_then(|v| v.as_str())
+        .ok_or_else(|| e400("keyword is required"))?;
+    let display_name = req.get("display_name").and_then(|v| v.as_str())
+        .ok_or_else(|| e400("display_name is required"))?;
+    let is_prohibited: i64 = req.get("is_prohibited").and_then(|v| v.as_bool())
+        .map(|b| if b { 1 } else { 0 }).unwrap_or(0);
 
     conn.execute(
-        "INSERT INTO legal_statutes (statute_code, act_name, section_no, description, penalty_desc, is_active, created_on)
-         VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO legal_statutes (keyword, display_name, is_prohibited,
+                supdt_goods_clause, adjn_goods_clause, legal_reference)
+         VALUES (?,?,?,?,?,?)",
         rusqlite::params![
-            req.get("statute_code").and_then(|v| v.as_str()),
-            act_name,
-            req.get("section_no").and_then(|v| v.as_str()),
-            req.get("description").and_then(|v| v.as_str()),
-            req.get("penalty_desc").and_then(|v| v.as_str()),
-            "Y",
-            today,
+            keyword,
+            display_name,
+            is_prohibited,
+            req.get("supdt_goods_clause").and_then(|v| v.as_str()).unwrap_or(""),
+            req.get("adjn_goods_clause").and_then(|v| v.as_str()).unwrap_or(""),
+            req.get("legal_reference").and_then(|v| v.as_str()).unwrap_or(""),
         ],
     ).map_err(|e| e400(&e.to_string()))?;
 
@@ -60,19 +62,23 @@ pub async fn create_statute(State(pool): Db, _auth: AuthUser, Json(req): Json<se
 pub async fn update_statute(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
+    let is_prohibited: Option<i64> = req.get("is_prohibited").and_then(|v| v.as_bool())
+        .map(|b| if b { 1 } else { 0 });
+
     let affected = conn.execute(
-        "UPDATE legal_statutes SET statute_code=COALESCE(?,statute_code),
-         act_name=COALESCE(?,act_name), section_no=COALESCE(?,section_no),
-         description=COALESCE(?,description), penalty_desc=COALESCE(?,penalty_desc),
-         is_active=COALESCE(?,is_active)
+        "UPDATE legal_statutes
+         SET display_name=COALESCE(?,display_name),
+             is_prohibited=COALESCE(?,is_prohibited),
+             supdt_goods_clause=COALESCE(?,supdt_goods_clause),
+             adjn_goods_clause=COALESCE(?,adjn_goods_clause),
+             legal_reference=COALESCE(?,legal_reference)
          WHERE id=?",
         rusqlite::params![
-            req.get("statute_code").and_then(|v| v.as_str()),
-            req.get("act_name").and_then(|v| v.as_str()),
-            req.get("section_no").and_then(|v| v.as_str()),
-            req.get("description").and_then(|v| v.as_str()),
-            req.get("penalty_desc").and_then(|v| v.as_str()),
-            req.get("is_active").and_then(|v| v.as_str()),
+            req.get("display_name").and_then(|v| v.as_str()),
+            is_prohibited,
+            req.get("supdt_goods_clause").and_then(|v| v.as_str()),
+            req.get("adjn_goods_clause").and_then(|v| v.as_str()),
+            req.get("legal_reference").and_then(|v| v.as_str()),
             id,
         ],
     ).map_err(|e| e500(&e.to_string()))?;
@@ -84,10 +90,10 @@ pub async fn update_statute(State(pool): Db, _auth: AuthUser, Path(id): Path<i64
 pub async fn delete_statute(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let affected = conn.execute(
-        "UPDATE legal_statutes SET is_active='N' WHERE id=?",
+        "DELETE FROM legal_statutes WHERE id=?",
         rusqlite::params![id],
     ).map_err(|e| e500(&e.to_string()))?;
 
     if affected == 0 { return Err(e404("Statute not found.")); }
-    Ok(Json(json!({ "message": "Statute deactivated." })))
+    Ok(Json(json!({ "message": "Statute deleted." })))
 }
