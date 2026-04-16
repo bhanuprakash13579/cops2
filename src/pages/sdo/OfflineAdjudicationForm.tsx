@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, memo, useRef, Fragment } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Plus, Trash2, FileText, User, Plane, AlertCircle, CheckCircle, Info, Upload, Table2, PenLine } from 'lucide-react';
 import DatePicker from '@/components/DatePicker';
@@ -8,12 +8,7 @@ import * as XLSX from 'xlsx';
 
 // ── Excel import helpers ──────────────────────────────────────────────────────
 
-/** Parse numbered item list: "1) GOLD BISCUIT 2) IPHONE 17" → ["GOLD BISCUIT","IPHONE 17"] */
-function splitNumberedList(str: string): string[] {
-  if (!str) return [];
-  const parts = str.split(/\d+\)\s*/).filter(s => s.trim().length > 0);
-  return parts.length > 1 ? parts.map(s => s.trim()) : [str.trim()];
-}
+type ParsedItem = { items_desc: string; items_qty: number; items_uqc: string; items_value: number; items_duty_type: string };
 
 /** Parse "2.5 KGS" or "1 NOS" → { qty, uqc } */
 function parseQtyUqc(raw: string): { qty: number; uqc: string } {
@@ -22,20 +17,81 @@ function parseQtyUqc(raw: string): { qty: number; uqc: string } {
   return { qty: 1, uqc: 'NOS' };
 }
 
-/** Build items array from ITEM DESCRIPTION + QUANTITY columns */
-function parseExcelItems(descCol: string, qtyCol: string): Array<{ items_desc: string; items_qty: number; items_uqc: string; items_value: number; items_duty_type: string }> {
-  const descs = splitNumberedList(descCol);
-  const qtys  = splitNumberedList(qtyCol || '');
-  return descs.map((d, i) => {
-    const { qty, uqc } = parseQtyUqc(qtys[i] || '1 NOS');
-    return { items_desc: d.toUpperCase(), items_qty: qty, items_uqc: uqc, items_value: 0, items_duty_type: 'Miscellaneous-22' };
-  });
+/**
+ * Parse item description + quantity columns into a structured items list.
+ *
+ * Handles three formats:
+ *  1. Numbered list  — "1) GOLD BISCUIT 2) IPHONE 17"
+ *  2. Comma-separated with leading qty  — "2 GAMING CARD,5000 RESISTOR 0603 300R 1% 150MW"
+ *  3. Single item (fall-through)
+ *
+ * Returns `needsManualEntry: true` when some tokens had a leading qty and
+ * some did not (ambiguous split) — the caller should ask the user to confirm.
+ */
+function parseExcelItems(descCol: string, qtyCol: string): { items: ParsedItem[]; needsManualEntry: boolean } {
+  if (!descCol) return { items: [], needsManualEntry: false };
+
+  // 1. Numbered list: "1) DESC 2) DESC"
+  const numberedParts = descCol.split(/\d+\)\s+/).filter(s => s.trim().length > 0);
+  if (numberedParts.length > 1) {
+    const qtyParts = (qtyCol || '').split(/\d+\)\s+/).filter(s => s.trim().length > 0);
+    return {
+      items: numberedParts.map((d, i) => {
+        const { qty, uqc } = parseQtyUqc(qtyParts[i] || '1 NOS');
+        return { items_desc: d.trim().toUpperCase(), items_qty: qty, items_uqc: uqc, items_value: 0, items_duty_type: 'Miscellaneous-22' };
+      }),
+      needsManualEntry: false,
+    };
+  }
+
+  // 2. Comma-separated "QTY DESC, QTY DESC" (handles complex specs like "5000 RESISTOR 0603 300R 1% 150MW")
+  const parts = descCol.split(',').map(s => s.trim()).filter(Boolean);
+  if (parts.length > 1) {
+    const QTY_PREFIX = /^(\d+(?:\.\d+)?)\s+(.+)$/;
+    const parsed = parts.map(p => {
+      const m = p.match(QTY_PREFIX);
+      return m
+        ? { qty: parseFloat(m[1]) || 1, desc: m[2].trim(), matched: true as const }
+        : { qty: 1, desc: p.trim(), matched: false as const };
+    });
+    const matchCount = parsed.filter(p => p.matched).length;
+    if (matchCount === parsed.length) {
+      // All tokens have a leading qty — clean, unambiguous parse
+      return {
+        items: parsed.map(p => ({ items_desc: p.desc.toUpperCase(), items_qty: p.qty, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' })),
+        needsManualEntry: false,
+      };
+    }
+    if (matchCount > 0) {
+      // Mixed — pre-populate from what parsed but ask user to review
+      return {
+        items: parsed.map(p => ({ items_desc: p.desc.toUpperCase(), items_qty: p.qty, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' })),
+        needsManualEntry: true,
+      };
+    }
+    // No leading qty anywhere — treat entire string as one item
+    return {
+      items: [{ items_desc: descCol.toUpperCase(), items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }],
+      needsManualEntry: false,
+    };
+  }
+
+  // 3. Single item — apply qty column if present
+  const { qty, uqc } = qtyCol ? parseQtyUqc(qtyCol) : { qty: 1, uqc: 'NOS' };
+  return {
+    items: [{ items_desc: descCol.toUpperCase(), items_qty: qty, items_uqc: uqc, items_value: 0, items_duty_type: 'Miscellaneous-22' }],
+    needsManualEntry: false,
+  };
 }
 
-/** Classify Column 1 into RF/REF/Confiscated */
-function classifyColumn1(col1: string): 'rf' | 'ref' | 'confiscated' | 'ambiguous' {
+/**
+ * Classify "Column 1" text into an RF/REF/Confiscated outcome type.
+ * Empty → 'none'   (AIU cases / no classification yet — allowed through import)
+ * Unknown text → 'ambiguous'  (user must select before importing)
+ */
+function classifyColumn1(col1: string): 'rf' | 'ref' | 'confiscated' | 'none' | 'ambiguous' {
   const v = (col1 || '').toLowerCase().trim();
-  if (!v) return 'ambiguous';
+  if (!v) return 'none';
   if (v.includes('absolute confiscation')) return 'confiscated';
   if (v.includes('confiscation'))          return 'rf';
   if (v.match(/re.?export/))               return 'ref';
@@ -87,9 +143,11 @@ interface ParsedImportRow {
   adj_offr_designation: string;
   adjudication_date: string;
   post_adj_br_entries: string;
-  // RF/REF classification (may need user input)
-  rfRefType:        'rf' | 'ref' | 'confiscated' | 'ambiguous';
+  // RF/REF classification
+  // 'none' = AIU/no classification (allowed through), 'ambiguous' = user must select
+  rfRefType:        'rf' | 'ref' | 'confiscated' | 'none' | 'ambiguous';
   rfRefValue:       number;
+  needsManualItems: boolean;  // true when item parsing was ambiguous — user must confirm
   // Parse warnings
   warnings:         string[];
 }
@@ -164,8 +222,11 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
 
     const descRaw = getCol(row, 'item description');
     const qtyRaw  = getCol(row, 'quantity');
-    const items   = descRaw ? parseExcelItems(descRaw, qtyRaw) : [];
+    const { items, needsManualEntry } = descRaw
+      ? parseExcelItems(descRaw, qtyRaw)
+      : { items: [], needsManualEntry: false };
     if (items.length === 0) warnings.push('No item description found');
+    if (needsManualEntry) warnings.push('Item descriptions need review — confirm items before importing');
 
     // Distribute total value across items proportionally if we have a total
     const totalValue = getColNum(row, 'value in rs.');
@@ -180,7 +241,8 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
     const rfRefRaw = getColNum(row, 'rf/r.e.f');
     const col1     = getCol(row, 'column 1');
     const rfRefType = classifyColumn1(col1);
-    if (rfRefType === 'ambiguous' && rfRefRaw > 0) warnings.push('RF/REF type ambiguous — please select below');
+    if (rfRefType === 'ambiguous') warnings.push('RF/REF type ambiguous — please select below');
+    // 'none' gets no warning — expected for AIU cases
 
     let rf_amount = 0, ref_amount = 0, confiscated_value = 0;
     if (rfRefType === 'rf')          rf_amount = rfRefRaw;
@@ -234,6 +296,7 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
       post_adj_br_entries,
       rfRefType,
       rfRefValue:        rfRefRaw,
+      needsManualItems:  needsManualEntry,
       warnings,
     });
   }
@@ -385,6 +448,76 @@ const SimpleItemRow = memo(function SimpleItemRow({
   );
 });
 
+// ── Inline item editor for Excel import rows with ambiguous item parsing ──────
+interface ItemEditPanelProps {
+  initialItems: ParsedItem[];
+  totalValue: number;
+  onConfirm: (items: ParsedItem[]) => void;
+  onCancel: () => void;
+}
+const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, onConfirm, onCancel }: ItemEditPanelProps) {
+  const seed = initialItems.length > 0 ? initialItems : [{ items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }];
+  const [editItems, setEditItems] = useState<ParsedItem[]>(seed);
+  const updateItem = useCallback((idx: number, field: string, value: any) => {
+    setEditItems(prev => prev.map((item, i) => i === idx ? { ...item, [field]: value } : item));
+  }, []);
+  const removeItem = useCallback((idx: number) => {
+    setEditItems(prev => prev.filter((_, i) => i !== idx));
+  }, []);
+  const noopBlur = useCallback(() => {}, []);
+  const canConfirm = editItems.length > 0 && editItems.every(it => String(it.items_desc || '').trim().length > 0);
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mt-1">
+      <div className="flex justify-between items-start mb-2">
+        <p className="text-xs font-bold text-amber-800">Review &amp; confirm items — total value: ₹{totalValue.toLocaleString('en-IN')}</p>
+        <p className="text-[10px] text-slate-500 ml-4">Distribute value across items and set duty types, then click Confirm.</p>
+      </div>
+      <div className="overflow-auto">
+        <table className="w-full text-xs">
+          <thead className="text-[10px] text-slate-500 uppercase bg-slate-100 border-b border-slate-200 tracking-wider">
+            <tr>
+              <th className="px-2 py-1.5 w-8 text-center">S.No</th>
+              <th className="px-2 py-1.5 w-48">Description</th>
+              <th className="px-2 py-1.5 w-32 text-center">Qty &amp; Unit</th>
+              <th className="px-2 py-1.5 w-24 text-right">Value (₹)</th>
+              <th className="px-2 py-1.5 w-36">Duty Type</th>
+              <th className="px-2 py-1.5 w-8"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100 bg-white">
+            {editItems.map((itm, idx) => (
+              <SimpleItemRow
+                key={idx}
+                itm={itm}
+                idx={idx}
+                rowErrors={undefined}
+                updateItem={updateItem}
+                onRemove={removeItem}
+                onDescBlur={noopBlur}
+                descDatalistId="offline-item-desc-datalist"
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex items-center gap-2 mt-2">
+        <button type="button" onClick={() => setEditItems(prev => [...prev, { items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }])}
+          className="text-xs px-2 py-1 border border-orange-200 text-orange-700 rounded hover:bg-orange-50 font-medium">
+          + Add Item
+        </button>
+        <button type="button" onClick={() => onConfirm(editItems)} disabled={!canConfirm}
+          className="text-xs px-3 py-1 bg-green-700 text-white rounded hover:bg-green-600 disabled:opacity-50 font-semibold">
+          ✓ Confirm Items
+        </button>
+        <button type="button" onClick={onCancel}
+          className="text-xs px-2 py-1 border border-slate-200 text-slate-600 rounded hover:bg-slate-50">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+});
+
 // Module-level cache for item descriptions
 let _offlineDescCache: string[] | null = null;
 
@@ -462,6 +595,8 @@ export default function OfflineAdjudicationForm() {
   const [inputMode, setInputMode] = useState<'manual' | 'excel'>('manual');
   const [parsedRows, setParsedRows] = useState<ParsedImportRow[]>([]);
   const [rowRfRefOverrides, setRowRfRefOverrides] = useState<Record<number, 'rf' | 'ref' | 'confiscated'>>({});
+  const [rowItemOverrides, setRowItemOverrides] = useState<Record<number, ParsedItem[]>>({});
+  const [expandedItemEdit, setExpandedItemEdit] = useState<Set<number>>(new Set());
   const [importLoading, setImportLoading] = useState(false);
   const [importStatus, setImportStatus] = useState<{ imported: number; skipped: number; failed: any[]; total: number } | null>(null);
 
@@ -772,6 +907,8 @@ export default function OfflineAdjudicationForm() {
     const rows = parseExcelRows(data);
     setParsedRows(rows);
     setRowRfRefOverrides({});
+    setRowItemOverrides({});
+    setExpandedItemEdit(new Set());
     setImportStatus(null);
     // Reset input so same file can be re-selected
     e.target.value = '';
@@ -789,13 +926,22 @@ export default function OfflineAdjudicationForm() {
         else if (chosen === 'ref')    ref_amount = row.rfRefValue;
         else                          confiscated_value = row.rfRefValue;
       }
-      return { ...row, rf_amount, ref_amount, confiscated_value };
+      // 'none' rows pass through with all-zero amounts (AIU case — outcome added later)
+      // Use manually confirmed items if user reviewed them, otherwise use parsed items
+      const items = rowItemOverrides[row.sno] || row.items;
+      return { ...row, rf_amount, ref_amount, confiscated_value, items };
     });
     try {
       const res = await api.post('/os/offline/bulk-import', payload);
       setImportStatus(res.data);
     } catch (err: any) {
-      const detail = err.response?.data?.detail || err.message || 'Import failed';
+      const rawDetail = err.response?.data?.detail ?? err.message ?? 'Import failed';
+      // Prevent React error #31: ensure detail is always a string, never an object
+      const detail = Array.isArray(rawDetail)
+        ? rawDetail.map((e: any) => e.msg ?? JSON.stringify(e)).join('; ')
+        : typeof rawDetail === 'object'
+          ? JSON.stringify(rawDetail)
+          : String(rawDetail);
       setImportStatus({ imported: 0, skipped: 0, failed: [{ error: detail }], total: parsedRows.length });
     } finally {
       setImportLoading(false);
@@ -1391,49 +1537,87 @@ export default function OfflineAdjudicationForm() {
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {parsedRows.map((row, i) => {
-                      const itemSummary = row.items.map(it => it.items_desc).join('; ');
+                      const confirmedItems = rowItemOverrides[row.sno];
+                      const displayItems = confirmedItems || row.items;
+                      const itemSummary = displayItems.map(it => it.items_desc).join('; ');
+                      const isEditingItems = expandedItemEdit.has(row.sno);
                       return (
-                        <tr key={row.sno} className={row.warnings.length > 0 ? 'bg-amber-50' : 'hover:bg-slate-50'}>
-                          <td className="px-2 py-1.5 text-slate-400 font-medium">{i + 1}</td>
-                          <td className="px-2 py-1.5 font-bold text-slate-800">{row.os_no}/{row.os_year}</td>
-                          <td className="px-2 py-1.5 text-slate-600">{row.os_date}</td>
-                          <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-700" title={row.pax_name}>{row.pax_name}</td>
-                          <td className="px-2 py-1.5 font-mono text-slate-600">{row.passport_no}</td>
-                          <td className="px-2 py-1.5 text-slate-600">{row.flight_no}</td>
-                          <td className="px-2 py-1.5 max-w-[140px] truncate text-slate-600" title={itemSummary}>
-                            {itemSummary.length > 40 ? itemSummary.slice(0, 40) + '…' : itemSummary}
-                          </td>
-                          <td className="px-2 py-1.5 text-right font-medium">{row.total_items_value.toLocaleString('en-IN')}</td>
-                          <td className="px-2 py-1.5">
-                            {row.rfRefType === 'ambiguous' ? (
-                              <select
-                                className="px-1 py-0.5 border border-amber-400 rounded text-[10px] bg-amber-50 focus:outline-none focus:ring-1 focus:ring-amber-500"
-                                value={rowRfRefOverrides[row.sno] || ''}
-                                onChange={e => setRowRfRefOverrides(prev => ({ ...prev, [row.sno]: e.target.value as 'rf' | 'ref' | 'confiscated' }))}
-                              >
-                                <option value="">— select —</option>
-                                <option value="rf">RF (Confiscation)</option>
-                                <option value="ref">REF (Re-Export)</option>
-                                <option value="confiscated">Abs. Confiscation</option>
-                              </select>
-                            ) : (
-                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                row.rfRefType === 'rf' ? 'bg-red-100 text-red-700'
-                                : row.rfRefType === 'ref' ? 'bg-blue-100 text-blue-700'
-                                : 'bg-purple-100 text-purple-700'
-                              }`}>{row.rfRefType}</span>
-                            )}
-                          </td>
-                          <td className="px-2 py-1.5 text-right font-medium">{row.rfRefValue.toLocaleString('en-IN')}</td>
-                          <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-600" title={row.adj_offr_name}>{row.adj_offr_name}</td>
-                          <td className="px-2 py-1.5">
-                            {row.warnings.length > 0 && (
-                              <span className="text-amber-700 text-[10px]" title={row.warnings.join('\n')}>
-                                ⚠ {row.warnings.join('; ')}
-                              </span>
-                            )}
-                          </td>
-                        </tr>
+                        <Fragment key={row.sno}>
+                          <tr className={row.warnings.length > 0 ? 'bg-amber-50' : 'hover:bg-slate-50'}>
+                            <td className="px-2 py-1.5 text-slate-400 font-medium">{i + 1}</td>
+                            <td className="px-2 py-1.5 font-bold text-slate-800">{row.os_no}/{row.os_year}</td>
+                            <td className="px-2 py-1.5 text-slate-600">{row.os_date}</td>
+                            <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-700" title={row.pax_name}>{row.pax_name}</td>
+                            <td className="px-2 py-1.5 font-mono text-slate-600">{row.passport_no}</td>
+                            <td className="px-2 py-1.5 text-slate-600">{row.flight_no}</td>
+                            <td className="px-2 py-1.5 max-w-[160px] text-slate-600">
+                              {row.needsManualItems && !confirmedItems ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedItemEdit(prev => { const n = new Set(prev); n.add(row.sno); return n; })}
+                                  className="flex items-center gap-1 text-amber-700 bg-amber-50 border border-amber-300 rounded px-1.5 py-0.5 text-[10px] font-semibold hover:bg-amber-100"
+                                >
+                                  ⚠ {row.items.length} item{row.items.length !== 1 ? 's' : ''} · review
+                                </button>
+                              ) : confirmedItems ? (
+                                <span className="text-green-700 text-[10px] font-semibold">
+                                  ✓ {confirmedItems.length} item{confirmedItems.length !== 1 ? 's' : ''} confirmed
+                                </span>
+                              ) : (
+                                <span className="truncate block" title={itemSummary}>
+                                  {itemSummary.length > 40 ? itemSummary.slice(0, 40) + '…' : itemSummary}
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-medium">{row.total_items_value.toLocaleString('en-IN')}</td>
+                            <td className="px-2 py-1.5">
+                              {row.rfRefType === 'none' ? (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-gray-100 text-gray-500">NIL</span>
+                              ) : row.rfRefType === 'ambiguous' ? (
+                                <select
+                                  className="px-1 py-0.5 border border-amber-400 rounded text-[10px] bg-amber-50 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                  value={rowRfRefOverrides[row.sno] || ''}
+                                  onChange={e => setRowRfRefOverrides(prev => ({ ...prev, [row.sno]: e.target.value as 'rf' | 'ref' | 'confiscated' }))}
+                                >
+                                  <option value="">— select —</option>
+                                  <option value="rf">RF (Confiscation)</option>
+                                  <option value="ref">REF (Re-Export)</option>
+                                  <option value="confiscated">Abs. Confiscation</option>
+                                </select>
+                              ) : (
+                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                  row.rfRefType === 'rf' ? 'bg-red-100 text-red-700'
+                                  : row.rfRefType === 'ref' ? 'bg-blue-100 text-blue-700'
+                                  : 'bg-purple-100 text-purple-700'
+                                }`}>{row.rfRefType}</span>
+                              )}
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-medium">{row.rfRefValue.toLocaleString('en-IN')}</td>
+                            <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-600" title={row.adj_offr_name}>{row.adj_offr_name}</td>
+                            <td className="px-2 py-1.5">
+                              {row.warnings.length > 0 && (
+                                <span className="text-amber-700 text-[10px]" title={row.warnings.join('\n')}>
+                                  ⚠ {row.warnings.join('; ')}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                          {isEditingItems && (
+                            <tr>
+                              <td colSpan={12} className="px-3 py-2">
+                                <ItemEditPanel
+                                  initialItems={confirmedItems || row.items}
+                                  totalValue={row.total_items_value}
+                                  onConfirm={items => {
+                                    setRowItemOverrides(prev => ({ ...prev, [row.sno]: items }));
+                                    setExpandedItemEdit(prev => { const n = new Set(prev); n.delete(row.sno); return n; });
+                                  }}
+                                  onCancel={() => setExpandedItemEdit(prev => { const n = new Set(prev); n.delete(row.sno); return n; })}
+                                />
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
                       );
                     })}
                   </tbody>
@@ -1451,7 +1635,9 @@ export default function OfflineAdjudicationForm() {
                 </div>
                 <button
                   type="button"
-                  disabled={importLoading || parsedRows.length === 0 || parsedRows.some(r => r.rfRefType === 'ambiguous' && !rowRfRefOverrides[r.sno])}
+                  disabled={importLoading || parsedRows.length === 0
+                    || parsedRows.some(r => r.rfRefType === 'ambiguous' && !rowRfRefOverrides[r.sno])
+                    || parsedRows.some(r => r.needsManualItems && !rowItemOverrides[r.sno])}
                   onClick={handleExcelImport}
                   className="flex items-center gap-2 px-6 py-2.5 bg-green-700 text-white font-semibold rounded-lg hover:bg-green-600 transition-colors text-sm disabled:opacity-60"
                 >
@@ -1495,7 +1681,7 @@ export default function OfflineAdjudicationForm() {
                   <p className="text-xs font-semibold text-red-700">Failed rows:</p>
                   {importStatus.failed.map((f: any, i: number) => (
                     <p key={i} className="text-xs text-red-600 font-mono bg-red-50 px-2 py-1 rounded">
-                      {f.os_no ? `OS ${f.os_no}/${f.os_year}: ` : ''}{f.error}
+                      {f.os_no ? `OS ${f.os_no}/${f.os_year}: ` : ''}{typeof f.error === 'string' ? f.error : JSON.stringify(f.error)}
                     </p>
                   ))}
                 </div>
