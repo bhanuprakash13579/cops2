@@ -456,11 +456,12 @@ pub async fn bulk_import_offline(
         let mut stmt = conn.prepare(
             "SELECT os_no, os_year FROM cops_master WHERE entry_deleted='N'"
         ).map_err(|e| e500(&e.to_string()))?;
-        let _ = stmt.query_map([], |r| {
+        let pairs: Vec<(String, i64)> = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        }).map(|rows| {
-            rows.filter_map(|r| r.ok()).for_each(|k| { existing.insert(k); })
-        });
+        })
+        .map(|mapped| mapped.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+        for k in pairs { existing.insert(k); }
     }
 
     let mut imported = 0i64;
