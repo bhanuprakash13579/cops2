@@ -38,6 +38,8 @@ interface OSResult {
   post_adj_dr_no: string | null;
   post_adj_dr_date: string | null;
   items: OSItem[];
+  country_of_departure: string | null;
+  item_desc_summary: string | null;
 }
 
 function SortIcon({ col, sortBy, sortDir }: { col: string; sortBy: string; sortDir: string }) {
@@ -79,6 +81,8 @@ export default function OSQueryPage() {
     item_desc: '',
     case_type: ''
   });
+  const [downloadLoading, setDownloadLoading] = useState(false);
+  const [activeSearch, setActiveSearch] = useState<typeof formData>({ ...formData });
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -89,6 +93,7 @@ export default function OSQueryPage() {
     setLoading(true);
     setHasSearched(false);
     setSearchError(null);
+    setActiveSearch({ ...formData });
 
     // Clean up empty strings and parse numbers for the API
     const payload: Record<string, any> = {};
@@ -149,94 +154,156 @@ export default function OSQueryPage() {
   };
 
 
-  const downloadCSV = async () => {
-    const headers = ['OS No', 'OS Year', 'OS Date', 'Passenger Name', 'Passport No', 'Flight No', 'Total Value (Rs)', 'Total Due (Rs)', 'Status', 'Adjudicated'];
-    const rows = results.map(r => [
-      r.os_no, r.os_year, r.os_date,
-      `"${(r.pax_name || '').replace(/"/g, '""')}"`,
-      r.passport_no || '', r.flight_no || '',
-      r.total_items_value || 0, r.total_payable || 0,
-      r.is_draft === 'N' ? 'Submitted' : 'Draft',
-      r.adjudication_date || 'No'
-    ]);
-    const csvString = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
-    const defaultName = `OS_Query_Results_${new Date().toISOString().split('T')[0]}.csv`;
+  // Build the search payload from the last executed search (activeSearch).
+  const buildExportPayload = () => {
+    const payload: Record<string, any> = { export: true, page: 1, limit: 5000 };
+    Object.entries(activeSearch).forEach(([key, value]) => {
+      if (value.trim() !== '') {
+        if (key === 'os_year') payload[key] = parseInt(value, 10);
+        else if (key === 'min_value' || key === 'max_value') payload[key] = parseFloat(value);
+        else payload[key] = value.trim();
+      }
+    });
+    payload['sort_by']  = sortBy;
+    payload['sort_dir'] = sortDir;
+    return payload;
+  };
 
+  const downloadCSV = async () => {
+    setDownloadLoading(true);
     try {
-      const { save } = await import('@tauri-apps/plugin-dialog');
-      const { writeTextFile } = await import('@tauri-apps/plugin-fs');
-      const savePath = await save({ title: 'Save CSV', defaultPath: defaultName, filters: [{ name: 'CSV', extensions: ['csv'] }] });
-      if (savePath) {
-        await writeTextFile(savePath, csvString);
-        showDownloadToast(`CSV saved to ${savePath}`);
+      const response = await api.post('/os-query/search', buildExportPayload());
+      const allRows: OSResult[] = response.data.items || [];
+
+      const showCountry  = !!activeSearch.country_of_departure.trim();
+      const showItemDesc = !!activeSearch.item_desc.trim();
+
+      const headers = [
+        'OS No', 'OS Year', 'OS Date', 'Passenger Name', 'Passport No', 'Flight No',
+        ...(showCountry  ? ['Country of Dep'] : []),
+        ...(showItemDesc ? ['Item Description'] : []),
+        'Total Value (Rs)', 'Total Due (Rs)', 'Status', 'Adjudicated',
+      ];
+
+      const rows = allRows.map(r => [
+        r.os_no, r.os_year, r.os_date,
+        `"${(r.pax_name || '').replace(/"/g, '""')}"`,
+        r.passport_no || '', r.flight_no || '',
+        ...(showCountry  ? [`"${(r.country_of_departure || '').replace(/"/g, '""')}"`] : []),
+        ...(showItemDesc ? [`"${(r.item_desc_summary    || '').replace(/"/g, '""')}"`] : []),
+        r.total_items_value || 0, r.total_payable || 0,
+        r.is_draft === 'N' ? 'Submitted' : 'Draft',
+        r.adjudication_date || 'No',
+      ]);
+
+      const csvString   = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+      const defaultName = `OS_Query_Results_${new Date().toISOString().split('T')[0]}.csv`;
+
+      try {
+        const { save }          = await import('@tauri-apps/plugin-dialog');
+        const { writeTextFile } = await import('@tauri-apps/plugin-fs');
+        const savePath = await save({ title: 'Save CSV', defaultPath: defaultName, filters: [{ name: 'CSV', extensions: ['csv'] }] });
+        if (savePath) {
+          await writeTextFile(savePath, csvString);
+          showDownloadToast(`CSV saved to ${savePath} (${allRows.length} records)`);
+        }
+      } catch {
+        const blob = new Blob([csvString], { type: 'text/csv' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = defaultName;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        showDownloadToast(`CSV downloaded — ${allRows.length} records`);
       }
     } catch {
-      // Fallback: browser download
-      const blob = new Blob([csvString], { type: 'text/csv' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = defaultName;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-      showDownloadToast(`CSV downloaded as ${defaultName}`);
+      import.meta.env.DEV && console.error('CSV export failed');
+    } finally {
+      setDownloadLoading(false);
     }
   };
 
-  const downloadPDF = () => {
-    // Build a clean standalone HTML page with just the results table
-    const today = new Date().toLocaleDateString('en-GB');
-    const tableRows = results.map(r =>
-      `<tr>
-        <td>${r.os_no}</td><td>${r.os_year}</td><td>${r.os_date ? new Date(r.os_date).toLocaleDateString('en-GB') : ''}</td>
-        <td>${r.pax_name || ''}</td><td>${r.passport_no || ''}</td><td>${r.flight_no || ''}</td>
-        <td style="text-align:right">${(r.total_items_value || 0).toLocaleString('en-IN')}</td>
-        <td style="text-align:right">${(r.total_payable || 0).toLocaleString('en-IN')}</td>
-        <td>${r.is_draft === 'N' ? 'Submitted' : 'Draft'}</td>
-        <td>${r.adjudication_date ? new Date(r.adjudication_date).toLocaleDateString('en-GB') : 'No'}</td>
-      </tr>`
-    ).join('');
+  const downloadPDF = async () => {
+    setDownloadLoading(true);
+    try {
+      const response = await api.post('/os-query/search', buildExportPayload());
+      const allRows: OSResult[] = response.data.items || [];
 
-    const html = `<!DOCTYPE html>
+      const showCountry  = !!activeSearch.country_of_departure.trim();
+      const showItemDesc = !!activeSearch.item_desc.trim();
+      const today        = new Date().toLocaleDateString('en-GB');
+
+      const extraHeaders = [
+        ...(showCountry  ? '<th>Country of Dep</th>' : ''),
+        ...(showItemDesc ? '<th>Item Description</th>' : ''),
+      ].join('');
+
+      const tableRows = allRows.map(r => {
+        const extraCells = [
+          ...(showCountry  ? [`<td>${r.country_of_departure || ''}</td>`] : []),
+          ...(showItemDesc ? [`<td>${r.item_desc_summary    || ''}</td>`] : []),
+        ].join('');
+        return `<tr>
+          <td>${r.os_no}</td><td>${r.os_year}</td>
+          <td>${r.os_date ? new Date(r.os_date).toLocaleDateString('en-GB') : ''}</td>
+          <td>${r.pax_name || ''}</td><td>${r.passport_no || ''}</td>
+          <td>${r.flight_no || ''}</td>
+          ${extraCells}
+          <td style="text-align:right">${(r.total_items_value || 0).toLocaleString('en-IN')}</td>
+          <td style="text-align:right">${(r.total_payable || 0).toLocaleString('en-IN')}</td>
+          <td>${r.is_draft === 'N' ? 'Submitted' : 'Draft'}</td>
+          <td>${r.adjudication_date ? new Date(r.adjudication_date).toLocaleDateString('en-GB') : 'No'}</td>
+        </tr>`;
+      }).join('');
+
+      const html = `<!DOCTYPE html>
 <html><head><title>OS Query Results</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: Arial, sans-serif; font-size: 11px; padding: 20px; }
-  h2 { font-size: 16px; margin-bottom: 4px; }
-  .meta { color: #666; font-size: 10px; margin-bottom: 12px; }
+  body { font-family: Arial, sans-serif; font-size: 10px; padding: 20px; }
+  h2 { font-size: 15px; margin-bottom: 4px; }
+  .meta { color: #666; font-size: 9px; margin-bottom: 10px; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; }
-  th { background: #f0f0f0; font-weight: bold; font-size: 10px; }
+  th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
+  th { background: #f0f0f0; font-weight: bold; font-size: 9px; }
   tr:nth-child(even) { background: #fafafa; }
   @media print { body { padding: 0; } }
 </style></head><body>
 <h2>OS Query Results</h2>
-<p class="meta">Generated on ${today} — ${results.length} record(s)</p>
+<p class="meta">Generated on ${today} — ${allRows.length} record(s)</p>
 <table>
   <thead><tr>
     <th>OS No</th><th>Year</th><th>OS Date</th><th>Passenger</th><th>Passport</th>
-    <th>Flight</th><th>Value (₹)</th><th>Due (₹)</th><th>Status</th><th>Adjudicated</th>
+    <th>Flight</th>${extraHeaders}<th>Value (₹)</th><th>Due (₹)</th><th>Status</th><th>Adjudicated</th>
   </tr></thead>
   <tbody>${tableRows}</tbody>
 </table>
 </body></html>`;
 
-    // Use a hidden iframe (works in Tauri WebView2 where window.open is blocked)
-    const iframe = document.createElement('iframe');
-    iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:900px;height:700px;border:none;';
-    document.body.appendChild(iframe);
-    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (iframeDoc) {
-      iframeDoc.open();
-      iframeDoc.write(html);
-      iframeDoc.close();
-      // Give the iframe a moment to render, then print
-      setTimeout(() => {
-        iframe.contentWindow?.print();
-        // Clean up after printing
-        setTimeout(() => document.body.removeChild(iframe), 1000);
-      }, 300);
+      const iframe = document.createElement('iframe');
+      iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:900px;height:700px;border:none;';
+      document.body.appendChild(iframe);
+      const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+      if (iframeDoc) {
+        iframeDoc.open();
+        iframeDoc.write(html);
+        iframeDoc.close();
+        setTimeout(() => {
+          iframe.contentWindow?.print();
+          setTimeout(() => document.body.removeChild(iframe), 1000);
+        }, 300);
+      }
+    } catch {
+      import.meta.env.DEV && console.error('PDF export failed');
+    } finally {
+      setDownloadLoading(false);
     }
   };
+
+  // Derived: which extra columns to show based on what was last searched
+  const showCountry  = hasSearched && !!activeSearch.country_of_departure?.trim();
+  const showItemDesc = hasSearched && !!activeSearch.item_desc?.trim();
+  const totalCols    = 7 + (showCountry ? 1 : 0) + (showItemDesc ? 1 : 0);
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -359,17 +426,21 @@ export default function OSQueryPage() {
             </h3>
             {results.length > 0 && (
               <div className="flex items-center gap-2">
-                <button 
-                  onClick={downloadPDF} 
-                  className="flex items-center gap-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50 transition-colors"
+                <button
+                  onClick={downloadPDF}
+                  disabled={downloadLoading}
+                  className="flex items-center gap-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50 transition-colors disabled:opacity-50"
                 >
-                  <Printer className="w-3.5 h-3.5" /> Download PDF
+                  {downloadLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
+                  Download PDF ({pagination.total_count})
                 </button>
-                <button 
-                  onClick={downloadCSV} 
-                  className="flex items-center gap-1.5 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 px-3 py-1.5 rounded hover:bg-emerald-700 transition-colors shadow-sm"
+                <button
+                  onClick={downloadCSV}
+                  disabled={downloadLoading}
+                  className="flex items-center gap-1.5 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 px-3 py-1.5 rounded hover:bg-emerald-700 transition-colors shadow-sm disabled:opacity-50"
                 >
-                  <FileDown className="w-3.5 h-3.5" /> Download Excel
+                  {downloadLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileDown className="w-3.5 h-3.5" />}
+                  Download Excel ({pagination.total_count})
                 </button>
               </div>
             )}
@@ -401,6 +472,12 @@ export default function OSQueryPage() {
                         Flight <SortIcon col="flight_date" sortBy={sortBy} sortDir={sortDir} />
                       </button>
                     </th>
+                    {showCountry && (
+                      <th className="px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Country of Dep</th>
+                    )}
+                    {showItemDesc && (
+                      <th className="px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Item Description</th>
+                    )}
                     <th className="px-4 py-3 text-right text-xs font-semibold text-slate-600 uppercase tracking-wider">
                       <button onClick={() => handleSort('total_items_value')} className="flex items-center ml-auto hover:text-slate-900 transition-colors">
                         Values (₹) <SortIcon col="total_items_value" sortBy={sortBy} sortDir={sortDir} />
@@ -438,6 +515,16 @@ export default function OSQueryPage() {
                             <div className="text-sm text-slate-800">{r.flight_no || 'N/A'}</div>
                             <div className="text-xs text-slate-500">{r.flight_date || ''}</div>
                           </td>
+                          {showCountry && (
+                            <td className="px-4 py-3">
+                              <div className="text-sm text-slate-800 truncate max-w-[130px]">{r.country_of_departure || '—'}</div>
+                            </td>
+                          )}
+                          {showItemDesc && (
+                            <td className="px-4 py-3">
+                              <div className="text-sm text-slate-700 truncate max-w-[200px]" title={r.item_desc_summary || ''}>{r.item_desc_summary || '—'}</div>
+                            </td>
+                          )}
                           <td className="px-4 py-3 text-right">
                             <div className="text-sm font-semibold text-slate-800">
                               Val: {r.total_items_value?.toLocaleString('en-IN') || '0'}
@@ -474,7 +561,7 @@ export default function OSQueryPage() {
                         {/* Expandable row for Items */}
                         {isExpanded && (
                           <tr className="bg-slate-50/80 border-b border-slate-200">
-                            <td colSpan={7} className="px-8 py-4">
+                            <td colSpan={totalCols} className="px-8 py-4">
                               <div className="border border-slate-200 rounded bg-white shadow-sm font-mono text-xs overflow-hidden">
                                 <div className="bg-slate-100 border-b border-slate-200 px-3 py-1.5 font-bold text-slate-600 text-[10px] uppercase tracking-wider flex justify-between">
                                   <span>Seized Goods / Items Inventory</span>

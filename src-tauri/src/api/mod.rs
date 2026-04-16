@@ -75,6 +75,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/os/classify-item",                    get(offence::classify_item))
         .route("/os/check-os-no",                      get(offence::check_os_no))
         .route("/os/offline",                          post(offence::create_offline))
+        .route("/os/offline/bulk-import",              post(offence::bulk_import_offline))
         .route("/os/{os_no}/{os_year}",
                get(offence::get_os)
                .put(offence::update_os)

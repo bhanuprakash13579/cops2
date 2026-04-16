@@ -1,9 +1,245 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Plus, Trash2, FileText, User, Plane, AlertCircle, CheckCircle, Info } from 'lucide-react';
+import { ArrowLeft, Plus, Trash2, FileText, User, Plane, AlertCircle, CheckCircle, Info, Upload, Table2, PenLine } from 'lucide-react';
 import DatePicker from '@/components/DatePicker';
 import api from '@/lib/api';
+import * as XLSX from 'xlsx';
+
+// ── Excel import helpers ──────────────────────────────────────────────────────
+
+/** Parse numbered item list: "1) GOLD BISCUIT 2) IPHONE 17" → ["GOLD BISCUIT","IPHONE 17"] */
+function splitNumberedList(str: string): string[] {
+  if (!str) return [];
+  const parts = str.split(/\d+\)\s*/).filter(s => s.trim().length > 0);
+  return parts.length > 1 ? parts.map(s => s.trim()) : [str.trim()];
+}
+
+/** Parse "2.5 KGS" or "1 NOS" → { qty, uqc } */
+function parseQtyUqc(raw: string): { qty: number; uqc: string } {
+  const m = raw.trim().match(/^([\d.]+)\s*([A-Za-z]+)?$/);
+  if (m) return { qty: parseFloat(m[1]) || 1, uqc: (m[2] || 'NOS').toUpperCase().slice(0, 3) };
+  return { qty: 1, uqc: 'NOS' };
+}
+
+/** Build items array from ITEM DESCRIPTION + QUANTITY columns */
+function parseExcelItems(descCol: string, qtyCol: string): Array<{ items_desc: string; items_qty: number; items_uqc: string; items_value: number; items_duty_type: string }> {
+  const descs = splitNumberedList(descCol);
+  const qtys  = splitNumberedList(qtyCol || '');
+  return descs.map((d, i) => {
+    const { qty, uqc } = parseQtyUqc(qtys[i] || '1 NOS');
+    return { items_desc: d.toUpperCase(), items_qty: qty, items_uqc: uqc, items_value: 0, items_duty_type: 'Miscellaneous-22' };
+  });
+}
+
+/** Classify Column 1 into RF/REF/Confiscated */
+function classifyColumn1(col1: string): 'rf' | 'ref' | 'confiscated' | 'ambiguous' {
+  const v = (col1 || '').toLowerCase().trim();
+  if (!v) return 'ambiguous';
+  if (v.includes('absolute confiscation')) return 'confiscated';
+  if (v.includes('confiscation'))          return 'rf';
+  if (v.match(/re.?export/))               return 'ref';
+  return 'ambiguous';
+}
+
+/** Convert Excel serial date number to YYYY-MM-DD, or pass through ISO string */
+function excelDateToIso(raw: any): string {
+  if (!raw) return '';
+  if (typeof raw === 'number') {
+    // Excel serial date: days since 1899-12-30
+    const d = new Date(Math.round((raw - 25569) * 86400 * 1000));
+    return d.toISOString().split('T')[0];
+  }
+  const s = String(raw).trim();
+  // DD/MM/YYYY
+  const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (dmy) {
+    const y = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return `${y}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  }
+  // Already ISO-ish
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  return '';
+}
+
+interface ParsedImportRow {
+  sno:              number;
+  os_no:            string;
+  os_date:          string;
+  os_year:          number;
+  booked_by:        string;
+  flight_no:        string;
+  pax_name:         string;
+  pax_nationality:  string;
+  passport_no:      string;
+  pax_address1:     string;
+  file_spot:        string;
+  case_type:        string;
+  items:            Array<{ items_desc: string; items_qty: number; items_uqc: string; items_value: number; items_duty_type: string }>;
+  total_items_value: number;
+  total_duty_amount: number;
+  total_payable:    number;
+  rf_amount:        number;
+  ref_amount:       number;
+  pp_amount:        number;
+  confiscated_value: number;
+  adj_offr_name:    string;
+  adj_offr_designation: string;
+  adjudication_date: string;
+  post_adj_br_entries: string;
+  // RF/REF classification (may need user input)
+  rfRefType:        'rf' | 'ref' | 'confiscated' | 'ambiguous';
+  rfRefValue:       number;
+  // Parse warnings
+  warnings:         string[];
+}
+
+function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
+  if (sheetData.length < 2) return [];
+
+  // Normalize header row to lowercase, trim
+  const rawHeaders = (sheetData[0] || []).map((h: any) => String(h || '').toLowerCase().trim());
+
+  // Column aliases (handle both old and new header variants)
+  const headerAliases: Record<string, string[]> = {
+    'os no':           ['os no', 'os_no', 'os number', 's.no'],
+    'os date':         ['os date', 'os_date', 'date'],
+    'batch / aiu':     ['batch / aiu', 'batch/aiu', 'booked by', 'batch'],
+    'flt no':          ['flt no', 'flt_no', 'flight no', 'flight_no'],
+    'pax name':        ['pax name', 'pax_name', 'passenger name'],
+    'nationality':     ['nationality', 'pax_nationality', 'pax nationality'],
+    'passport no.':    ['passport no.', 'passport no', 'passport_no'],
+    'address':         ['address', 'pax_address1', 'pax address'],
+    'item description':['item description', 'item_description', 'items_desc'],
+    'quantity':        ['quantity', 'qty'],
+    'value in rs.':    ['value in rs.', 'value in rs', 'value_in_rs', 'total value'],
+    'rf/r.e.f':        ['rf/r.e.f', 'rf/ref', 'rf_amount', 'ref_amount'],
+    'penalty':         ['penalty', 'pp_amount'],
+    'duty in rs':      ['duty in rs', 'duty_in_rs', 'duty rs', 'total_duty_amount'],
+    'total':           ['total', 'total_payable'],
+    'b.r no':          ['b.r no', 'br no', 'br_no'],
+    'b.r date':        ['b.r date', 'br date', 'br_date'],
+    'file / spot -adjudication': ['file / spot -adjudication', 'file/spot', 'file_spot'],
+    'adjudicated by ac/dc':      ['adjudicated by ac/dc', 'adj_offr_name', 'adjudicated by'],
+    'adjudicated by jc/adc':     ['adjudicated by jc/adc', 'adj_offr_designation'],
+    'export/import':             ['export/import', 'case_type'],
+    'column 1':                  ['column 1', 'column1', 'col1', 'confiscation type'],
+  };
+
+  // Build a resolved col-index map
+  const colMap: Record<string, number> = {};
+  for (const [canonical, aliases] of Object.entries(headerAliases)) {
+    for (const alias of aliases) {
+      const idx = rawHeaders.indexOf(alias);
+      if (idx >= 0) { colMap[canonical] = idx; break; }
+    }
+  }
+
+  const getCol = (row: any[], canonical: string) => {
+    const i = colMap[canonical];
+    return i !== undefined ? String(row[i] ?? '').trim() : '';
+  };
+  const getColNum = (row: any[], canonical: string) => {
+    const i = colMap[canonical];
+    if (i === undefined) return 0;
+    const v = row[i];
+    return typeof v === 'number' ? v : parseFloat(String(v || '0').replace(/,/g, '')) || 0;
+  };
+
+  const results: ParsedImportRow[] = [];
+
+  for (let ri = 1; ri < sheetData.length; ri++) {
+    const row = sheetData[ri];
+    if (!row || row.every((c: any) => !c)) continue; // skip blank rows
+
+    const warnings: string[] = [];
+
+    const os_no_raw = getCol(row, 'os no').replace(/\D/g, ''); // strip non-digits
+    if (!os_no_raw) { warnings.push('No OS No. — row skipped'); continue; }
+
+    const os_date_raw = getCol(row, 'os date');
+    const os_date = excelDateToIso(colMap['os date'] !== undefined ? row[colMap['os date']] : os_date_raw);
+    if (!os_date) warnings.push('Could not parse OS Date');
+    const os_year = os_date ? parseInt(os_date.split('-')[0]) : new Date().getFullYear();
+
+    const descRaw = getCol(row, 'item description');
+    const qtyRaw  = getCol(row, 'quantity');
+    const items   = descRaw ? parseExcelItems(descRaw, qtyRaw) : [];
+    if (items.length === 0) warnings.push('No item description found');
+
+    // Distribute total value across items proportionally if we have a total
+    const totalValue = getColNum(row, 'value in rs.');
+    if (items.length === 1) {
+      items[0].items_value = totalValue;
+    } else if (items.length > 1) {
+      // Equal split — value per item
+      const perItem = Math.round((totalValue / items.length) * 100) / 100;
+      items.forEach(itm => { itm.items_value = perItem; });
+    }
+
+    const rfRefRaw = getColNum(row, 'rf/r.e.f');
+    const col1     = getCol(row, 'column 1');
+    const rfRefType = classifyColumn1(col1);
+    if (rfRefType === 'ambiguous' && rfRefRaw > 0) warnings.push('RF/REF type ambiguous — please select below');
+
+    let rf_amount = 0, ref_amount = 0, confiscated_value = 0;
+    if (rfRefType === 'rf')          rf_amount = rfRefRaw;
+    else if (rfRefType === 'ref')    ref_amount = rfRefRaw;
+    else if (rfRefType === 'confiscated') confiscated_value = rfRefRaw;
+
+    // BR entries
+    const brNo   = getCol(row, 'b.r no');
+    const brDate = excelDateToIso(colMap['b.r date'] !== undefined ? row[colMap['b.r date']] : '');
+    const post_adj_br_entries = brNo
+      ? JSON.stringify([{ no: brNo, date: brDate || null }])
+      : '';
+
+    const fileSpotRaw = getCol(row, 'file / spot -adjudication').toLowerCase();
+    const file_spot = fileSpotRaw.includes('file') ? 'File' : 'Spot';
+
+    const caseTypeRaw = getCol(row, 'export/import').toLowerCase();
+    const case_type = caseTypeRaw.includes('export') ? 'Export Case' : 'Arrival Case';
+
+    const adjDesigRaw = getCol(row, 'adjudicated by jc/adc').toLowerCase();
+    const adj_offr_designation = adjDesigRaw.includes('jc') || adjDesigRaw.includes('jc') ? 'JC'
+      : adjDesigRaw.includes('adc') ? 'ADC'
+      : adjDesigRaw.includes('ac') ? 'AC'
+      : adjDesigRaw.includes('dc') ? 'DC'
+      : getCol(row, 'adjudicated by jc/adc');
+
+    results.push({
+      sno:             ri,
+      os_no:           os_no_raw,
+      os_date,
+      os_year,
+      booked_by:       getCol(row, 'batch / aiu') || 'BATCH A',
+      flight_no:       getCol(row, 'flt no').toUpperCase(),
+      pax_name:        getCol(row, 'pax name').toUpperCase(),
+      pax_nationality: getCol(row, 'nationality').toUpperCase(),
+      passport_no:     getCol(row, 'passport no.').toUpperCase(),
+      pax_address1:    getCol(row, 'address').toUpperCase(),
+      file_spot,
+      case_type,
+      items,
+      total_items_value: totalValue,
+      total_duty_amount: getColNum(row, 'duty in rs'),
+      total_payable:     getColNum(row, 'total'),
+      rf_amount,
+      ref_amount,
+      pp_amount:         getColNum(row, 'penalty'),
+      confiscated_value,
+      adj_offr_name:     getCol(row, 'adjudicated by ac/dc').toUpperCase(),
+      adj_offr_designation,
+      adjudication_date: os_date,
+      post_adj_br_entries,
+      rfRefType,
+      rfRefValue:        rfRefRaw,
+      warnings,
+    });
+  }
+
+  return results;
+}
 
 // ── Static seed list for item-description autocomplete ───────────────────────
 const STATIC_ITEM_SUGGESTIONS = [
@@ -223,6 +459,11 @@ export default function OfflineAdjudicationForm() {
   const [additionalOpen, setAdditionalOpen] = useState(false);
   const [confirmSave, setConfirmSave] = useState(false);
   const [editLoading, setEditLoading] = useState(isEditing);
+  const [inputMode, setInputMode] = useState<'manual' | 'excel'>('manual');
+  const [parsedRows, setParsedRows] = useState<ParsedImportRow[]>([]);
+  const [rowRfRefOverrides, setRowRfRefOverrides] = useState<Record<number, 'rf' | 'ref' | 'confiscated'>>({});
+  const [importLoading, setImportLoading] = useState(false);
+  const [importStatus, setImportStatus] = useState<{ imported: number; skipped: number; failed: any[]; total: number } | null>(null);
 
   // ── Load existing case when editing ───────────────────────────────────────
   useEffect(() => {
@@ -520,6 +761,47 @@ export default function OfflineAdjudicationForm() {
     [items]
   );
 
+  // ── Excel import handlers ─────────────────────────────────────────────────
+  const handleExcelFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const buffer = await file.arrayBuffer();
+    const wb = XLSX.read(buffer, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const data: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    const rows = parseExcelRows(data);
+    setParsedRows(rows);
+    setRowRfRefOverrides({});
+    setImportStatus(null);
+    // Reset input so same file can be re-selected
+    e.target.value = '';
+  };
+
+  const handleExcelImport = async () => {
+    setImportLoading(true);
+    setImportStatus(null);
+    const payload = parsedRows.map(row => {
+      let { rf_amount, ref_amount, confiscated_value } = row;
+      if (row.rfRefType === 'ambiguous') {
+        const chosen = rowRfRefOverrides[row.sno] || 'rf';
+        rf_amount = 0; ref_amount = 0; confiscated_value = 0;
+        if (chosen === 'rf')          rf_amount = row.rfRefValue;
+        else if (chosen === 'ref')    ref_amount = row.rfRefValue;
+        else                          confiscated_value = row.rfRefValue;
+      }
+      return { ...row, rf_amount, ref_amount, confiscated_value };
+    });
+    try {
+      const res = await api.post('/os/offline/bulk-import', payload);
+      setImportStatus(res.data);
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || err.message || 'Import failed';
+      setImportStatus({ imported: 0, skipped: 0, failed: [{ error: detail }], total: parsedRows.length });
+    } finally {
+      setImportLoading(false);
+    }
+  };
+
   // ── Success screen ────────────────────────────────────────────────────────
   if (successInfo) {
     return (
@@ -594,6 +876,27 @@ export default function OfflineAdjudicationForm() {
         </span>
       </div>
 
+      {/* Input mode toggle — only shown when creating (not editing) */}
+      {!isEditing && (
+        <div className="flex gap-3">
+          <button
+            type="button"
+            onClick={() => { setInputMode('manual'); setImportStatus(null); }}
+            className={`flex items-center gap-2 px-5 py-3.5 rounded-xl border-2 font-semibold text-sm transition-all ${inputMode === 'manual' ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'}`}
+          >
+            <PenLine size={16} /> Add Data Manually
+          </button>
+          <button
+            type="button"
+            onClick={() => { setInputMode('excel'); setImportStatus(null); }}
+            className={`flex items-center gap-2 px-5 py-3.5 rounded-xl border-2 font-semibold text-sm transition-all ${inputMode === 'excel' ? 'border-green-500 bg-green-50 text-green-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'}`}
+          >
+            <Table2 size={16} /> Add Data through Excel
+          </button>
+        </div>
+      )}
+
+      {inputMode === 'manual' && (<>
       {/* Error banner */}
       {errorMsg && (
         <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg flex items-start">
@@ -1034,6 +1337,190 @@ export default function OfflineAdjudicationForm() {
           </div>
         </div>
       </form>
+      </>)}
+
+      {/* ── Excel import mode ──────────────────────────────────────────────── */}
+      {inputMode === 'excel' && (
+        <div className="space-y-4">
+
+          {/* File picker card */}
+          <div className="bg-white rounded-xl border border-slate-200 p-6">
+            <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider mb-3 flex items-center">
+              <Upload className="mr-2 text-green-600" size={16} /> Import from Monthly Report Excel
+            </h2>
+            <p className="text-xs text-slate-500 mb-4">
+              Upload the monthly report Excel file (.xlsx / .xls). All rows are parsed and only cases
+              not already in the database are imported — duplicates are silently skipped.
+            </p>
+            <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-xl cursor-pointer hover:border-green-400 hover:bg-green-50 transition-all">
+              <Upload size={24} className="text-slate-400 mb-2" />
+              <span className="text-sm font-medium text-slate-600">Click to select Excel file</span>
+              <span className="text-xs text-slate-400 mt-1">.xlsx or .xls</span>
+              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleExcelFile} />
+            </label>
+          </div>
+
+          {/* Parsed rows preview */}
+          {parsedRows.length > 0 && !importStatus && (
+            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+              <div className="p-4 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
+                <h2 className="text-sm font-bold text-slate-800 uppercase flex items-center tracking-wider">
+                  <Table2 className="mr-2 text-green-600" size={16} /> Preview — {parsedRows.length} rows parsed
+                </h2>
+                <span className="text-xs text-slate-500">
+                  {parsedRows.filter(r => r.warnings.length > 0).length} rows with warnings
+                </span>
+              </div>
+              <div className="overflow-auto max-h-[480px]">
+                <table className="w-full text-xs text-left whitespace-nowrap">
+                  <thead className="text-[10px] text-slate-500 uppercase bg-slate-100 border-b border-slate-200 tracking-wider sticky top-0 z-10">
+                    <tr>
+                      <th className="px-2 py-2">#</th>
+                      <th className="px-2 py-2">OS No.</th>
+                      <th className="px-2 py-2">Date</th>
+                      <th className="px-2 py-2">Passenger</th>
+                      <th className="px-2 py-2">Passport</th>
+                      <th className="px-2 py-2">Flight</th>
+                      <th className="px-2 py-2">Items</th>
+                      <th className="px-2 py-2 text-right">Value (₹)</th>
+                      <th className="px-2 py-2">RF/REF Type</th>
+                      <th className="px-2 py-2 text-right">Amt (₹)</th>
+                      <th className="px-2 py-2">Adj. Officer</th>
+                      <th className="px-2 py-2">Warnings</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {parsedRows.map((row, i) => {
+                      const itemSummary = row.items.map(it => it.items_desc).join('; ');
+                      return (
+                        <tr key={row.sno} className={row.warnings.length > 0 ? 'bg-amber-50' : 'hover:bg-slate-50'}>
+                          <td className="px-2 py-1.5 text-slate-400 font-medium">{i + 1}</td>
+                          <td className="px-2 py-1.5 font-bold text-slate-800">{row.os_no}/{row.os_year}</td>
+                          <td className="px-2 py-1.5 text-slate-600">{row.os_date}</td>
+                          <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-700" title={row.pax_name}>{row.pax_name}</td>
+                          <td className="px-2 py-1.5 font-mono text-slate-600">{row.passport_no}</td>
+                          <td className="px-2 py-1.5 text-slate-600">{row.flight_no}</td>
+                          <td className="px-2 py-1.5 max-w-[140px] truncate text-slate-600" title={itemSummary}>
+                            {itemSummary.length > 40 ? itemSummary.slice(0, 40) + '…' : itemSummary}
+                          </td>
+                          <td className="px-2 py-1.5 text-right font-medium">{row.total_items_value.toLocaleString('en-IN')}</td>
+                          <td className="px-2 py-1.5">
+                            {row.rfRefType === 'ambiguous' ? (
+                              <select
+                                className="px-1 py-0.5 border border-amber-400 rounded text-[10px] bg-amber-50 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                value={rowRfRefOverrides[row.sno] || ''}
+                                onChange={e => setRowRfRefOverrides(prev => ({ ...prev, [row.sno]: e.target.value as 'rf' | 'ref' | 'confiscated' }))}
+                              >
+                                <option value="">— select —</option>
+                                <option value="rf">RF (Confiscation)</option>
+                                <option value="ref">REF (Re-Export)</option>
+                                <option value="confiscated">Abs. Confiscation</option>
+                              </select>
+                            ) : (
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                row.rfRefType === 'rf' ? 'bg-red-100 text-red-700'
+                                : row.rfRefType === 'ref' ? 'bg-blue-100 text-blue-700'
+                                : 'bg-purple-100 text-purple-700'
+                              }`}>{row.rfRefType}</span>
+                            )}
+                          </td>
+                          <td className="px-2 py-1.5 text-right font-medium">{row.rfRefValue.toLocaleString('en-IN')}</td>
+                          <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-600" title={row.adj_offr_name}>{row.adj_offr_name}</td>
+                          <td className="px-2 py-1.5">
+                            {row.warnings.length > 0 && (
+                              <span className="text-amber-700 text-[10px]" title={row.warnings.join('\n')}>
+                                ⚠ {row.warnings.join('; ')}
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Import action bar */}
+              <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-4">
+                <div className="text-xs text-slate-500">
+                  {parsedRows.filter(r => r.rfRefType === 'ambiguous' && !rowRfRefOverrides[r.sno]).length > 0 && (
+                    <span className="text-amber-700 font-medium">
+                      ⚠ {parsedRows.filter(r => r.rfRefType === 'ambiguous' && !rowRfRefOverrides[r.sno]).length} rows still need RF/REF type selected
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  disabled={importLoading}
+                  onClick={handleExcelImport}
+                  className="flex items-center gap-2 px-6 py-2.5 bg-green-700 text-white font-semibold rounded-lg hover:bg-green-600 transition-colors text-sm disabled:opacity-60"
+                >
+                  {importLoading ? (
+                    <>
+                      <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Importing…
+                    </>
+                  ) : (
+                    <>
+                      <Upload size={15} /> Import {parsedRows.length} Cases
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Import result */}
+          {importStatus && (
+            <div className={`rounded-xl border p-6 ${importStatus.failed.length > 0 ? 'bg-amber-50 border-amber-200' : 'bg-green-50 border-green-200'}`}>
+              <h3 className="font-bold text-sm text-slate-800 mb-4 flex items-center gap-2">
+                <CheckCircle size={16} className="text-green-600" /> Import Complete
+              </h3>
+              <div className="flex gap-8 text-sm mb-4">
+                <div className="text-center">
+                  <div className="text-3xl font-bold text-green-700">{importStatus.imported}</div>
+                  <div className="text-xs text-slate-500 mt-0.5">Imported</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-3xl font-bold text-amber-600">{importStatus.skipped}</div>
+                  <div className="text-xs text-slate-500 mt-0.5">Skipped (already in DB)</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-3xl font-bold text-red-600">{importStatus.failed.length}</div>
+                  <div className="text-xs text-slate-500 mt-0.5">Failed</div>
+                </div>
+              </div>
+              {importStatus.failed.length > 0 && (
+                <div className="mb-4 space-y-1">
+                  <p className="text-xs font-semibold text-red-700">Failed rows:</p>
+                  {importStatus.failed.map((f: any, i: number) => (
+                    <p key={i} className="text-xs text-red-600 font-mono bg-red-50 px-2 py-1 rounded">
+                      {f.os_no ? `OS ${f.os_no}/${f.os_year}: ` : ''}{f.error}
+                    </p>
+                  ))}
+                </div>
+              )}
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => { setParsedRows([]); setImportStatus(null); setRowRfRefOverrides({}); }}
+                  className="px-4 py-2 text-sm font-semibold bg-white border border-slate-300 text-slate-700 rounded-lg hover:bg-slate-50 transition-colors"
+                >
+                  Import Another File
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigate('/sdo/offence')}
+                  className="px-4 py-2 text-sm font-semibold bg-blue-700 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                >
+                  View OS Cases
+                </button>
+              </div>
+            </div>
+          )}
+
+        </div>
+      )}
     </div>
   );
 }
