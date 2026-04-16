@@ -470,14 +470,17 @@ const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, pe
   }, []);
   const noopBlur = useCallback(() => {}, []);
 
-  // Expand any item whose description has commas/semicolons into individual rows
+  // Expand any item whose description has commas/semicolons into individual rows.
+  // Each split part inherits an equal share of the parent item's value so the
+  // aggregated total remains balanced without the user having to redistribute.
   const autoSplit = useCallback(() => {
     setEditItems(prev => {
       const expanded: ParsedItem[] = [];
       for (const item of prev) {
         const parts = item.items_desc.split(/[,;]/).map(s => s.trim()).filter(Boolean);
         if (parts.length > 1) {
-          parts.forEach(desc => expanded.push({ ...item, items_desc: desc.toUpperCase(), items_value: 0 }));
+          const perValue = Math.round(((Number(item.items_value) || 0) / parts.length) * 100) / 100;
+          parts.forEach(desc => expanded.push({ ...item, items_desc: desc.toUpperCase(), items_qty: 1, items_value: perValue }));
         } else {
           expanded.push(item);
         }
