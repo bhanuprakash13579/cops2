@@ -448,16 +448,20 @@ const SimpleItemRow = memo(function SimpleItemRow({
   );
 });
 
-// ── Inline item editor for Excel import rows with ambiguous item parsing ──────
+// ── Inline item editor for Excel import rows ─────────────────────────────────
 interface ItemEditPanelProps {
   initialItems: ParsedItem[];
   totalValue: number;
+  penalty: number;
   onConfirm: (items: ParsedItem[]) => void;
   onCancel: () => void;
 }
-const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, onConfirm, onCancel }: ItemEditPanelProps) {
-  const seed = initialItems.length > 0 ? initialItems : [{ items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }];
+const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, penalty, onConfirm, onCancel }: ItemEditPanelProps) {
+  const seed = initialItems.length > 0
+    ? initialItems
+    : [{ items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }];
   const [editItems, setEditItems] = useState<ParsedItem[]>(seed);
+
   const updateItem = useCallback((idx: number, field: string, value: any) => {
     setEditItems(prev => prev.map((item, i) => i === idx ? { ...item, [field]: value } : item));
   }, []);
@@ -465,19 +469,73 @@ const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, on
     setEditItems(prev => prev.filter((_, i) => i !== idx));
   }, []);
   const noopBlur = useCallback(() => {}, []);
+
+  // Expand any item whose description has commas/semicolons into individual rows
+  const autoSplit = useCallback(() => {
+    setEditItems(prev => {
+      const expanded: ParsedItem[] = [];
+      for (const item of prev) {
+        const parts = item.items_desc.split(/[,;]/).map(s => s.trim()).filter(Boolean);
+        if (parts.length > 1) {
+          parts.forEach(desc => expanded.push({ ...item, items_desc: desc.toUpperCase(), items_value: 0 }));
+        } else {
+          expanded.push(item);
+        }
+      }
+      return expanded;
+    });
+  }, []);
+
+  // Divide totalValue evenly across all current items
+  const distributeEqually = useCallback(() => {
+    setEditItems(prev => {
+      if (!prev.length) return prev;
+      const per = Math.round((totalValue / prev.length) * 100) / 100;
+      return prev.map(it => ({ ...it, items_value: per }));
+    });
+  }, [totalValue]);
+
   const canConfirm = editItems.length > 0 && editItems.every(it => String(it.items_desc || '').trim().length > 0);
+  const distributed = editItems.reduce((s, it) => s + (Number(it.items_value) || 0), 0);
+  const valueBalanced = Math.abs(distributed - totalValue) < 1;
+  const hasSplittable = editItems.some(it => /[,;]/.test(it.items_desc));
+
   return (
-    <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mt-1">
-      <div className="flex justify-between items-start mb-2">
-        <p className="text-xs font-bold text-amber-800">Review &amp; confirm items — total value: ₹{totalValue.toLocaleString('en-IN')}</p>
-        <p className="text-[10px] text-slate-500 ml-4">Distribute value across items and set duty types, then click Confirm.</p>
+    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mt-1">
+      <div className="flex items-start justify-between mb-2 flex-wrap gap-2">
+        <div>
+          <p className="text-xs font-bold text-blue-800">
+            Edit items — Value: ₹{totalValue.toLocaleString('en-IN')}
+            {penalty > 0 && <span className="ml-2 text-slate-600 font-normal">· Penalty: ₹{penalty.toLocaleString('en-IN')}</span>}
+            {!valueBalanced && (
+              <span className="ml-2 text-amber-600 font-normal text-[10px]">
+                (distributed: ₹{distributed.toLocaleString('en-IN')})
+              </span>
+            )}
+          </p>
+          <p className="text-[10px] text-slate-500 mt-0.5">
+            Split merged descriptions, set individual qty / value / duty type, then confirm.
+          </p>
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          {hasSplittable && (
+            <button type="button" onClick={autoSplit}
+              className="text-[10px] px-2 py-1 border border-violet-300 text-violet-700 rounded hover:bg-violet-50 font-medium whitespace-nowrap">
+              ✂ Auto-split on commas
+            </button>
+          )}
+          <button type="button" onClick={distributeEqually}
+            className="text-[10px] px-2 py-1 border border-blue-300 text-blue-700 rounded hover:bg-blue-100 font-medium whitespace-nowrap">
+            ÷ Distribute value equally
+          </button>
+        </div>
       </div>
       <div className="overflow-auto">
         <table className="w-full text-xs">
           <thead className="text-[10px] text-slate-500 uppercase bg-slate-100 border-b border-slate-200 tracking-wider">
             <tr>
               <th className="px-2 py-1.5 w-8 text-center">S.No</th>
-              <th className="px-2 py-1.5 w-48">Description</th>
+              <th className="px-2 py-1.5">Description</th>
               <th className="px-2 py-1.5 w-32 text-center">Qty &amp; Unit</th>
               <th className="px-2 py-1.5 w-24 text-right">Value (₹)</th>
               <th className="px-2 py-1.5 w-36">Duty Type</th>
@@ -500,9 +558,10 @@ const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, on
           </tbody>
         </table>
       </div>
-      <div className="flex items-center gap-2 mt-2">
-        <button type="button" onClick={() => setEditItems(prev => [...prev, { items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }])}
-          className="text-xs px-2 py-1 border border-orange-200 text-orange-700 rounded hover:bg-orange-50 font-medium">
+      <div className="flex items-center gap-2 mt-2 flex-wrap">
+        <button type="button"
+          onClick={() => setEditItems(prev => [...prev, { items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }])}
+          className="text-xs px-2 py-1 border border-blue-300 text-blue-700 rounded hover:bg-blue-50 font-medium">
           + Add Item
         </button>
         <button type="button" onClick={() => onConfirm(editItems)} disabled={!canConfirm}
@@ -513,6 +572,11 @@ const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, on
           className="text-xs px-2 py-1 border border-slate-200 text-slate-600 rounded hover:bg-slate-50">
           Cancel
         </button>
+        {!valueBalanced && (
+          <span className="text-[10px] text-amber-600 ml-auto">
+            ⚠ ₹{Math.abs(distributed - totalValue).toFixed(2)} unallocated
+          </span>
+        )}
       </div>
     </div>
   );
@@ -1530,7 +1594,8 @@ export default function OfflineAdjudicationForm() {
                       <th className="px-2 py-2">Items</th>
                       <th className="px-2 py-2 text-right">Value (₹)</th>
                       <th className="px-2 py-2">RF/REF Type</th>
-                      <th className="px-2 py-2 text-right">Amt (₹)</th>
+                      <th className="px-2 py-2 text-right">RF/REF (₹)</th>
+                      <th className="px-2 py-2 text-right">Penalty (₹)</th>
                       <th className="px-2 py-2">Adj. Officer</th>
                       <th className="px-2 py-2">Warnings</th>
                     </tr>
@@ -1550,24 +1615,34 @@ export default function OfflineAdjudicationForm() {
                             <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-700" title={row.pax_name}>{row.pax_name}</td>
                             <td className="px-2 py-1.5 font-mono text-slate-600">{row.passport_no}</td>
                             <td className="px-2 py-1.5 text-slate-600">{row.flight_no}</td>
-                            <td className="px-2 py-1.5 max-w-[160px] text-slate-600">
-                              {row.needsManualItems && !confirmedItems ? (
+                            <td className="px-2 py-1.5 max-w-[180px] text-slate-600">
+                              <div className="flex items-start gap-1">
+                                <div className="flex-1 min-w-0">
+                                  {row.needsManualItems && !confirmedItems && (
+                                    <span className="text-amber-600 text-[10px] font-semibold block">⚠ needs review</span>
+                                  )}
+                                  {confirmedItems && (
+                                    <span className="text-green-700 text-[10px] font-semibold block">✓ confirmed</span>
+                                  )}
+                                  <span className="text-[10px] text-slate-500 truncate block" title={itemSummary}>
+                                    {displayItems.length} item{displayItems.length !== 1 ? 's' : ''}
+                                    {displayItems.length > 0 && `: ${displayItems[0].items_desc.slice(0, 22)}${displayItems.length > 1 || displayItems[0].items_desc.length > 22 ? '…' : ''}`}
+                                  </span>
+                                  {displayItems.length === 1 && (
+                                    <span className="text-[10px] text-slate-400">
+                                      ×{displayItems[0].items_qty} {displayItems[0].items_uqc}
+                                    </span>
+                                  )}
+                                </div>
                                 <button
                                   type="button"
-                                  onClick={() => setExpandedItemEdit(prev => { const n = new Set(prev); n.add(row.sno); return n; })}
-                                  className="flex items-center gap-1 text-amber-700 bg-amber-50 border border-amber-300 rounded px-1.5 py-0.5 text-[10px] font-semibold hover:bg-amber-100"
+                                  title="Edit items"
+                                  onClick={() => setExpandedItemEdit(prev => { const n = new Set(prev); if (n.has(row.sno)) n.delete(row.sno); else n.add(row.sno); return n; })}
+                                  className={`flex-shrink-0 p-0.5 rounded transition-colors ${isEditingItems ? 'text-blue-600 bg-blue-100' : 'text-slate-400 hover:text-blue-600 hover:bg-blue-50'}`}
                                 >
-                                  ⚠ {row.items.length} item{row.items.length !== 1 ? 's' : ''} · review
+                                  <PenLine size={11} />
                                 </button>
-                              ) : confirmedItems ? (
-                                <span className="text-green-700 text-[10px] font-semibold">
-                                  ✓ {confirmedItems.length} item{confirmedItems.length !== 1 ? 's' : ''} confirmed
-                                </span>
-                              ) : (
-                                <span className="truncate block" title={itemSummary}>
-                                  {itemSummary.length > 40 ? itemSummary.slice(0, 40) + '…' : itemSummary}
-                                </span>
-                              )}
+                              </div>
                             </td>
                             <td className="px-2 py-1.5 text-right font-medium">{row.total_items_value.toLocaleString('en-IN')}</td>
                             <td className="px-2 py-1.5">
@@ -1593,6 +1668,9 @@ export default function OfflineAdjudicationForm() {
                               )}
                             </td>
                             <td className="px-2 py-1.5 text-right font-medium">{row.rfRefValue.toLocaleString('en-IN')}</td>
+                            <td className="px-2 py-1.5 text-right font-medium">
+                              {row.pp_amount > 0 ? row.pp_amount.toLocaleString('en-IN') : <span className="text-slate-300">—</span>}
+                            </td>
                             <td className="px-2 py-1.5 max-w-[120px] truncate text-slate-600" title={row.adj_offr_name}>{row.adj_offr_name}</td>
                             <td className="px-2 py-1.5">
                               {row.warnings.length > 0 && (
@@ -1604,10 +1682,11 @@ export default function OfflineAdjudicationForm() {
                           </tr>
                           {isEditingItems && (
                             <tr>
-                              <td colSpan={12} className="px-3 py-2">
+                              <td colSpan={13} className="px-3 py-2 bg-blue-50/40">
                                 <ItemEditPanel
                                   initialItems={confirmedItems || row.items}
                                   totalValue={row.total_items_value}
+                                  penalty={row.pp_amount}
                                   onConfirm={items => {
                                     setRowItemOverrides(prev => ({ ...prev, [row.sno]: items }));
                                     setExpandedItemEdit(prev => { const n = new Set(prev); n.delete(row.sno); return n; });
