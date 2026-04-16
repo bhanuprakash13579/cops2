@@ -715,12 +715,14 @@ pub async fn delete_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
     let reason = params.get("reason").map(|s| s.as_str()).unwrap_or("").trim().to_string();
     if reason.len() < 5 { return Err(e400("Reason must be at least 5 characters.")); }
 
-    let (adj_date,): (Option<String>,) = conn.query_row(
-        "SELECT adjudication_date FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
-        rusqlite::params![os_no, os_year], |r| Ok((r.get(0)?,))
+    let (adj_date, adj_time): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT adjudication_date, adjudication_time FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
+        rusqlite::params![os_no, os_year], |r| Ok((r.get(0)?, r.get(1)?))
     ).map_err(|_| e404("O.S. not found"))?;
 
-    if adj_date.is_some() { return Err(e400("Cannot delete an adjudicated case via this route.")); }
+    if adj_date.is_some() && !within_edit_window(&adj_time) {
+        return Err(e400("Cannot delete — 24-hour deletion window has expired."));
+    }
 
     // Archive + soft-delete in a single transaction so a crash between the two
     // operations cannot leave a record permanently stuck in limbo.
