@@ -518,7 +518,8 @@ pub async fn bulk_import_offline(
         let pp_amount           = f("pp_amount");
         let confiscated_value   = f("confiscated_value");
         let total_duty_amount   = f("total_duty_amount");
-        let total_payable       = f("total_payable");
+        // Compute total_payable from components — never trust the Excel-provided value.
+        let total_payable       = total_duty_amount + rf_amount + ref_amount + pp_amount;
         let br_entries_json     = row.get("post_adj_br_entries").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
 
         let items_arr = row.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -860,6 +861,8 @@ pub async fn complete_offline(State(pool): Db, auth: AdjnUser, Path((os_no, os_y
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let adj_date = req.adjudication_date.clone().unwrap_or(today.clone());
+    if adj_date.as_str() > today.as_str() { return Err(e400("Adjudication date cannot be in the future.")); }
 
     // Compute total_payable the same way adjudicate() does
     let base_duty: f64 = conn.query_row(
@@ -878,7 +881,7 @@ pub async fn complete_offline(State(pool): Db, auth: AdjnUser, Path((os_no, os_y
          WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![
             req.adj_offr_name, req.adj_offr_designation,
-            req.adjudication_date.unwrap_or(today), now_ts,
+            adj_date, now_ts,
             req.adjn_offr_remarks, rf, pp, refv,
             req.confiscated_value.unwrap_or(0.0),
             req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),
@@ -905,6 +908,8 @@ pub async fn outcome_update(State(pool): Db, _auth: AuthUser, Path((os_no, os_ye
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let adj_date = req.adjudication_date.clone().unwrap_or(today.clone());
+    if adj_date.as_str() > today.as_str() { return Err(e400("Adjudication date cannot be in the future.")); }
 
     let base_duty: f64 = conn.query_row(
         "SELECT COALESCE(total_duty_amount, 0) FROM cops_master WHERE os_no=? AND os_year=?",
@@ -922,7 +927,7 @@ pub async fn outcome_update(State(pool): Db, _auth: AuthUser, Path((os_no, os_ye
          WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![
             req.adj_offr_name, req.adj_offr_designation,
-            req.adjudication_date.unwrap_or(today), now_ts,
+            adj_date, now_ts,
             req.adjn_offr_remarks, rf, pp, refv,
             req.confiscated_value.unwrap_or(0.0),
             req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),

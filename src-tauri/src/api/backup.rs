@@ -724,7 +724,7 @@ pub async fn custom_report(
     }
     let master_sel = query_master_cols.iter().map(|c| format!("cm.{c}")).collect::<Vec<_>>().join(", ");
     let master_sql = format!(
-        "SELECT {master_sel} FROM cops_master cm WHERE {where_clause} ORDER BY cm.os_year, CAST(cm.os_no AS INTEGER)"
+        "SELECT {master_sel} FROM cops_master cm WHERE {where_clause} ORDER BY cm.os_year, CAST(cm.os_no AS INTEGER) LIMIT 10000"
     );
 
     let qmc_len = query_master_cols.len();
