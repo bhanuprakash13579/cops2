@@ -363,7 +363,7 @@ export default function OSQueryPage() {
                   className="flex items-center gap-1.5 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 px-3 py-1.5 rounded hover:bg-emerald-700 transition-colors shadow-sm disabled:opacity-50"
                 >
                   {downloadLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileDown className="w-3.5 h-3.5" />}
-                  Download Excel ({pagination.total_count})
+                  Download CSV ({pagination.total_count})
                 </button>
               </div>
             )}
