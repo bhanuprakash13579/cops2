@@ -891,6 +891,50 @@ pub async fn complete_offline(State(pool): Db, auth: AdjnUser, Path((os_no, os_y
     Ok(Json(json!({ "status": "ok", "os_no": os_no, "os_year": os_year })))
 }
 
+pub async fn outcome_update(State(pool): Db, _auth: AuthUser, Path((os_no, os_year)): Path<(String, i64)>, Json(req): Json<CompleteOfflineRequest>) -> Result<Json<Value>, Err> {
+    validate_remarks_length(req.adjn_offr_remarks.as_deref())?;
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    let adj_name: Option<String> = conn.query_row(
+        "SELECT adj_offr_name FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N' AND is_offline_adjudication='Y'",
+        rusqlite::params![os_no, os_year], |r| r.get(0)
+    ).map_err(|_| e404("Offline case not found."))?;
+
+    if adj_name.is_some() { return Err(e400("Outcome already recorded for this case.")); }
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let base_duty: f64 = conn.query_row(
+        "SELECT COALESCE(total_duty_amount, 0) FROM cops_master WHERE os_no=? AND os_year=?",
+        rusqlite::params![os_no, os_year], |r| r.get(0)
+    ).unwrap_or(0.0);
+    let rf   = req.rf_amount.unwrap_or(0.0);
+    let pp   = req.pp_amount.unwrap_or(0.0);
+    let refv = req.ref_amount.unwrap_or(0.0);
+    let total_payable = base_duty + rf + pp + refv;
+
+    conn.execute(
+        "UPDATE cops_master SET adj_offr_name=?, adj_offr_designation=?, adjudication_date=?,
+         adjudication_time=?, adjn_offr_remarks=?, rf_amount=?, pp_amount=?, ref_amount=?,
+         confiscated_value=?, redeemed_value=?, re_export_value=?, total_payable=?, closure_ind=?
+         WHERE os_no=? AND os_year=? AND entry_deleted='N'",
+        rusqlite::params![
+            req.adj_offr_name, req.adj_offr_designation,
+            req.adjudication_date.unwrap_or(today), now_ts,
+            req.adjn_offr_remarks, rf, pp, refv,
+            req.confiscated_value.unwrap_or(0.0),
+            req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),
+            total_payable,
+            if req.close_case.unwrap_or(false) { Some("Y") } else { None },
+            os_no, os_year,
+        ],
+    ).map_err(|e| e500(&e.to_string()))?;
+
+    Ok(Json(json!({ "status": "ok", "os_no": os_no, "os_year": os_year })))
+}
+
 pub async fn quash_os(State(pool): Db, auth: AdjnUser, Path((os_no, os_year)): Path<(String, i64)>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 

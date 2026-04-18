@@ -170,6 +170,125 @@ const BrDrPanel = memo(function BrDrPanel({
   );
 });
 
+const DESIGNATIONS = ['AC', 'DC', 'JC', 'ADC', 'COMMISSIONER'];
+
+const AddOutcomePanel = memo(function AddOutcomePanel({
+  osNo, osYear, onClose, onSaved,
+}: { osNo: string; osYear: number; onClose: () => void; onSaved: () => void; }) {
+  const [form, setForm] = useState({
+    adj_offr_name: '', adj_offr_designation: 'AC', adjudication_date: '',
+    rf_amount: '', ref_amount: '', pp_amount: '',
+    confiscated_value: '', redeemed_value: '', re_export_value: '',
+    adjn_offr_remarks: '', close_case: false,
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const set = (k: string, v: any) => setForm(f => ({ ...f, [k]: v }));
+
+  const handleSave = async () => {
+    if (!form.adj_offr_name.trim()) { setError('Adjudicating Officer Name is required.'); return; }
+    setSaving(true); setError('');
+    try {
+      await api.patch(`/os/${osNo}/${osYear}/outcome`, {
+        adj_offr_name: form.adj_offr_name.trim(),
+        adj_offr_designation: form.adj_offr_designation,
+        adjudication_date: form.adjudication_date || null,
+        rf_amount: parseFloat(form.rf_amount) || 0,
+        ref_amount: parseFloat(form.ref_amount) || 0,
+        pp_amount: parseFloat(form.pp_amount) || 0,
+        confiscated_value: parseFloat(form.confiscated_value) || 0,
+        redeemed_value: parseFloat(form.redeemed_value) || 0,
+        re_export_value: parseFloat(form.re_export_value) || 0,
+        adjn_offr_remarks: form.adjn_offr_remarks.trim() || null,
+        close_case: form.close_case,
+      });
+      onSaved();
+    } catch (err: any) {
+      let msg = err.response?.data?.detail || err.message || 'Failed to save';
+      if (Array.isArray(msg)) msg = msg.map((e: any) => `${e.loc?.join('.')} - ${e.msg}`).join(', ');
+      else if (typeof msg === 'object') msg = JSON.stringify(msg);
+      setError(msg);
+    } finally { setSaving(false); }
+  };
+
+  const inp = "w-full border border-slate-300 rounded-md px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-purple-400 focus:border-purple-400";
+  const lbl = "block text-xs font-semibold text-slate-600 mb-1";
+
+  return (
+    <div className="border border-purple-200 rounded-lg bg-white p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-bold text-purple-900 flex items-center gap-2">
+          <FileText size={15} />
+          Add Adjudication Outcome — {osNo}/{osYear}
+        </h3>
+        <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className={lbl}>Adjudicating Officer Name *</label>
+          <input type="text" value={form.adj_offr_name} onChange={e => set('adj_offr_name', e.target.value)} className={inp} placeholder="Full name..." />
+        </div>
+        <div>
+          <label className={lbl}>Designation *</label>
+          <select value={form.adj_offr_designation} onChange={e => set('adj_offr_designation', e.target.value)} className={inp}>
+            {DESIGNATIONS.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className={lbl}>Adjudication Date</label>
+          <DatePicker value={form.adjudication_date} onChange={v => set('adjudication_date', v)} placeholder="DD-MM-YYYY" inputClassName="w-full border border-slate-300 rounded-md px-2.5 py-1.5 text-sm focus:ring-1 focus:ring-purple-400 focus:border-purple-400" />
+        </div>
+        <div>
+          <label className={lbl}>RF Amount (₹)</label>
+          <input type="number" min="0" step="0.01" value={form.rf_amount} onChange={e => set('rf_amount', e.target.value)} className={inp} />
+        </div>
+        <div>
+          <label className={lbl}>Redemption Fine (₹)</label>
+          <input type="number" min="0" step="0.01" value={form.ref_amount} onChange={e => set('ref_amount', e.target.value)} className={inp} />
+        </div>
+        <div>
+          <label className={lbl}>Personal Penalty (₹)</label>
+          <input type="number" min="0" step="0.01" value={form.pp_amount} onChange={e => set('pp_amount', e.target.value)} className={inp} />
+        </div>
+        <div>
+          <label className={lbl}>Confiscated Value (₹)</label>
+          <input type="number" min="0" step="0.01" value={form.confiscated_value} onChange={e => set('confiscated_value', e.target.value)} className={inp} />
+        </div>
+        <div>
+          <label className={lbl}>Redeemed Value (₹)</label>
+          <input type="number" min="0" step="0.01" value={form.redeemed_value} onChange={e => set('redeemed_value', e.target.value)} className={inp} />
+        </div>
+      </div>
+      <div>
+        <label className={lbl}>Adjudicating Officer Remarks</label>
+        <textarea rows={3} value={form.adjn_offr_remarks} onChange={e => set('adjn_offr_remarks', e.target.value)}
+          className={`${inp} resize-none`} placeholder="Remarks..." />
+      </div>
+      <div className="flex items-center gap-2">
+        <input type="checkbox" id={`close-${osNo}-${osYear}`} checked={form.close_case}
+          onChange={e => set('close_case', e.target.checked)} className="rounded border-slate-300 text-purple-600 focus:ring-purple-400" />
+        <label htmlFor={`close-${osNo}-${osYear}`} className="text-xs font-semibold text-slate-600 cursor-pointer">Close Case after saving</label>
+      </div>
+      {error && (
+        <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 rounded-md">
+          <AlertCircle size={14} className="text-red-600 flex-shrink-0 mt-0.5" />
+          <span className="text-xs text-red-700">{error}</span>
+        </div>
+      )}
+      <div className="flex items-center gap-2 pt-1">
+        <button onClick={handleSave} disabled={saving}
+          className="px-4 py-1.5 bg-purple-600 text-white text-xs font-bold rounded-md hover:bg-purple-700 disabled:opacity-50 transition-colors">
+          {saving ? 'Saving...' : 'Save Outcome'}
+        </button>
+        <button onClick={onClose}
+          className="px-4 py-1.5 border border-slate-300 bg-white text-slate-600 text-xs font-medium rounded-md hover:bg-slate-50 transition-colors">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+});
+
 export default function OffenceList() {
   const navigate = useNavigate();
   const { token: _token } = useAuth();
@@ -203,6 +322,7 @@ export default function OffenceList() {
   // Keystroke state lives inside BrDrPanel so typing doesn't re-render the whole list.
   const [expandedBrDr, setExpandedBrDr] = useState<string | null>(null);
   const [expandedBrDrData, setExpandedBrDrData] = useState<BrDrData>({ brEntries: [{ no: '', date: '' }], drNo: '', drDate: '' });
+  const [expandedOutcome, setExpandedOutcome] = useState<string | null>(null);
 
   // Delete confirmation modal state
   const [deleteTarget, setDeleteTarget] = useState<{ os_no: string; os_year: number; label: string } | null>(null);
@@ -448,6 +568,7 @@ export default function OffenceList() {
                   const totalValue = row.total_items_value || 0;
                   const rowKey = `${row.os_no}-${row.os_year}`;
                   const isExpanded = expandedBrDr === rowKey;
+                  const isOutcomeExpanded = expandedOutcome === rowKey;
                   const hasBrDr = !!(row.post_adj_br_entries || row.post_adj_dr_no);
                   return (
                     <>
@@ -528,7 +649,7 @@ export default function OffenceList() {
                                 </button>
                               </div>
                             ) : (
-                              <div className="flex items-center gap-1.5">
+                              <div className="flex items-center gap-1.5 flex-wrap">
                                 <button
                                   onClick={() => {
                                     if (row.is_offline_adjudication === 'Y') {
@@ -542,6 +663,21 @@ export default function OffenceList() {
                                 >
                                   Edit
                                 </button>
+                                {row.is_offline_adjudication === 'Y' && row.is_draft !== 'Y' && (
+                                  <button
+                                    onClick={() => setExpandedOutcome(isOutcomeExpanded ? null : rowKey)}
+                                    title="Add adjudication outcome for this offline case"
+                                    className={`px-2.5 py-1.5 text-xs font-bold rounded-md transition-colors flex items-center gap-1 ${
+                                      isOutcomeExpanded
+                                        ? 'text-purple-800 bg-purple-100 border border-purple-300'
+                                        : 'text-purple-700 bg-purple-50 border border-purple-200 hover:bg-purple-100'
+                                    }`}
+                                  >
+                                    <FileText size={11} />
+                                    Outcome
+                                    {isOutcomeExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                                  </button>
+                                )}
                                 <button
                                   onClick={() => handleDelete(row.os_no, row.os_year, row.is_draft)}
                                   title={row.is_draft === 'Y' ? 'Delete Draft' : 'Delete Pending Case'}
@@ -565,6 +701,18 @@ export default function OffenceList() {
                               initialData={expandedBrDrData}
                               onClose={() => setExpandedBrDr(null)}
                               onSaved={() => { setExpandedBrDr(null); queryClient.invalidateQueries({ queryKey: ['os', 'list'] }); }}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                      {isOutcomeExpanded && (
+                        <tr key={`${rowKey}-outcome`} className="bg-purple-50/60">
+                          <td colSpan={7} className="px-6 py-4">
+                            <AddOutcomePanel
+                              osNo={row.os_no}
+                              osYear={row.os_year}
+                              onClose={() => setExpandedOutcome(null)}
+                              onSaved={() => { setExpandedOutcome(null); queryClient.invalidateQueries({ queryKey: ['os', 'list'] }); }}
                             />
                           </td>
                         </tr>

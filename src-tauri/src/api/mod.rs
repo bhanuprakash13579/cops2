@@ -82,6 +82,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
                .delete(offence::delete_os))
         .route("/os/{os_no}/{os_year}/adjudicate",             post(offence::adjudicate))
         .route("/os/{os_no}/{os_year}/complete-offline-adj",   patch(offence::complete_offline))
+        .route("/os/{os_no}/{os_year}/outcome",                patch(offence::outcome_update))
         .route("/os/{os_no}/{os_year}/quash",                  post(offence::quash_os))
         .route("/os/{os_no}/{os_year}/post-adj",               patch(offence::post_adj))
         .route("/os/{os_no}/{os_year}/print-pdf",              get(offence::print_pdf))
