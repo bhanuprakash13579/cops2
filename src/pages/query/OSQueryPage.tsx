@@ -182,19 +182,26 @@ export default function OSQueryPage() {
         'OS No', 'OS Year', 'OS Date', 'Passenger Name', 'Passport No', 'Flight No',
         ...(showCountry  ? ['Country of Dep'] : []),
         ...(showItemDesc ? ['Item Description'] : []),
+        'Items (Desc × Qty Unit)',
         'Total Value (Rs)', 'Total Due (Rs)', 'Status', 'Adjudicated',
       ];
 
-      const rows = allRows.map(r => [
-        r.os_no, r.os_year, r.os_date,
-        `"${(r.pax_name || '').replace(/"/g, '""')}"`,
-        r.passport_no || '', r.flight_no || '',
-        ...(showCountry  ? [`"${(r.country_of_departure || '').replace(/"/g, '""')}"`] : []),
-        ...(showItemDesc ? [`"${(r.item_desc_summary    || '').replace(/"/g, '""')}"`] : []),
-        r.total_items_value || 0, r.total_payable || 0,
-        r.is_draft === 'N' ? 'Submitted' : 'Draft',
-        r.adjudication_date || 'No',
-      ]);
+      const rows = allRows.map(r => {
+        const itemsSummary = (r.items || [])
+          .map(i => `${i.items_desc || ''}${i.items_qty != null ? ` x ${i.items_qty}` : ''}${i.items_uqc ? ` ${i.items_uqc}` : ''}`.trim())
+          .join('; ');
+        return [
+          r.os_no, r.os_year, r.os_date,
+          `"${(r.pax_name || '').replace(/"/g, '""')}"`,
+          r.passport_no || '', r.flight_no || '',
+          ...(showCountry  ? [`"${(r.country_of_departure || '').replace(/"/g, '""')}"`] : []),
+          ...(showItemDesc ? [`"${(r.item_desc_summary    || '').replace(/"/g, '""')}"`] : []),
+          `"${itemsSummary.replace(/"/g, '""')}"`,
+          r.total_items_value || 0, r.total_payable || 0,
+          r.is_draft === 'N' ? 'Submitted' : 'Draft',
+          r.adjudication_date || 'No',
+        ];
+      });
 
       const csvString   = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
       const defaultName = `OS_Query_Results_${new Date().toISOString().split('T')[0]}.csv`;
@@ -223,87 +230,11 @@ export default function OSQueryPage() {
     }
   };
 
-  const downloadPDF = async () => {
-    setDownloadLoading(true);
-    try {
-      const response = await api.post('/os-query/search', buildExportPayload());
-      const allRows: OSResult[] = response.data.items || [];
-
-      const showCountry  = !!activeSearch.country_of_departure.trim();
-      const showItemDesc = !!activeSearch.item_desc.trim();
-      const today        = new Date().toLocaleDateString('en-GB');
-
-      const extraHeaders = [
-        ...(showCountry  ? '<th>Country of Dep</th>' : ''),
-        ...(showItemDesc ? '<th>Item Description</th>' : ''),
-      ].join('');
-
-      const tableRows = allRows.map(r => {
-        const extraCells = [
-          ...(showCountry  ? [`<td>${r.country_of_departure || ''}</td>`] : []),
-          ...(showItemDesc ? [`<td>${r.item_desc_summary    || ''}</td>`] : []),
-        ].join('');
-        return `<tr>
-          <td>${r.os_no}</td><td>${r.os_year}</td>
-          <td>${r.os_date ? new Date(r.os_date).toLocaleDateString('en-GB') : ''}</td>
-          <td>${r.pax_name || ''}</td><td>${r.passport_no || ''}</td>
-          <td>${r.flight_no || ''}</td>
-          ${extraCells}
-          <td style="text-align:right">${(r.total_items_value || 0).toLocaleString('en-IN')}</td>
-          <td style="text-align:right">${(r.total_payable || 0).toLocaleString('en-IN')}</td>
-          <td>${r.is_draft === 'N' ? 'Submitted' : 'Draft'}</td>
-          <td>${r.adjudication_date ? new Date(r.adjudication_date).toLocaleDateString('en-GB') : 'No'}</td>
-        </tr>`;
-      }).join('');
-
-      const html = `<!DOCTYPE html>
-<html><head><title>OS Query Results</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: Arial, sans-serif; font-size: 10px; padding: 20px; }
-  h2 { font-size: 15px; margin-bottom: 4px; }
-  .meta { color: #666; font-size: 9px; margin-bottom: 10px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
-  th { background: #f0f0f0; font-weight: bold; font-size: 9px; }
-  tr:nth-child(even) { background: #fafafa; }
-  @media print { body { padding: 0; } }
-</style></head><body>
-<h2>OS Query Results</h2>
-<p class="meta">Generated on ${today} — ${allRows.length} record(s)</p>
-<table>
-  <thead><tr>
-    <th>OS No</th><th>Year</th><th>OS Date</th><th>Passenger</th><th>Passport</th>
-    <th>Flight</th>${extraHeaders}<th>Value (₹)</th><th>Due (₹)</th><th>Status</th><th>Adjudicated</th>
-  </tr></thead>
-  <tbody>${tableRows}</tbody>
-</table>
-</body></html>`;
-
-      const iframe = document.createElement('iframe');
-      iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:900px;height:700px;border:none;';
-      document.body.appendChild(iframe);
-      const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (iframeDoc) {
-        iframeDoc.open();
-        iframeDoc.write(html);
-        iframeDoc.close();
-        setTimeout(() => {
-          iframe.contentWindow?.print();
-          setTimeout(() => document.body.removeChild(iframe), 1000);
-        }, 300);
-      }
-    } catch {
-      import.meta.env.DEV && console.error('PDF export failed');
-    } finally {
-      setDownloadLoading(false);
-    }
-  };
 
   // Derived: which extra columns to show based on what was last searched
   const showCountry  = hasSearched && !!activeSearch.country_of_departure?.trim();
   const showItemDesc = hasSearched && !!activeSearch.item_desc?.trim();
-  const totalCols    = 7 + (showCountry ? 1 : 0) + (showItemDesc ? 1 : 0);
+  const totalCols    = 8 + (showCountry ? 1 : 0) + (showItemDesc ? 1 : 0); // +1 for always-visible Items column
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -427,14 +358,6 @@ export default function OSQueryPage() {
             {results.length > 0 && (
               <div className="flex items-center gap-2">
                 <button
-                  onClick={downloadPDF}
-                  disabled={downloadLoading}
-                  className="flex items-center gap-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50 transition-colors disabled:opacity-50"
-                >
-                  {downloadLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
-                  Download PDF ({pagination.total_count})
-                </button>
-                <button
                   onClick={downloadCSV}
                   disabled={downloadLoading}
                   className="flex items-center gap-1.5 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 px-3 py-1.5 rounded hover:bg-emerald-700 transition-colors shadow-sm disabled:opacity-50"
@@ -478,6 +401,7 @@ export default function OSQueryPage() {
                     {showItemDesc && (
                       <th className="px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Item Description</th>
                     )}
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-amber-700 uppercase tracking-wider bg-amber-50">Items</th>
                     <th className="px-4 py-3 text-right text-xs font-semibold text-slate-600 uppercase tracking-wider">
                       <button onClick={() => handleSort('total_items_value')} className="flex items-center ml-auto hover:text-slate-900 transition-colors">
                         Values (₹) <SortIcon col="total_items_value" sortBy={sortBy} sortDir={sortDir} />
@@ -525,6 +449,22 @@ export default function OSQueryPage() {
                               <div className="text-sm text-slate-700 truncate max-w-[200px]" title={r.item_desc_summary || ''}>{r.item_desc_summary || '—'}</div>
                             </td>
                           )}
+                          <td className="px-4 py-2 align-top bg-amber-50/30">
+                            {r.items.length === 0 ? (
+                              <span className="text-xs text-slate-400">—</span>
+                            ) : (
+                              <div className="space-y-0.5">
+                                {r.items.map((item, ii) => (
+                                  <div key={ii} className="text-xs leading-tight">
+                                    <span className="font-medium text-slate-800">{item.items_desc || '—'}</span>
+                                    {(item.items_qty != null || item.items_uqc) && (
+                                      <span className="text-slate-500 ml-1">× {item.items_qty} {item.items_uqc}</span>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </td>
                           <td className="px-4 py-3 text-right">
                             <div className="text-sm font-semibold text-slate-800">
                               Val: {r.total_items_value?.toLocaleString('en-IN') || '0'}

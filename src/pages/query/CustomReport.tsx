@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback } from 'react';
-import { FileText, Download, RefreshCw, CheckSquare, Square, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react';
+import { FileText, Download, RefreshCw, CheckSquare, Square, ArrowUp, ArrowDown, ArrowUpDown, Lock } from 'lucide-react';
 import api from '@/lib/api';
 import DatePicker from '@/components/DatePicker';
 import { showDownloadToast } from '@/components/DownloadToast';
@@ -126,6 +126,12 @@ const ITEM_GROUP: { group: string; cols: ColDef[] } = {
   ],
 };
 
+// These 3 are always auto-included when any item column is selected.
+// They form the minimum context needed to make item data readable.
+const ITEM_CONTEXT_KEYS = new Set(['items_desc', 'items_qty', 'items_uqc']);
+
+const ITEM_COL_KEYS = new Set(ITEM_GROUP.cols.map(c => c.key));
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function exportCsv(columns: string[], rows: Record<string, string>[], colLabels: Record<string, string>) {
@@ -158,8 +164,6 @@ async function exportCsv(columns: string[], rows: Record<string, string>[], colL
   }
 }
 
-// ── Sort icon (defined outside component to avoid remount on every render) ────
-
 function ColSortIcon({ col, sortCol, sortDir }: { col: string; sortCol: string | null; sortDir: string }) {
   if (sortCol !== col) return <ArrowUpDown size={10} className="ml-1 opacity-30" />;
   return sortDir === 'asc'
@@ -167,21 +171,51 @@ function ColSortIcon({ col, sortCol, sortDir }: { col: string; sortCol: string |
     : <ArrowDown size={10} className="ml-1 text-emerald-600" />;
 }
 
+/** Render a cell value. Item cells with \n are split into stacked sub-rows. */
+function ItemCell({ value }: { value: string }) {
+  const parts = value.split('\n');
+  if (parts.length <= 1) return <span>{value || '—'}</span>;
+  return (
+    <div className="divide-y divide-amber-100 -my-1">
+      {parts.map((p, i) => (
+        <div key={i} className="py-0.5 text-xs">{p || '—'}</div>
+      ))}
+    </div>
+  );
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function CustomReport() {
   const [selectedMaster, setSelectedMaster] = useState<Set<string>>(new Set(['os_no', 'os_year', 'pax_name']));
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
-  const [fromDate, setFromDate] = useState('');
-  const [toDate, setToDate] = useState('');
-  const [caseType, setCaseType] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ columns: string[]; rows: Record<string, string>[]; total: number } | null>(null);
-  const [error, setError] = useState('');
-  const [sortCol, setSortCol] = useState<string | null>(null);
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
-  // Reusable comparator — used for both the preview table and the CSV export
+  // Date / case-type filters
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate]     = useState('');
+  const [caseType, setCaseType] = useState('');
+
+  // Row-level filters
+  const [filterOsNo,       setFilterOsNo]       = useState('');
+  const [filterOsYear,     setFilterOsYear]     = useState('');
+  const [filterAdjOfficer, setFilterAdjOfficer] = useState('');
+  const [filterFlightNo,   setFilterFlightNo]   = useState('');
+  const [filterPaxName,    setFilterPaxName]    = useState('');
+  const [filterPassportNo, setFilterPassportNo] = useState('');
+  const [filterItemDesc,   setFilterItemDesc]   = useState('');
+
+  const [loading, setLoading]   = useState(false);
+  const [result, setResult]     = useState<{ columns: string[]; rows: Record<string, string>[]; total: number } | null>(null);
+  const [error, setError]       = useState('');
+  const [sortCol, setSortCol]   = useState<string | null>(null);
+  const [sortDir, setSortDir]   = useState<'asc' | 'desc'>('asc');
+
+  // When any item column is selected, context columns are forced in.
+  const effectiveItemCols: string[] = useMemo(() => {
+    if (selectedItems.size === 0) return [];
+    return [...new Set([...ITEM_CONTEXT_KEYS, ...selectedItems])];
+  }, [selectedItems]);
+
   const sortComparator = useCallback((a: Record<string, string>, b: Record<string, string>) => {
     if (!sortCol) return 0;
     const av = a[sortCol] ?? '';
@@ -192,7 +226,6 @@ export default function CustomReport() {
     return sortDir === 'asc' ? cmp : -cmp;
   }, [sortCol, sortDir]);
 
-  // Sort all rows first, then slice to 500 — ensures top 500 after sort, not sort of first 500
   const sortedRows = useMemo(() => {
     if (!result) return [];
     if (!sortCol) return result.rows.slice(0, 500);
@@ -200,35 +233,34 @@ export default function CustomReport() {
   }, [result, sortCol, sortDir, sortComparator]);
 
   const handleColSort = (col: string) => {
-    if (sortCol === col) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortCol(col);
-      setSortDir('asc');
-    }
+    if (sortCol === col) { setSortDir(d => d === 'asc' ? 'desc' : 'asc'); }
+    else { setSortCol(col); setSortDir('asc'); }
   };
 
-  // Build label lookup
   const labelOf: Record<string, string> = {};
   MASTER_GROUPS.forEach(g => g.cols.forEach(c => { labelOf[c.key] = c.label; }));
   ITEM_GROUP.cols.forEach(c => { labelOf[c.key] = c.label; });
 
   const toggle = (key: string, which: 'master' | 'item') => {
-    const set = which === 'master' ? new Set(selectedMaster) : new Set(selectedItems);
-    const setter = which === 'master' ? setSelectedMaster : setSelectedItems;
+    const set    = which === 'master' ? new Set(selectedMaster) : new Set(selectedItems);
+    const setter = which === 'master' ? setSelectedMaster       : setSelectedItems;
+    // Context cols can't be unchecked individually while other item cols are selected
+    if (which === 'item' && ITEM_CONTEXT_KEYS.has(key) && set.size > 1) return;
     set.has(key) ? set.delete(key) : set.add(key);
     setter(set);
     setResult(null);
   };
 
   const toggleGroup = (cols: ColDef[], which: 'master' | 'item') => {
-    const set = which === 'master' ? new Set(selectedMaster) : new Set(selectedItems);
-    const setter = which === 'master' ? setSelectedMaster : setSelectedItems;
+    const set    = which === 'master' ? new Set(selectedMaster) : new Set(selectedItems);
+    const setter = which === 'master' ? setSelectedMaster       : setSelectedItems;
     const allSelected = cols.every(c => set.has(c.key));
     cols.forEach(c => allSelected ? set.delete(c.key) : set.add(c.key));
     setter(set);
     setResult(null);
   };
+
+  const hasActiveFilters = filterOsNo || filterOsYear || filterAdjOfficer || filterFlightNo || filterPaxName || filterPassportNo || filterItemDesc;
 
   const generate = async () => {
     if (selectedMaster.size === 0 && selectedItems.size === 0) {
@@ -238,10 +270,17 @@ export default function CustomReport() {
     try {
       const res = await api.post('/backup/custom-report', {
         master_cols: [...selectedMaster],
-        item_cols: [...selectedItems],
-        from_date: fromDate || null,
-        to_date: toDate || null,
-        case_type: caseType || null,
+        item_cols:   effectiveItemCols,
+        from_date:   fromDate || null,
+        to_date:     toDate   || null,
+        case_type:   caseType || null,
+        os_no:         filterOsNo       || null,
+        os_year:       filterOsYear     ? parseInt(filterOsYear) : null,
+        adj_offr_name: filterAdjOfficer || null,
+        flight_no:     filterFlightNo   || null,
+        pax_name:      filterPaxName    || null,
+        passport_no:   filterPassportNo || null,
+        item_desc:     filterItemDesc   || null,
       });
       setResult(res.data);
     } catch (err: any) {
@@ -256,6 +295,8 @@ export default function CustomReport() {
 
   const totalSelected = selectedMaster.size + selectedItems.size;
 
+  const inp = "w-full border border-slate-300 rounded-md px-2 py-1.5 text-xs focus:ring-1 focus:ring-emerald-400 focus:border-emerald-400 bg-white";
+
   return (
     <div className="space-y-5">
       {/* Header */}
@@ -265,8 +306,7 @@ export default function CustomReport() {
           Custom Report
         </h1>
         <p className="text-xs text-slate-500 mt-1">
-          Tick the columns you want, optionally filter by date, then generate.
-          If you include Item columns, each item appears as a separate row.
+          Choose columns, apply filters, then generate. Item columns show all items stacked within each row.
         </p>
       </div>
 
@@ -275,7 +315,6 @@ export default function CustomReport() {
         {/* ── Column Selector ── */}
         <div className="lg:col-span-1 space-y-3">
 
-          {/* Master column groups */}
           {MASTER_GROUPS.map(g => {
             const allSel = g.cols.every(c => selectedMaster.has(c.key));
             return (
@@ -305,7 +344,8 @@ export default function CustomReport() {
 
           {/* Items group */}
           {(() => {
-            const allSel = ITEM_GROUP.cols.every(c => selectedItems.has(c.key));
+            const allSel = ITEM_GROUP.cols.every(c => selectedItems.has(c.key) || ITEM_CONTEXT_KEYS.has(c.key) && selectedItems.size > 0);
+            const hasAnyItem = selectedItems.size > 0;
             return (
               <div className="bg-white rounded-xl border border-amber-200 overflow-hidden">
                 <div className="flex items-center justify-between px-3 py-2 bg-amber-50 border-b border-amber-100">
@@ -317,17 +357,29 @@ export default function CustomReport() {
                     {allSel ? 'Deselect all' : 'Select all'}
                   </button>
                 </div>
+                {hasAnyItem && (
+                  <div className="px-3 py-1.5 bg-amber-50/60 border-b border-amber-100 flex items-center gap-1.5">
+                    <Lock size={10} className="text-amber-500" />
+                    <span className="text-[10px] text-amber-600">Desc, Qty &amp; Unit always included</span>
+                  </div>
+                )}
                 <div className="p-2 space-y-0.5">
-                  {ITEM_GROUP.cols.map(c => (
-                    <button key={c.key} type="button"
-                      onClick={() => toggle(c.key, 'item')}
-                      className="flex items-center gap-2 px-1 py-0.5 rounded hover:bg-amber-50 cursor-pointer w-full text-left focus:outline-none">
-                      <span className="text-amber-500 shrink-0">
-                        {selectedItems.has(c.key) ? <CheckSquare size={13} /> : <Square size={13} className="text-slate-300" />}
-                      </span>
-                      <span className="text-xs text-slate-700">{c.label}</span>
-                    </button>
-                  ))}
+                  {ITEM_GROUP.cols.map(c => {
+                    const isContext = ITEM_CONTEXT_KEYS.has(c.key);
+                    const isForced  = isContext && hasAnyItem;
+                    const isChecked = selectedItems.has(c.key) || isForced;
+                    return (
+                      <button key={c.key} type="button"
+                        onClick={() => !isForced && toggle(c.key, 'item')}
+                        className={`flex items-center gap-2 px-1 py-0.5 rounded w-full text-left focus:outline-none ${isForced ? 'cursor-default opacity-70' : 'hover:bg-amber-50 cursor-pointer'}`}>
+                        <span className={isForced ? 'text-amber-400 shrink-0' : 'text-amber-500 shrink-0'}>
+                          {isChecked ? <CheckSquare size={13} /> : <Square size={13} className="text-slate-300" />}
+                        </span>
+                        <span className="text-xs text-slate-700">{c.label}</span>
+                        {isForced && <Lock size={9} className="text-amber-400 ml-auto shrink-0" />}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             );
@@ -342,29 +394,74 @@ export default function CustomReport() {
             <p className="text-xs font-semibold text-slate-600">
               {totalSelected} column{totalSelected !== 1 ? 's' : ''} selected
               {selectedItems.size > 0 && (
-                <span className="ml-2 text-amber-600">
-                  (includes items — one row per item)
-                </span>
+                <span className="ml-2 text-amber-600">(items stacked per row)</span>
               )}
             </p>
+
+            {/* Date + Case Type */}
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="block text-xs text-slate-500 mb-1">From Date <span className="text-slate-400">(optional)</span></label>
+                <label className="block text-xs text-slate-500 mb-1">From Date</label>
                 <DatePicker value={fromDate} onChange={setFromDate} inputClassName="input-field" />
               </div>
               <div>
-                <label className="block text-xs text-slate-500 mb-1">To Date <span className="text-slate-400">(optional)</span></label>
+                <label className="block text-xs text-slate-500 mb-1">To Date</label>
                 <DatePicker value={toDate} onChange={setToDate} inputClassName="input-field" />
               </div>
               <div>
-                <label className="block text-xs text-slate-500 mb-1">Case Type <span className="text-slate-400">(optional)</span></label>
-                <select value={caseType} onChange={e => setCaseType(e.target.value)} className="w-full bg-white border border-slate-300 rounded-md text-xs px-3 py-2 text-slate-800 focus:ring-emerald-500 focus:border-emerald-500">
+                <label className="block text-xs text-slate-500 mb-1">Case Type</label>
+                <select value={caseType} onChange={e => setCaseType(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-md text-xs px-3 py-2 text-slate-800 focus:ring-emerald-500 focus:border-emerald-500">
                   <option value="">All Cases</option>
                   <option value="Arrival Case">Arrival Cases</option>
                   <option value="Export Case">Export Cases</option>
                 </select>
               </div>
             </div>
+
+            {/* Row-level filters */}
+            <div className="border border-slate-100 rounded-lg p-3 bg-slate-50/60 space-y-2">
+              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide flex items-center gap-1">
+                Row Filters <span className={`ml-1 px-1.5 py-0.5 rounded text-[9px] font-bold ${hasActiveFilters ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500'}`}>{hasActiveFilters ? 'active' : 'optional'}</span>
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-0.5">OS No.</label>
+                  <input type="text" value={filterOsNo} onChange={e => setFilterOsNo(e.target.value)} className={inp} placeholder="e.g. 142" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-0.5">OS Year</label>
+                  <input type="number" value={filterOsYear} onChange={e => setFilterOsYear(e.target.value)} className={inp} placeholder="e.g. 2024" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-0.5">Passenger Name</label>
+                  <input type="text" value={filterPaxName} onChange={e => setFilterPaxName(e.target.value)} className={inp} placeholder="Partial match" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-0.5">Passport No.</label>
+                  <input type="text" value={filterPassportNo} onChange={e => setFilterPassportNo(e.target.value)} className={inp} placeholder="Partial match" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-0.5">Flight No.</label>
+                  <input type="text" value={filterFlightNo} onChange={e => setFilterFlightNo(e.target.value)} className={inp} placeholder="e.g. EK542" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-0.5">Adjudicating Officer</label>
+                  <input type="text" value={filterAdjOfficer} onChange={e => setFilterAdjOfficer(e.target.value)} className={inp} placeholder="Partial match" />
+                </div>
+                <div className="col-span-2">
+                  <label className="block text-[10px] text-slate-500 mb-0.5">Item Description</label>
+                  <input type="text" value={filterItemDesc} onChange={e => setFilterItemDesc(e.target.value)} className={inp} placeholder="e.g. Gold, Drone… (partial match)" />
+                </div>
+              </div>
+              {hasActiveFilters && (
+                <button onClick={() => { setFilterOsNo(''); setFilterOsYear(''); setFilterAdjOfficer(''); setFilterFlightNo(''); setFilterPaxName(''); setFilterPassportNo(''); setFilterItemDesc(''); setResult(null); }}
+                  className="text-[10px] text-slate-500 hover:text-red-600 underline">
+                  Clear all row filters
+                </button>
+              )}
+            </div>
+
             <div className="flex gap-2 flex-wrap">
               <button onClick={generate} disabled={loading || totalSelected === 0}
                 className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
@@ -387,7 +484,7 @@ export default function CustomReport() {
             <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
               <div className="px-4 py-2.5 border-b border-slate-100 flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-600">
-                  Results — {result.total.toLocaleString()} row{result.total !== 1 ? 's' : ''}
+                  Results — {result.total.toLocaleString()} OS case{result.total !== 1 ? 's' : ''}
                 </span>
                 {result.total > 500 && (
                   <span className="text-[10px] text-amber-600 bg-amber-50 px-2 py-0.5 rounded">
@@ -404,7 +501,7 @@ export default function CustomReport() {
                         <th key={col}
                           onClick={() => handleColSort(col)}
                           className={`text-left px-3 py-2 font-medium border-b border-slate-100 whitespace-nowrap cursor-pointer select-none hover:bg-slate-100 transition-colors ${
-                            ITEM_GROUP.cols.some(c => c.key === col)
+                            ITEM_COL_KEYS.has(col)
                               ? 'text-amber-700 bg-amber-50 hover:bg-amber-100'
                               : 'text-slate-600'
                           }`}>
@@ -419,10 +516,13 @@ export default function CustomReport() {
                   <tbody>
                     {sortedRows.map((row, i) => (
                       <tr key={i} className={`border-b border-slate-50 ${i % 2 === 0 ? '' : 'bg-slate-50/50'} hover:bg-emerald-50/30`}>
-                        <td className="px-3 py-1.5 text-slate-400 tabular-nums">{i + 1}</td>
+                        <td className="px-3 py-1.5 text-slate-400 tabular-nums align-top">{i + 1}</td>
                         {result.columns.map(col => (
-                          <td key={col} className="px-3 py-1.5 text-slate-700 whitespace-nowrap max-w-[200px] truncate">
-                            {row[col] ?? ''}
+                          <td key={col} className={`px-3 py-1.5 align-top ${ITEM_COL_KEYS.has(col) ? 'text-amber-800' : 'text-slate-700'} max-w-[220px]`}>
+                            {ITEM_COL_KEYS.has(col)
+                              ? <ItemCell value={row[col] ?? ''} />
+                              : <span className="truncate block max-w-[220px]">{row[col] ?? ''}</span>
+                            }
                           </td>
                         ))}
                       </tr>

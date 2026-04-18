@@ -664,6 +664,14 @@ pub struct CustomReportRequest {
     from_date: Option<String>,
     to_date:   Option<String>,
     case_type: Option<String>,
+    // Row-level filters
+    #[serde(default)] os_no:         Option<String>,
+    #[serde(default)] os_year:       Option<i64>,
+    #[serde(default)] adj_offr_name: Option<String>,
+    #[serde(default)] flight_no:     Option<String>,
+    #[serde(default)] pax_name:      Option<String>,
+    #[serde(default)] passport_no:   Option<String>,
+    #[serde(default)] item_desc:     Option<String>,
 }
 
 pub async fn custom_report(
@@ -671,7 +679,6 @@ pub async fn custom_report(
     _auth: AuthUser,
     Json(body): Json<CustomReportRequest>,
 ) -> Result<Json<Value>, Err> {
-    // Validate columns against allowlist (prevent SQL injection)
     let invalid_m: Vec<_> = body.master_cols.iter().filter(|c| !REPORT_MASTER_COLS.contains(&c.as_str())).collect();
     let invalid_i: Vec<_> = body.item_cols.iter().filter(|c| !REPORT_ITEM_COLS.contains(&c.as_str())).collect();
     if !invalid_m.is_empty() || !invalid_i.is_empty() {
@@ -684,13 +691,12 @@ pub async fn custom_report(
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let include_items = !body.item_cols.is_empty();
 
-    // Build WHERE clause with parameterized date values
+    // Build parameterized WHERE clause
     let mut conditions = vec!["cm.entry_deleted = 'N'".to_string()];
-    let mut date_params: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
     if let (Some(fd), Some(td)) = (&body.from_date, &body.to_date) {
         conditions.push("cm.os_date >= ? AND cm.os_date <= ?".to_string());
-        date_params.push(fd.clone());
-        date_params.push(td.clone());
+        params.extend_from_slice(&[fd.clone(), td.clone()]);
     }
     if let Some(ct) = &body.case_type {
         if ct.to_uppercase().contains("EXPORT") {
@@ -699,45 +705,82 @@ pub async fn custom_report(
             conditions.push("(cm.case_type IS NULL OR upper(cm.case_type) != 'EXPORT CASE')".to_string());
         }
     }
+    if let Some(v) = &body.os_no         { conditions.push("cm.os_no = ?".to_string()); params.push(v.clone()); }
+    if let Some(v) = body.os_year        { conditions.push("cm.os_year = ?".to_string()); params.push(v.to_string()); }
+    if let Some(v) = &body.adj_offr_name { conditions.push("upper(cm.adj_offr_name) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+    if let Some(v) = &body.flight_no     { conditions.push("upper(cm.flight_no) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+    if let Some(v) = &body.pax_name      { conditions.push("upper(cm.pax_name) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+    if let Some(v) = &body.passport_no   { conditions.push("upper(cm.passport_no) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+    if let Some(v) = &body.item_desc {
+        conditions.push("EXISTS (SELECT 1 FROM cops_items ci2 WHERE ci2.os_no=cm.os_no AND ci2.os_year=cm.os_year AND upper(ci2.items_desc) LIKE upper(?))".to_string());
+        params.push(format!("%{v}%"));
+    }
     let where_clause = conditions.join(" AND ");
 
-    let master_sel = body.master_cols.iter().map(|c| format!("cm.{c}")).collect::<Vec<_>>().join(",");
+    // Always include os_no and os_year at positions 0 and 1 as keys for the items join.
+    let mut query_master_cols = vec!["os_no".to_string(), "os_year".to_string()];
+    for c in &body.master_cols {
+        if c != "os_no" && c != "os_year" { query_master_cols.push(c.clone()); }
+    }
+    let master_sel = query_master_cols.iter().map(|c| format!("cm.{c}")).collect::<Vec<_>>().join(", ");
+    let master_sql = format!(
+        "SELECT {master_sel} FROM cops_master cm WHERE {where_clause} ORDER BY cm.os_year, CAST(cm.os_no AS INTEGER)"
+    );
+
+    let qmc_len = query_master_cols.len();
+    let mut stmt = conn.prepare(&master_sql).map_err(|e| e500(&e.to_string()))?;
+    let master_rows: Vec<Vec<String>> = stmt.query_map(
+        rusqlite::params_from_iter(params.iter()),
+        |row| Ok((0..qmc_len).map(|i| val_to_str(row.get_ref(i).unwrap_or(rusqlite::types::ValueRef::Null))).collect()),
+    ).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+
+    // Bulk-load items (OR-chain, chunked at 80) and aggregate per OS with \n separator.
+    let mut items_map: std::collections::HashMap<(String, String), Vec<Vec<String>>> = std::collections::HashMap::new();
+    if include_items && !master_rows.is_empty() {
+        let item_sel = body.item_cols.iter().map(|c| format!("ci.{c}")).collect::<Vec<_>>().join(", ");
+        let icc = body.item_cols.len();
+        for chunk in master_rows.chunks(80) {
+            let or_parts = chunk.iter().map(|_| "(ci.os_no=? AND ci.os_year=?)").collect::<Vec<_>>().join(" OR ");
+            let isql = format!(
+                "SELECT ci.os_no, ci.os_year, {item_sel} FROM cops_items ci
+                 WHERE ({or_parts}) AND (ci.entry_deleted IS NULL OR ci.entry_deleted != 'Y')
+                 ORDER BY ci.os_no, ci.os_year, ci.items_sno"
+            );
+            let flat: Vec<String> = chunk.iter().flat_map(|r| [r[0].clone(), r[1].clone()]).collect();
+            let mut istmt = conn.prepare(&isql).map_err(|e| e500(&e.to_string()))?;
+            let item_rows: Vec<(String, String, Vec<String>)> = istmt.query_map(
+                rusqlite::params_from_iter(flat.iter()),
+                |row| {
+                    let ono: String = row.get(0)?;
+                    let oyr = row.get::<_, i64>(1).map(|y| y.to_string()).unwrap_or_default();
+                    let vals: Vec<String> = (0..icc).map(|i| val_to_str(row.get_ref(i + 2).unwrap_or(rusqlite::types::ValueRef::Null))).collect();
+                    Ok((ono, oyr, vals))
+                },
+            ).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+            for (ono, oyr, vals) in item_rows {
+                items_map.entry((ono, oyr)).or_default().push(vals);
+            }
+        }
+    }
+
+    // Build output columns list and one row per OS.
     let mut all_cols = body.master_cols.clone();
+    if include_items { all_cols.extend(body.item_cols.iter().cloned()); }
 
-    let rows_data: Vec<Vec<String>> = if include_items {
-        let item_sel = body.item_cols.iter().map(|c| format!("ci.{c}")).collect::<Vec<_>>().join(",");
-        all_cols.extend(body.item_cols.iter().cloned());
-
-        let sql = format!(
-            "SELECT {master_sel}, {item_sel} FROM cops_master cm
-             LEFT JOIN cops_items ci ON ci.os_no = cm.os_no AND ci.os_year = cm.os_year
-             WHERE {where_clause} ORDER BY cm.os_year, cm.os_no, ci.items_sno"
-        );
-        let mut stmt = conn.prepare(&sql).map_err(|e| e500(&e.to_string()))?;
-        let col_count = all_cols.len();
-        let rows: Vec<Vec<String>> = stmt.query_map(rusqlite::params_from_iter(date_params.iter()), |row| {
-            Ok((0..col_count)
-                .map(|i| val_to_str(row.get_ref(i).unwrap_or(rusqlite::types::ValueRef::Null)))
-                .collect())
-        }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
-        rows
-    } else {
-        let sql = format!("SELECT {master_sel} FROM cops_master cm WHERE {where_clause} ORDER BY cm.os_year, cm.os_no");
-        let col_count = all_cols.len();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e500(&e.to_string()))?;
-        let x: Vec<Vec<String>> = stmt.query_map(rusqlite::params_from_iter(date_params.iter()), |row| {
-            Ok((0..col_count)
-                .map(|i| val_to_str(row.get_ref(i).unwrap_or(rusqlite::types::ValueRef::Null)))
-                .collect())
-        }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
-        x
-    };
-
-    // Convert to JSON rows (array of objects)
-    let json_rows: Vec<Value> = rows_data.iter().map(|row| {
+    let json_rows: Vec<Value> = master_rows.iter().map(|row| {
+        let os_no  = &row[0];
+        let os_year = &row[1];
         let mut obj = serde_json::Map::new();
-        for (k, v) in all_cols.iter().zip(row.iter()) {
-            obj.insert(k.clone(), Value::String(v.clone()));
+        for col in &body.master_cols {
+            let idx = query_master_cols.iter().position(|c| c == col).unwrap_or(0);
+            obj.insert(col.clone(), Value::String(row[idx].clone()));
+        }
+        if include_items {
+            let item_rows = items_map.get(&(os_no.clone(), os_year.clone())).cloned().unwrap_or_default();
+            for (ci, col) in body.item_cols.iter().enumerate() {
+                let joined = item_rows.iter().map(|ir| ir[ci].as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
+                obj.insert(col.clone(), Value::String(joined));
+            }
         }
         Value::Object(obj)
     }).collect();
