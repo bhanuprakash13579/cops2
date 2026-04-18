@@ -897,7 +897,7 @@ pub async fn outcome_update(State(pool): Db, _auth: AuthUser, Path((os_no, os_ye
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
     let adj_name: Option<String> = conn.query_row(
-        "SELECT adj_offr_name FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N' AND is_offline_adjudication='Y'",
+        "SELECT adj_offr_name FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N' AND is_offline_adjudication='Y' AND is_draft='N'",
         rusqlite::params![os_no, os_year], |r| r.get(0)
     ).map_err(|_| e404("Offline case not found."))?;
 

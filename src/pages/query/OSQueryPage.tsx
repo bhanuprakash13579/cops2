@@ -450,11 +450,11 @@ export default function OSQueryPage() {
                             </td>
                           )}
                           <td className="px-4 py-2 align-top bg-amber-50/30">
-                            {r.items.length === 0 ? (
+                            {(r.items || []).length === 0 ? (
                               <span className="text-xs text-slate-400">—</span>
                             ) : (
                               <div className="space-y-0.5">
-                                {r.items.map((item, ii) => (
+                                {(r.items || []).map((item, ii) => (
                                   <div key={ii} className="text-xs leading-tight">
                                     <span className="font-medium text-slate-800">{item.items_desc || '—'}</span>
                                     {(item.items_qty != null || item.items_uqc) && (
@@ -505,9 +505,9 @@ export default function OSQueryPage() {
                               <div className="border border-slate-200 rounded bg-white shadow-sm font-mono text-xs overflow-hidden">
                                 <div className="bg-slate-100 border-b border-slate-200 px-3 py-1.5 font-bold text-slate-600 text-[10px] uppercase tracking-wider flex justify-between">
                                   <span>Seized Goods / Items Inventory</span>
-                                  <span>{r.items.length} item(s)</span>
+                                  <span>{(r.items || []).length} item(s)</span>
                                 </div>
-                                {r.items.length === 0 ? (
+                                {(r.items || []).length === 0 ? (
                                   <div className="p-3 text-slate-400 italic text-center">No items recorded</div>
                                 ) : (
                                   <table className="min-w-full divide-y divide-slate-100 table-fixed">
@@ -520,7 +520,7 @@ export default function OSQueryPage() {
                                       </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-50">
-                                      {r.items.map((item, i) => (
+                                      {(r.items || []).map((item, i) => (
                                         <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50/30'}>
                                           <td className="px-3 py-2 text-slate-500">{item.items_sno}</td>
                                           <td className="px-3 py-2 text-slate-800 truncate" title={item.items_desc}>{item.items_desc || '—'}</td>

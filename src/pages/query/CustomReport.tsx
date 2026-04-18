@@ -274,13 +274,13 @@ export default function CustomReport() {
         from_date:   fromDate || null,
         to_date:     toDate   || null,
         case_type:   caseType || null,
-        os_no:         filterOsNo       || null,
-        os_year:       filterOsYear     ? parseInt(filterOsYear) : null,
-        adj_offr_name: filterAdjOfficer || null,
-        flight_no:     filterFlightNo   || null,
-        pax_name:      filterPaxName    || null,
-        passport_no:   filterPassportNo || null,
-        item_desc:     filterItemDesc   || null,
+        os_no:         filterOsNo.trim()       || null,
+        os_year:       filterOsYear            ? parseInt(filterOsYear) : null,
+        adj_offr_name: filterAdjOfficer.trim() || null,
+        flight_no:     filterFlightNo.trim()   || null,
+        pax_name:      filterPaxName.trim()    || null,
+        passport_no:   filterPassportNo.trim() || null,
+        item_desc:     filterItemDesc.trim()   || null,
       });
       setResult(res.data);
     } catch (err: any) {
