@@ -967,18 +967,26 @@ export default function OfflineAdjudicationForm() {
   const handleExcelFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const buffer = await file.arrayBuffer();
-    const wb = XLSX.read(buffer, { type: 'array' });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const data: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-    const rows = parseExcelRows(data);
-    setParsedRows(rows);
-    setRowRfRefOverrides({});
-    setRowItemOverrides({});
-    setExpandedItemEdit(new Set());
-    setImportStatus(null);
-    // Reset input so same file can be re-selected
     e.target.value = '';
+    if (file.size > 10 * 1024 * 1024) {
+      setErrorMsg('File too large. Please upload an Excel file under 10 MB.');
+      return;
+    }
+    try {
+      const buffer = await file.arrayBuffer();
+      const wb = XLSX.read(buffer, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      if (!ws) { setErrorMsg('Excel file appears empty or has no sheets.'); return; }
+      const data: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      const rows = parseExcelRows(data);
+      setParsedRows(rows);
+      setRowRfRefOverrides({});
+      setRowItemOverrides({});
+      setExpandedItemEdit(new Set());
+      setImportStatus(null);
+    } catch {
+      setErrorMsg('Could not read the file. Please upload a valid .xlsx or .xls Excel file.');
+    }
   };
 
   const handleExcelImport = async () => {
