@@ -985,7 +985,7 @@ export default function OfflineAdjudicationForm() {
       setExpandedItemEdit(new Set());
       setImportStatus(null);
     } catch {
-      setErrorMsg('Could not read the file. Please upload a valid .xlsx or .xls Excel file.');
+      setErrorMsg('Could not read the file. Please upload a valid .xlsx, .xls, or .csv file.');
     }
   };
 
@@ -1570,14 +1570,14 @@ export default function OfflineAdjudicationForm() {
               <Upload className="mr-2 text-green-600" size={16} /> Import from Monthly Report Excel
             </h2>
             <p className="text-xs text-slate-500 mb-4">
-              Upload the monthly report Excel file (.xlsx / .xls). All rows are parsed and only cases
+              Upload the monthly report Excel / CSV file (.xlsx / .xls / .csv). All rows are parsed and only cases
               not already in the database are imported — duplicates are silently skipped.
             </p>
             <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-xl cursor-pointer hover:border-green-400 hover:bg-green-50 transition-all">
               <Upload size={24} className="text-slate-400 mb-2" />
               <span className="text-sm font-medium text-slate-600">Click to select Excel file</span>
-              <span className="text-xs text-slate-400 mt-1">.xlsx or .xls</span>
-              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleExcelFile} />
+              <span className="text-xs text-slate-400 mt-1">.xlsx, .xls or .csv</span>
+              <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={handleExcelFile} />
             </label>
           </div>
 
