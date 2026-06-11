@@ -31,18 +31,20 @@ const TODAY = new Date().toISOString().split('T')[0];
 // Base keys whose text contains {placeholder} tokens
 const PLACEHOLDER_BASE_KEYS = new Set([
   'legal_para_2',
+  'order_para_currency_release',
   'order_para_rf', 'order_para_ref', 'order_para_abs_conf', 'order_para_pp',
 ]);
 
 // Arrival base key → export-specific storage key (only for fields that differ)
 const EXPORT_KEY_MAP: Record<string, string> = {
-  inventory_heading:   'export_inventory_heading',
-  waiver_text_1:       'export_waiver_text_1',
-  legal_para_1:        'export_legal_para_1',
-  legal_para_2:        'export_legal_para_2',
-  order_para_rf:       'export_order_para_rf',
-  order_para_abs_conf: 'export_order_para_abs_conf',
-  order_para_pp:       'export_order_para_pp',
+  inventory_heading:           'export_inventory_heading',
+  waiver_text_1:               'export_waiver_text_1',
+  legal_para_1:                'export_legal_para_1',
+  legal_para_2:                'export_legal_para_2',
+  order_para_currency_release: 'export_order_para_currency_release',
+  order_para_rf:               'export_order_para_rf',
+  order_para_abs_conf:         'export_order_para_abs_conf',
+  order_para_pp:               'export_order_para_pp',
 };
 
 // Reverse: export_* key → arrival base key
@@ -52,13 +54,14 @@ const EXPORT_KEY_REVERSE: Record<string, string> = Object.fromEntries(
 
 // Human-readable labels for export-specific keys (shown in edit panel header)
 const EXPORT_KEY_LABELS: Record<string, string> = {
-  export_inventory_heading:   'Inventory Heading (Export Cases)',
-  export_waiver_text_1:       'Waiver Text 1 (Export Cases)',
-  export_legal_para_1:        'Legal Paragraph 1 (Export Cases)',
-  export_legal_para_2:        'Legal Paragraph 2 (Export Cases)',
-  export_order_para_rf:       'Order: Redemption Fine (Export Cases)',
-  export_order_para_abs_conf: 'Order: Absolute Confiscation (Export Cases)',
-  export_order_para_pp:       'Order: Personal Penalty (Export Cases)',
+  export_inventory_heading:           'Inventory Heading (Export Cases)',
+  export_waiver_text_1:               'Waiver Text 1 (Export Cases)',
+  export_legal_para_1:                'Legal Paragraph 1 (Export Cases)',
+  export_legal_para_2:                'Legal Paragraph 2 (Export Cases)',
+  export_order_para_currency_release: 'Order: Currency Release (Export Cases)',
+  export_order_para_rf:               'Order: Redemption Fine (Export Cases)',
+  export_order_para_abs_conf:         'Order: Absolute Confiscation (Export Cases)',
+  export_order_para_pp:               'Order: Personal Penalty (Export Cases)',
 };
 
 // Hard-coded defaults (arrival)
@@ -75,13 +78,14 @@ const ARRIVAL_DEFAULTS: Record<string, string> = {
 
 // Hard-coded defaults (export)
 const EXPORT_DEFAULTS: Record<string, string> = {
-  inventory_heading:   'INVENTORY OF THE GOODS DETAINED FOR EXPORT',
-  waiver_text_1:       'The Charges have been orally communicated to me in respect of the goods mentioned overleaf and detained at the time of my departure. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing.',
-  legal_para_1:        'In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.',
-  legal_para_2:        'Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.',
-  order_para_rf:       'I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref}, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.',
-  order_para_abs_conf: 'I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref}.',
-  order_para_pp:       'I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 114 of the Customs Act, 1962.',
+  inventory_heading:           'INVENTORY OF THE GOODS DETAINED FOR EXPORT',
+  waiver_text_1:               'The Charges have been orally communicated to me in respect of the goods mentioned overleaf and detained at the time of my departure. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing.',
+  legal_para_1:                'In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.',
+  legal_para_2:                'Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.',
+  order_para_currency_release: 'I Order for the release of Indian currency amounting to Rs.{currency_value}/- (Rupees {currency_words} Only) as per Regulation 3 of the Foreign Exchange Management (Export and Import of Currency) Regulations, 2015.',
+  order_para_rf:               'I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref}, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.',
+  order_para_abs_conf:         'I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref}.',
+  order_para_pp:               'I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 114 of the Customs Act, 1962.',
 };
 
 // Highlight {placeholder} tokens in template text
@@ -478,6 +482,20 @@ export default function OSTemplateEditor({ adminToken }: OSTemplateEditorProps) 
 
           {/* ORDER paragraphs — section refs differ between arrival/export */}
           <div className="text-[7.5pt] text-justify space-y-1 mb-2">
+            {/* Currency release — export-only, kicks in at print time when free allowance > 0 */}
+            {mode === 'export' ? (
+              <p className="indent-4">
+                <ES fieldKey={rk('order_para_currency_release')} onEdit={openEdit} selected={sel === rk('order_para_currency_release')}>
+                  <TemplateText text={v('order_para_currency_release', EXPORT_DEFAULTS.order_para_currency_release ?? '')} />
+                </ES>
+                <span className="ml-1 text-[7pt] text-violet-500 italic">— shown in PDF only when Free Allowance &gt; 0</span>
+              </p>
+            ) : (
+              <p className="indent-4 text-[7pt] text-slate-400 italic border border-dashed border-indigo-200 rounded px-2 py-0.5">
+                Currency release (order_para_currency_release) — applies only to export / departure cases
+              </p>
+            )}
+
             <p className="indent-4">
               <ES fieldKey={rk('order_para_rf')} onEdit={openEdit} selected={sel === rk('order_para_rf')}>
                 <TemplateText text={v('order_para_rf', ARRIVAL_DEFAULTS.order_para_rf ?? '')} />
@@ -707,10 +725,13 @@ export default function OSTemplateEditor({ adminToken }: OSTemplateEditorProps) 
                 onChange={e => setEdit(prev => prev ? { ...prev, newValue: e.target.value } : null)}
               />
               {edit.isTemplate && (
-                <div className="mt-1 text-[10px]">
+                <div className="mt-1 text-[10px]" style={{ whiteSpace: 'pre-wrap' }}>
                   <TemplateText text={edit.newValue} />
                 </div>
               )}
+              <p className="mt-1 text-[9px] text-slate-400">
+                Tip: Press Enter to add a line break. A blank line creates a paragraph break in the printed PDF.
+              </p>
             </div>
 
             <div>

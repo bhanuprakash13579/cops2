@@ -1,5 +1,5 @@
-import { useState, useMemo, useCallback } from 'react';
-import { FileText, Download, RefreshCw, CheckSquare, Square, ArrowUp, ArrowDown, ArrowUpDown, Lock } from 'lucide-react';
+import { useState, useMemo, useCallback, useRef } from 'react';
+import { FileText, Download, RefreshCw, CheckSquare, Square, ArrowUp, ArrowDown, ArrowUpDown, Lock, Upload, X, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import api from '@/lib/api';
 import DatePicker from '@/components/DatePicker';
 import { showDownloadToast } from '@/components/DownloadToast';
@@ -120,11 +120,53 @@ const ITEM_GROUP: { group: string; cols: ColDef[] } = {
     { key: 'items_duty_type',        label: 'Duty Type' },
     { key: 'items_category',         label: 'Category' },
     { key: 'items_sub_category',     label: 'Sub Category' },
-    { key: 'items_release_category', label: 'Release Category' },
+    { key: 'items_release_category', label: 'Release Category (Raw)' },
+    { key: 'confiscation_type',      label: 'Confiscation Type' },
     { key: 'value_per_piece',        label: 'Value per Piece' },
     { key: 'cumulative_duty_rate',   label: 'Cumulative Duty Rate' },
   ],
 };
+
+// ── Excel-upload helpers ──────────────────────────────────────────────────────
+
+interface ParsedOsRow { os_no: string; os_year: number; rowNum: number }
+
+async function parseExcelOsList(file: File): Promise<{ rows: ParsedOsRow[]; errors: string[] }> {
+  const XLSX = await import('xlsx');
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const raw: Record<string, unknown>[] = XLSX.utils.sheet_to_json(ws, { defval: '' });
+  const rows: ParsedOsRow[] = [];
+  const errors: string[] = [];
+
+  // Detect column names case-insensitively
+  const sampleKeys = raw.length > 0 ? Object.keys(raw[0]) : [];
+  const findKey = (candidates: string[]) =>
+    sampleKeys.find(k => candidates.some(c => k.trim().toLowerCase() === c.toLowerCase())) ?? null;
+
+  const osNoKey  = findKey(['os_no', 'os no', 'osno', 'os.no', 'os.no.', 'os number', 'os_number']);
+  const osYrKey  = findKey(['os_year', 'os year', 'year', 'os yr', 'osyear']);
+
+  if (!osNoKey || !osYrKey) {
+    return { rows: [], errors: [`Could not find required columns. Expected headers: OS_NO and OS_YEAR (found: ${sampleKeys.join(', ')})`] };
+  }
+
+  raw.forEach((r, idx) => {
+    const rowNum = idx + 2; // 1-based + header row
+    const rawNo = String(r[osNoKey] ?? '').trim();
+    const rawYr = String(r[osYrKey] ?? '').trim();
+    if (!rawNo || !rawYr) return; // skip blank rows silently
+    const yr = parseInt(rawYr, 10);
+    if (isNaN(yr) || yr < 1990 || yr > 2099) {
+      errors.push(`Row ${rowNum}: invalid year "${rawYr}"`);
+      return;
+    }
+    rows.push({ os_no: rawNo, os_year: yr, rowNum });
+  });
+
+  return { rows, errors };
+}
 
 // These 3 are always auto-included when any item column is selected.
 // They form the minimum context needed to make item data readable.
@@ -205,10 +247,56 @@ export default function CustomReport() {
   const [filterItemDesc,   setFilterItemDesc]   = useState('');
 
   const [loading, setLoading]   = useState(false);
-  const [result, setResult]     = useState<{ columns: string[]; rows: Record<string, string>[]; total: number } | null>(null);
+  const [result, setResult]     = useState<{ columns: string[]; rows: Record<string, string>[]; total: number; not_found?: {os_no:string;os_year:number}[] } | null>(null);
   const [error, setError]       = useState('');
   const [sortCol, setSortCol]   = useState<string | null>(null);
   const [sortDir, setSortDir]   = useState<'asc' | 'desc'>('asc');
+
+  // ── Excel-upload state ────────────────────────────────────────────────────
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [xlsxRows,    setXlsxRows]    = useState<ParsedOsRow[]>([]);
+  const [xlsxErrors,  setXlsxErrors]  = useState<string[]>([]);
+  const [xlsxFileName,setXlsxFileName]= useState('');
+  const [xlsxLoading, setXlsxLoading] = useState(false);
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setXlsxLoading(true);
+    setXlsxRows([]); setXlsxErrors([]); setResult(null);
+    setXlsxFileName(file.name);
+    const { rows, errors } = await parseExcelOsList(file);
+    setXlsxRows(rows);
+    setXlsxErrors(errors);
+    setXlsxLoading(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const clearXlsx = () => {
+    setXlsxRows([]); setXlsxErrors([]); setXlsxFileName(''); setResult(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const generateFromXlsx = async () => {
+    if (xlsxRows.length === 0) { setError('No OS records parsed from file.'); return; }
+    if (selectedMaster.size === 0 && selectedItems.size === 0) { setError('Select at least one column.'); return; }
+    setError(''); setLoading(true); setResult(null); setSortCol(null); setSortDir('asc');
+    try {
+      const res = await api.post('/backup/custom-report', {
+        master_cols: [...selectedMaster],
+        item_cols:   effectiveItemCols,
+        os_list:     xlsxRows.map(r => ({ os_no: r.os_no, os_year: r.os_year })),
+      });
+      setResult(res.data);
+    } catch (err: any) {
+      let detail = err.response?.data?.detail || 'Failed to generate report.';
+      if (Array.isArray(detail)) detail = detail.map((e: any) => `${e.loc?.join('.')} - ${e.msg}`).join(', ');
+      else if (typeof detail === 'object') detail = JSON.stringify(detail);
+      setError(detail);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // When any item column is selected, context columns are forced in.
   const effectiveItemCols: string[] = useMemo(() => {
@@ -477,6 +565,93 @@ export default function CustomReport() {
               )}
             </div>
             {error && <p className="text-xs text-red-600">{error}</p>}
+          </div>
+
+          {/* ── Excel Upload Panel ── */}
+          <div className="bg-white rounded-xl border border-indigo-200 overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-2.5 bg-indigo-50 border-b border-indigo-100">
+              <span className="flex items-center gap-2 text-xs font-semibold text-indigo-700">
+                <Upload size={13} />
+                Bulk Lookup from Excel / CSV
+              </span>
+              <span className="text-[10px] text-indigo-500">Upload a file with OS_NO and OS_YEAR columns</span>
+            </div>
+            <div className="p-4 space-y-3">
+              <div className="flex items-center gap-3 flex-wrap">
+                <label className="cursor-pointer flex items-center gap-2 px-3 py-1.5 text-xs rounded-lg border border-indigo-300 text-indigo-700 hover:bg-indigo-50 transition-colors">
+                  <Upload size={12} />
+                  {xlsxFileName ? 'Replace File' : 'Choose .xlsx / .csv'}
+                  <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={handleFileChange} />
+                </label>
+                {xlsxFileName && (
+                  <button onClick={clearXlsx} className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-red-500">
+                    <X size={11} /> Clear
+                  </button>
+                )}
+                {xlsxLoading && <span className="text-[10px] text-indigo-500 animate-pulse">Parsing…</span>}
+              </div>
+
+              {xlsxErrors.length > 0 && (
+                <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg p-2.5">
+                  <AlertTriangle size={13} className="text-red-500 shrink-0 mt-0.5" />
+                  <div className="text-[10px] text-red-700 space-y-0.5">
+                    {xlsxErrors.map((e, i) => <div key={i}>{e}</div>)}
+                  </div>
+                </div>
+              )}
+
+              {xlsxRows.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 size={12} className="text-emerald-600" />
+                    <span className="text-[10px] text-emerald-700 font-medium">{xlsxRows.length} OS record{xlsxRows.length !== 1 ? 's' : ''} parsed from <span className="font-semibold">{xlsxFileName}</span></span>
+                  </div>
+                  {/* Preview table — first 8 rows */}
+                  <div className="overflow-auto max-h-40 rounded-lg border border-indigo-100">
+                    <table className="w-full text-[10px] border-collapse">
+                      <thead className="sticky top-0 bg-indigo-50">
+                        <tr>
+                          <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">#</th>
+                          <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">OS No.</th>
+                          <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">Year</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {xlsxRows.slice(0, 8).map((r, i) => (
+                          <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-indigo-50/40'}>
+                            <td className="px-2 py-0.5 text-slate-400">{r.rowNum}</td>
+                            <td className="px-2 py-0.5 text-slate-700 font-medium">{r.os_no}</td>
+                            <td className="px-2 py-0.5 text-slate-700">{r.os_year}</td>
+                          </tr>
+                        ))}
+                        {xlsxRows.length > 8 && (
+                          <tr><td colSpan={3} className="px-2 py-1 text-center text-slate-400 italic">…and {xlsxRows.length - 8} more</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="flex gap-2 flex-wrap items-center">
+                    <button onClick={generateFromXlsx} disabled={loading || totalSelected === 0}
+                      className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+                      <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+                      {loading ? 'Fetching…' : `Fetch Details (${xlsxRows.length} records)`}
+                    </button>
+                    {totalSelected === 0 && <span className="text-[10px] text-amber-600">← Select columns first</span>}
+                  </div>
+                </div>
+              )}
+
+              {/* Not-found list */}
+              {result?.not_found && result.not_found.length > 0 && (
+                <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg p-2.5">
+                  <AlertTriangle size={13} className="text-amber-500 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-[10px] font-semibold text-amber-700 mb-1">{result.not_found.length} OS number{result.not_found.length !== 1 ? 's' : ''} not found in the database:</p>
+                    <p className="text-[10px] text-amber-600">{result.not_found.map(x => `${x.os_no}/${x.os_year}`).join(', ')}</p>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Results table */}

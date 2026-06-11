@@ -653,8 +653,28 @@ const REPORT_MASTER_COLS: &[&str] = &[
 const REPORT_ITEM_COLS: &[&str] = &[
     "items_desc","items_qty","items_uqc","items_value","items_fa",
     "items_duty","items_duty_type","items_category","items_sub_category",
-    "items_release_category","value_per_piece","cumulative_duty_rate",
+    "items_release_category","confiscation_type",
+    "value_per_piece","cumulative_duty_rate",
 ];
+
+/// Human-readable label derived from items_release_category (kept for reference).
+#[allow(dead_code)]
+fn confiscation_label(rc: &str) -> &'static str {
+    match rc.trim().to_uppercase().as_str() {
+        "CONFS"      => "Absolute Confiscation",
+        "RF"         => "Confiscation",
+        "REF"        => "Re-Export",
+        "UNDER OS"   => "Under OS (Seized)",
+        "UNDER DUTY" => "Dutiable",
+        _            => "",
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OsListItem {
+    os_no:   String,
+    os_year: i64,
+}
 
 #[derive(Deserialize)]
 pub struct CustomReportRequest {
@@ -664,7 +684,7 @@ pub struct CustomReportRequest {
     from_date: Option<String>,
     to_date:   Option<String>,
     case_type: Option<String>,
-    // Row-level filters
+    // Row-level filters (used when os_list is absent)
     #[serde(default)] os_no:         Option<String>,
     #[serde(default)] os_year:       Option<i64>,
     #[serde(default)] adj_offr_name: Option<String>,
@@ -672,6 +692,9 @@ pub struct CustomReportRequest {
     #[serde(default)] pax_name:      Option<String>,
     #[serde(default)] passport_no:   Option<String>,
     #[serde(default)] item_desc:     Option<String>,
+    // Excel-upload batch: if provided, only these (os_no, os_year) pairs are returned
+    #[serde(default)]
+    os_list: Vec<OsListItem>,
 }
 
 pub async fn custom_report(
@@ -688,32 +711,48 @@ pub async fn custom_report(
         return Err(e400("Select at least one column."));
     }
 
+    if body.os_list.len() > 2000 {
+        return Err(e400("os_list cannot exceed 2000 items per request."));
+    }
+
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let include_items = !body.item_cols.is_empty();
 
     // Build parameterized WHERE clause
     let mut conditions = vec!["cm.entry_deleted = 'N'".to_string()];
     let mut params: Vec<String> = Vec::new();
-    if let (Some(fd), Some(td)) = (&body.from_date, &body.to_date) {
-        conditions.push("cm.os_date >= ? AND cm.os_date <= ?".to_string());
-        params.extend_from_slice(&[fd.clone(), td.clone()]);
-    }
-    if let Some(ct) = &body.case_type {
-        if ct.to_uppercase().contains("EXPORT") {
-            conditions.push("upper(cm.case_type) = 'EXPORT CASE'".to_string());
-        } else {
-            conditions.push("(cm.case_type IS NULL OR upper(cm.case_type) != 'EXPORT CASE')".to_string());
+
+    if !body.os_list.is_empty() {
+        // Excel-upload mode: match exactly these (os_no, os_year) pairs
+        let or_parts = body.os_list.iter().map(|_| "(cm.os_no=? AND cm.os_year=?)").collect::<Vec<_>>().join(" OR ");
+        conditions.push(format!("({or_parts})"));
+        for item in &body.os_list {
+            params.push(item.os_no.clone());
+            params.push(item.os_year.to_string());
         }
-    }
-    if let Some(v) = &body.os_no         { conditions.push("cm.os_no = ?".to_string()); params.push(v.clone()); }
-    if let Some(v) = body.os_year        { conditions.push("cm.os_year = ?".to_string()); params.push(v.to_string()); }
-    if let Some(v) = &body.adj_offr_name { conditions.push("upper(cm.adj_offr_name) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
-    if let Some(v) = &body.flight_no     { conditions.push("upper(cm.flight_no) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
-    if let Some(v) = &body.pax_name      { conditions.push("upper(cm.pax_name) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
-    if let Some(v) = &body.passport_no   { conditions.push("upper(cm.passport_no) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
-    if let Some(v) = &body.item_desc {
-        conditions.push("EXISTS (SELECT 1 FROM cops_items ci2 WHERE ci2.os_no=cm.os_no AND ci2.os_year=cm.os_year AND upper(ci2.items_desc) LIKE upper(?))".to_string());
-        params.push(format!("%{v}%"));
+    } else {
+        // Filter-based mode
+        if let (Some(fd), Some(td)) = (&body.from_date, &body.to_date) {
+            conditions.push("cm.os_date >= ? AND cm.os_date <= ?".to_string());
+            params.extend_from_slice(&[fd.clone(), td.clone()]);
+        }
+        if let Some(ct) = &body.case_type {
+            if ct.to_uppercase().contains("EXPORT") {
+                conditions.push("upper(cm.case_type) = 'EXPORT CASE'".to_string());
+            } else {
+                conditions.push("(cm.case_type IS NULL OR upper(cm.case_type) != 'EXPORT CASE')".to_string());
+            }
+        }
+        if let Some(v) = &body.os_no         { conditions.push("cm.os_no = ?".to_string()); params.push(v.clone()); }
+        if let Some(v) = body.os_year        { conditions.push("cm.os_year = ?".to_string()); params.push(v.to_string()); }
+        if let Some(v) = &body.adj_offr_name { conditions.push("upper(cm.adj_offr_name) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+        if let Some(v) = &body.flight_no     { conditions.push("upper(cm.flight_no) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+        if let Some(v) = &body.pax_name      { conditions.push("upper(cm.pax_name) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+        if let Some(v) = &body.passport_no   { conditions.push("upper(cm.passport_no) LIKE upper(?)".to_string()); params.push(format!("%{v}%")); }
+        if let Some(v) = &body.item_desc {
+            conditions.push("EXISTS (SELECT 1 FROM cops_items ci2 WHERE ci2.os_no=cm.os_no AND ci2.os_year=cm.os_year AND upper(ci2.items_desc) LIKE upper(?))".to_string());
+            params.push(format!("%{v}%"));
+        }
     }
     let where_clause = conditions.join(" AND ");
 
@@ -735,9 +774,22 @@ pub async fn custom_report(
     ).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     // Bulk-load items (OR-chain, chunked at 80) and aggregate per OS with \n separator.
+    // confiscation_type is a computed column — replace with SQL CASE expression.
     let mut items_map: std::collections::HashMap<(String, String), Vec<Vec<String>>> = std::collections::HashMap::new();
     if include_items && !master_rows.is_empty() {
-        let item_sel = body.item_cols.iter().map(|c| format!("ci.{c}")).collect::<Vec<_>>().join(", ");
+        let item_sel = body.item_cols.iter().map(|c| {
+            if c == "confiscation_type" {
+                "CASE COALESCE(TRIM(UPPER(ci.items_release_category)),'') \
+                  WHEN 'CONFS' THEN 'Absolute Confiscation' \
+                  WHEN 'RF' THEN 'Confiscation' \
+                  WHEN 'REF' THEN 'Re-Export' \
+                  WHEN 'UNDER OS' THEN 'Under OS (Seized)' \
+                  WHEN 'UNDER DUTY' THEN 'Dutiable' \
+                  ELSE COALESCE(ci.items_release_category,'') END".to_string()
+            } else {
+                format!("ci.{c}")
+            }
+        }).collect::<Vec<_>>().join(", ");
         let icc = body.item_cols.len();
         for chunk in master_rows.chunks(80) {
             let or_parts = chunk.iter().map(|_| "(ci.os_no=? AND ci.os_year=?)").collect::<Vec<_>>().join(" OR ");
@@ -785,7 +837,19 @@ pub async fn custom_report(
         Value::Object(obj)
     }).collect();
 
-    Ok(Json(json!({ "columns": all_cols, "rows": json_rows, "total": json_rows.len() })))
+    // When os_list was provided, report which pairs were not found.
+    let not_found: Vec<Value> = if !body.os_list.is_empty() {
+        let found: std::collections::HashSet<(String, String)> =
+            master_rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+        body.os_list.iter()
+            .filter(|item| !found.contains(&(item.os_no.clone(), item.os_year.to_string())))
+            .map(|item| json!({ "os_no": item.os_no, "os_year": item.os_year }))
+            .collect()
+    } else {
+        vec![]
+    };
+
+    Ok(Json(json!({ "columns": all_cols, "rows": json_rows, "total": json_rows.len(), "not_found": not_found })))
 }
 
 // ── Adjudication summary PDF ──────────────────────────────────────────────────

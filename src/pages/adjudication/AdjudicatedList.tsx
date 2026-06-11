@@ -141,7 +141,7 @@ export default function AdjudicatedList() {
                   </div>
                 </td></tr>
               ) : cases.map((c, idx) => {
-                const totalDemand = c.total_payable || ((c.total_duty_amount || 0) + (c.rf_amount || 0) + (c.pp_amount || 0) + (c.ref_amount || 0) + (c.br_amount || 0));
+                const totalDemand = c.total_payable || ((c.total_duty_amount || 0) + (c.rf_amount || 0) + (c.pp_amount || 0) + (c.ref_amount || 0));
                 const modifiable = isWithin24hWindow(c.adjudication_time);
                 return (
                   <tr key={`${c.os_no}-${c.os_year}-${idx}`} onClick={() => navigate(`/adjudication/case/${c.os_no}/${c.os_year}`)}

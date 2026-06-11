@@ -681,3 +681,9 @@ CREATE INDEX IF NOT EXISTS ix_cops_master_adjudication_time   ON cops_master (ad
 CREATE INDEX IF NOT EXISTS ix_cops_master_closure_ind         ON cops_master (closure_ind);
 CREATE INDEX IF NOT EXISTS ix_cops_master_pending_composite   ON cops_master (entry_deleted, is_draft, adjudication_date, adj_offr_name);
 CREATE INDEX IF NOT EXISTS ix_cops_master_os_date             ON cops_master (os_date);
+-- Text-search support: used when these columns are the sole/primary search filter.
+-- Prefix-match (LIKE 'val%') on these columns will use the index; substring
+-- ('%val%') still benefits indirectly because the entry_deleted composite index
+-- narrows the candidate set before the linear scan.
+CREATE INDEX IF NOT EXISTS ix_cops_master_pax_name              ON cops_master (pax_name);
+CREATE INDEX IF NOT EXISTS ix_cops_master_country_of_departure  ON cops_master (country_of_departure);

@@ -45,55 +45,127 @@ export default function OSPrintView() {
           const fetchedData = response.data.items[0];
           setData(fetchedData);
 
-          // Fetch versioned config and prior offences in parallel — independent requests
-          const [pitResult, ppResult] = await Promise.allSettled([
+          // Token-overlap name score — mirrors backend _name_score logic.
+          const nameScore = (a: string, b: string): number => {
+            const tok = (s: string) => new Set(
+              s.toUpperCase().replace(/[^A-Z ]/g, ' ').split(/\s+/).filter(t => t.length >= 2)
+            );
+            const t1 = tok(a); const t2 = tok(b);
+            if (!t1.size || !t2.size) return 0;
+            return [...t1].filter(t => t2.has(t)).length / Math.min(t1.size, t2.size);
+          };
+
+          // Returns false for placeholder values — all valid country passport formats are accepted.
+          const PP_PLACEHOLDERS = new Set([
+            'NA', 'N/A', 'N.A', 'N.A.', 'NIL', 'NONE', 'NILL', 'NULL',
+            'UNKNOWN', 'NOT APPLICABLE', 'NOTAPPLICABLE',
+            'NOT AVAILABLE', 'NOTAVAILABLE', '0', '00', '000', '0000', '00000000',
+          ]);
+          const isRealPassport = (pp: string | null | undefined): boolean => {
+            if (!pp || !pp.trim()) return false;
+            const s = pp.trim().toUpperCase();
+            if (PP_PLACEHOLDERS.has(s)) return false;
+            if (s.startsWith('UNCLAIM') || s.startsWith('CARGO') || s.startsWith('FREIGHT')) return false;
+            return true;
+          };
+
+          const DISPLAY_CAP = 20;
+          const currentOsDate = new Date(fetchedData.os_date);
+          const paxNameLower = (fetchedData.pax_name || '').trim().toLowerCase();
+          // Placeholder / unidentified pax names — skip name-based Other-PP lookup entirely
+          // to avoid matching all "UNCLAIMED", "NA", "UNKNOWN" etc. cases against each other.
+          const PAX_NAME_PLACEHOLDERS = new Set([
+            'na', 'n/a', 'n.a', 'n.a.', 'nil', 'nill', 'none', 'unknown',
+            'not available', 'not known', 'notknown',
+          ]);
+          const isUnclaimed = (
+            paxNameLower.startsWith('unclaimed') ||
+            paxNameLower.startsWith('cargo') ||
+            paxNameLower.startsWith('freight') ||
+            PAX_NAME_PLACEHOLDERS.has(paxNameLower)
+          );
+          const currentPp = fetchedData.passport_no as string | null | undefined;
+          const ppIsReal = isRealPassport(currentPp);
+
+          // Two independent searches — passport-based for "Prev. Offence",
+          // name-based for "Other PPs". Fired in parallel.
+          const [pitResult, ppByPassportResult, ppByNameResult] = await Promise.allSettled([
             api.get('/admin/config/pit', { params: { ref_date: fetchedData.os_date } }),
-            api.post('/os-query/search', { pax_name: fetchedData.pax_name, page: 1, limit: 50 }),
+            // "Prev. Offence": only search when passport is a real passport number
+            ppIsReal
+              ? api.post('/os-query/search', { passport_no: currentPp, page: 1, limit: 100 })
+              : Promise.resolve(null),
+            // "Other PPs": search by name (only for real passengers, not unclaimed goods)
+            (!isUnclaimed && paxNameLower)
+              ? api.post('/os-query/search', { pax_name: fetchedData.pax_name, page: 1, limit: 100 })
+              : Promise.resolve(null),
           ]);
 
-          setPitConfig(pitResult.status === 'fulfilled' ? pitResult.value.data : null);
+          setPitConfig(pitResult.status === 'fulfilled' ? pitResult.value?.data ?? null : null);
 
-          if (ppResult.status === 'fulfilled') {
-            try {
-              const ppData = ppResult.value.data;
-              // Exclude the current OS record itself
-              const allOther = ppData.items.filter((item: any) =>
-                item.os_no !== fetchedData.os_no || item.os_year !== fetchedData.os_year
-              );
-
-              // Same passport + strictly before current OS date → "Prev. Offence in Above PP No(s)."
-              const currentOsDate = new Date(fetchedData.os_date);
-              const samePassportPrior = allOther.filter((o: any) =>
-                o.passport_no === fetchedData.passport_no &&
+          // ── "Prev. Offence in Above PP No(s). as per COPS" ──────────────────
+          // Exact match on the current passport number, cases before current OS date.
+          // The os-query search uses ilike so we filter for exact match client-side.
+          try {
+            const ppData = ppByPassportResult.status === 'fulfilled' ? ppByPassportResult.value?.data : null;
+            const ppItems: any[] = ppData?.items ?? [];
+            const samePassportPrior = ppItems
+              .filter((o: any) =>
+                (o.os_no !== fetchedData.os_no || o.os_year !== fetchedData.os_year) &&
+                o.passport_no === currentPp &&          // exact match — ilike may return partial hits
                 new Date(o.os_date) < currentOsDate
-              );
-              if (samePassportPrior.length > 0) {
-                const osList = samePassportPrior
-                  .sort((a: any, b: any) => new Date(b.os_date).getTime() - new Date(a.os_date).getTime())
-                  .map((o: any) => `${o.os_no}/${o.os_year}`)
-                  .join(', ');
-                setPrevSamePpOffences(`${samePassportPrior.length} (${osList})`);
-              } else {
-                setPrevSamePpOffences('NIL');
-              }
+              )
+              .sort((a: any, b: any) => new Date(b.os_date).getTime() - new Date(a.os_date).getTime());
 
-              // Different passport, same pax name → "Offences of Other PPs(if any)"
-              const otherPassport = allOther.filter((o: any) =>
-                o.passport_no !== fetchedData.passport_no
-              );
+            if (samePassportPrior.length > 0) {
+              const shown = samePassportPrior.slice(0, DISPLAY_CAP);
+              const osList = shown.map((o: any) => `${o.os_no}/${o.os_year}`).join(', ');
+              const overflow = samePassportPrior.length - shown.length;
+              const suffix = overflow > 0 ? `, and ${overflow} more` : '';
+              setPrevSamePpOffences(`${samePassportPrior.length} (${osList}${suffix})`);
+            } else {
+              setPrevSamePpOffences('NIL');
+            }
+          } catch {
+            setPrevSamePpOffences('NIL');
+          }
+
+          // ── "Offences of Other PPs(if any)" ─────────────────────────────────
+          // Same person, DIFFERENT passport — via DOB+name matching.
+          // Records sharing the current PP are explicitly excluded to ensure
+          // zero overlap with the "Prev. Offence" field above.
+          // Rules:
+          //   • DOB present → exact DOB match + name token-overlap ≥ 90%
+          //   • DOB absent  → 100% exact name match (case-insensitive)
+          try {
+            if (isUnclaimed || !paxNameLower) {
+              setOtherPpOffences('NIL');
+            } else {
+              const nameData = ppByNameResult.status === 'fulfilled' ? ppByNameResult.value?.data : null;
+              const nameItems: any[] = nameData?.items ?? [];
+              const ourDob = fetchedData.pax_date_of_birth || null;
+              const otherPassport = nameItems.filter((o: any) => {
+                if (o.os_no === fetchedData.os_no && o.os_year === fetchedData.os_year) return false;
+                // Exclude same passport — those belong to "Prev. Offence"
+                if (currentPp && o.passport_no === currentPp) return false;
+                if (ourDob) {
+                  if (!o.pax_date_of_birth || o.pax_date_of_birth !== ourDob) return false;
+                  return nameScore(fetchedData.pax_name || '', o.pax_name || '') >= 0.90;
+                } else {
+                  return (o.pax_name || '').trim().toLowerCase() === paxNameLower;
+                }
+              });
               if (otherPassport.length > 0) {
-                setOtherPpOffences(
-                  otherPassport.map((o: any) => `${o.passport_no} (OS ${o.os_no}/${o.os_year})`).join(', ')
-                );
+                const shown = otherPassport.slice(0, DISPLAY_CAP);
+                const parts = shown.map((o: any) => `${o.passport_no} (OS ${o.os_no}/${o.os_year})`);
+                const overflow = otherPassport.length - shown.length;
+                if (overflow > 0) parts.push(`and ${overflow} more`);
+                setOtherPpOffences(parts.join(', '));
               } else {
                 setOtherPpOffences('NIL');
               }
-            } catch {
-              setPrevSamePpOffences('NIL');
-              setOtherPpOffences('NIL');
             }
-          } else {
-            setPrevSamePpOffences('NIL');
+          } catch {
             setOtherPpOffences('NIL');
           }
         }
@@ -106,12 +178,16 @@ export default function OSPrintView() {
     if (os_no && os_year) fetchRecord();
   }, [os_no, os_year]);
 
-  // Pre-generate the PDF in the background as soon as the record loads
+  // Pre-generate the PDF in the background as soon as the record loads.
+  // On failure clear the ref so the next download attempt starts a fresh request
+  // rather than re-awaiting an already-rejected promise.
   useEffect(() => {
     if (data && os_no && os_year) {
-      pdfPromiseRef.current = api
+      const req = api
         .get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer' })
         .then((r) => r.data);
+      req.catch(() => { pdfPromiseRef.current = null; });
+      pdfPromiseRef.current = req;
     }
   }, [data, os_no, os_year]);
 
@@ -137,11 +213,15 @@ export default function OSPrintView() {
     return parts.slice(0, -1).join(', ') + ' & ' + parts[parts.length - 1];
   };
   const confiscationRef: string = (() => {
+    // A case adjudicated through the form persists the officer's exact selection
+    // (fixed + chosen optionals) in adjn_section_ref — always honour it verbatim.
     if (data.adjn_section_ref) return data.adjn_section_ref;
+    // Fallback (offline / legacy / pre-adjudication cases): use ONLY the fixed
+    // subsections. Optional subsections (e.g. (i), (o)) are opt-in by design and
+    // must never be auto-included without an explicit officer selection.
     const secNo   = isExportCase ? pitText('confiscation_section_export',        '113') : pitText('confiscation_section_import',        '111');
     const fixCsv  = isExportCase ? pitText('confiscation_fixed_subs_export',     '')    : pitText('confiscation_fixed_subs_import',     'd,l,m');
-    const optCsv  = isExportCase ? pitText('confiscation_optional_subs_export',  '')    : pitText('confiscation_optional_subs_import',  'i,o');
-    const allSubs = [..._parseCsv(fixCsv), ..._parseCsv(optCsv)].sort();
+    const allSubs = [..._parseCsv(fixCsv)].sort();
     return `Section ${secNo}${_fmtSubs(allSubs)} of the Customs Act, 1962`;
   })();
 
@@ -173,6 +253,8 @@ export default function OSPrintView() {
     : pitText('legal_para_2', "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.");
   const recordHeading   = pitText('record_heading',    "RECORD OF PERSONAL HEARING & FINDINGS");
   const orderHeading    = pitText('order_heading',     "ORDER");
+  const orderParaCurrencyReleaseTpl = pitText('export_order_para_currency_release',
+    "I Order for the release of Indian currency amounting to Rs.{currency_value}/- (Rupees {currency_words} Only) as per Regulation 3 of the Foreign Exchange Management (Export and Import of Currency) Regulations, 2015.");
   const orderParaRfTpl      = isExportCase
     ? pitText('export_order_para_rf', "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref}, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.")
     : pitText('order_para_rf', "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref} read with Section 3(3) of Foreign Trade (D&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.");
@@ -195,6 +277,21 @@ export default function OSPrintView() {
     tpl.replace(/\{(\w+)\}/g, (_, k) => String(vars[k] ?? `{${k}}`));
 
   const slnosText = (nos: number[]) => nos.length > 0 ? ` at Sl.No(s). ${nos.join(', ')}` : '';
+
+  // Render plaintext as multiple <p>s split on blank lines (matches PDF backend).
+  // Single \n inside a block becomes <br>. Each paragraph gets the same className
+  // so first-line indent (e.g. "indent-8") applies to every paragraph.
+  const renderParas = (text: string, className?: string) => {
+    if (!text) return null;
+    const blocks = text.split(/\n[ \t]*\n+/);
+    return blocks.map((block, bi) => (
+      <p key={bi} className={className}>
+        {block.split('\n').map((line, li, arr) => (
+          <span key={li}>{line}{li < arr.length - 1 && <br />}</span>
+        ))}
+      </p>
+    ));
+  };
 
   const handlePrint = async () => {
     // Use the pre-generated PDF (started when page loaded); fall back to a fresh request
@@ -219,9 +316,14 @@ export default function OSPrintView() {
         showDownloadToast(`PDF saved to ${savePath}`);
       }
     } catch {
-      // Fallback: browser download (non-Tauri / web mode)
+      // Fallback: browser download (non-Tauri / web mode).
+      // Always start a fresh request — pdfReady may be a rejected promise
+      // if the background pre-generation failed, and re-awaiting a rejected
+      // promise always throws immediately without retrying the network call.
       try {
-        const pdfData = await pdfReady;
+        const pdfData = await api
+          .get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer' })
+          .then((r) => r.data);
         const blob = new Blob([pdfData], { type: 'application/pdf' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -323,11 +425,8 @@ export default function OSPrintView() {
     ? [...confsSlNos, ...rfSlNos].sort((a: number, b: number) => a - b)
     : confsSlNos;
 
-  // Calculate prev offences count
-  // "Prev. Offence in Above PP No(s).": live COPS data takes priority over legacy DB field
-  const prevOffenceCountDisplay = prevSamePpOffences !== 'NIL'
-    ? prevSamePpOffences
-    : (data.previous_visits || 'NIL');
+  // "Prev. Offence in Above PP No(s). as per COPS" — only live COPS DB data, never the legacy free-text field.
+  const prevOffenceCountDisplay = prevSamePpOffences;
 
   // Summary Table Calculations
   const FA_ELIGIBLE_CATS = ['UNDER DUTY', 'UNDER OS', 'RF', 'REF'];
@@ -595,8 +694,8 @@ export default function OSPrintView() {
           <p className="mb-2 indent-8"><span className="font-bold">{noteScnWaived}</span></p>
 
           <div className="mb-2 space-y-1 text-justify">
-            <p className="indent-8">{legalPara1}</p>
-            <p className="indent-8">{fillTpl(legalPara2, { confiscation_full_ref: confiscationRef })}</p>
+            {renderParas(legalPara1, "indent-8")}
+            {renderParas(fillTpl(legalPara2, { confiscation_full_ref: confiscationRef }), "indent-8")}
           </div>
 
           <div className="font-bold underline text-center uppercase mb-1">{recordHeading}</div>
@@ -608,44 +707,48 @@ export default function OSPrintView() {
 
           <div className="font-bold underline text-center uppercase mb-1">{orderHeading}</div>
           <div className="mb-2 text-justify">
-            {confValue > 0 && (data.rf_amount || 0) > 0 && (
-              <p className="mb-1 indent-8">
-                {fillTpl(orderParaRfTpl, {
-                  confiscation_full_ref: confiscationRef,
-                  rf_slnos_text: slnosText(rfSlNos),
-                  conf_value: confValue,
-                  rf_amount: data.rf_amount || 0,
-                  rf_words: numberToWords(data.rf_amount || 0).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
-                })}
-              </p>
+            {/* Currency release — export-only, when free allowance entered (e.g. Indian Currency declared) */}
+            {isExportCase && totalFaMonetary > 0 && renderParas(
+              fillTpl(orderParaCurrencyReleaseTpl, {
+                currency_value: Math.round(totalFaMonetary),
+                currency_words: numberToWords(Math.round(totalFaMonetary)).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
+              }),
+              "mb-1 indent-8",
             )}
-            {reExpValue > 0 && (data.ref_amount || 0) > 0 && !isExportCase && (
-              <p className="mb-1 indent-8">
-                {fillTpl(orderParaRefTpl, {
-                  ref_slnos_text: slnosText(refSlNos),
-                  re_exp_value: reExpValue,
-                  ref_amount: data.ref_amount || 0,
-                  ref_words: numberToWords(data.ref_amount || 0).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
-                })}
-              </p>
+            {confValue > 0 && (data.rf_amount || 0) > 0 && renderParas(
+              fillTpl(orderParaRfTpl, {
+                confiscation_full_ref: confiscationRef,
+                rf_slnos_text: slnosText(rfSlNos),
+                conf_value: confValue,
+                rf_amount: data.rf_amount || 0,
+                rf_words: numberToWords(data.rf_amount || 0).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
+              }),
+              "mb-1 indent-8",
             )}
-            {absConfValue > 0 && (
-              <p className="mb-1 indent-8">
-                {fillTpl(orderParaAbsConfTpl, {
-                  confiscation_full_ref: confiscationRef,
-                  also_text: (confValue > 0 || reExpValue > 0) ? 'also ' : '',
-                  abs_conf_slnos_text: slnosText(allAbsConfSlNos),
-                  abs_conf_value: absConfValue,
-                })}
-              </p>
+            {reExpValue > 0 && (data.ref_amount || 0) > 0 && !isExportCase && renderParas(
+              fillTpl(orderParaRefTpl, {
+                ref_slnos_text: slnosText(refSlNos),
+                re_exp_value: reExpValue,
+                ref_amount: data.ref_amount || 0,
+                ref_words: numberToWords(data.ref_amount || 0).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
+              }),
+              "mb-1 indent-8",
             )}
-            {(data.pp_amount || 0) > 0 && (
-              <p className="indent-8">
-                {fillTpl(orderParaPpTpl, {
-                  pp_amount: data.pp_amount || 0,
-                  pp_words: numberToWords(data.pp_amount || 0).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
-                })}
-              </p>
+            {absConfValue > 0 && renderParas(
+              fillTpl(orderParaAbsConfTpl, {
+                confiscation_full_ref: confiscationRef,
+                also_text: (confValue > 0 || reExpValue > 0) ? 'also ' : '',
+                abs_conf_slnos_text: slnosText(allAbsConfSlNos),
+                abs_conf_value: absConfValue,
+              }),
+              "mb-1 indent-8",
+            )}
+            {(data.pp_amount || 0) > 0 && renderParas(
+              fillTpl(orderParaPpTpl, {
+                pp_amount: data.pp_amount || 0,
+                pp_words: numberToWords(data.pp_amount || 0).trim().replace(/\b\w/g, (l: string) => l.toUpperCase()),
+              }),
+              "indent-8",
             )}
           </div>
 

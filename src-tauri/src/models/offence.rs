@@ -225,6 +225,7 @@ pub struct CompleteOfflineRequest {
     pub adj_offr_designation: String,
     pub adjudication_date: Option<String>,
     pub adjn_offr_remarks: Option<String>,
+    pub adjn_section_ref: Option<String>,
     pub rf_amount: Option<f64>,
     pub pp_amount: Option<f64>,
     pub ref_amount: Option<f64>,

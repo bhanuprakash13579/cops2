@@ -876,13 +876,15 @@ pub async fn complete_offline(State(pool): Db, auth: AdjnUser, Path((os_no, os_y
 
     conn.execute(
         "UPDATE cops_master SET adj_offr_name=?, adj_offr_designation=?, adjudication_date=?,
-         adjudication_time=?, adjn_offr_remarks=?, rf_amount=?, pp_amount=?, ref_amount=?,
+         adjudication_time=?, adjn_offr_remarks=?, adjn_section_ref=?,
+         rf_amount=?, pp_amount=?, ref_amount=?,
          confiscated_value=?, redeemed_value=?, re_export_value=?, total_payable=?, closure_ind=?
          WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![
             req.adj_offr_name, req.adj_offr_designation,
             adj_date, now_ts,
-            req.adjn_offr_remarks, rf, pp, refv,
+            req.adjn_offr_remarks, req.adjn_section_ref,
+            rf, pp, refv,
             req.confiscated_value.unwrap_or(0.0),
             req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),
             total_payable,
@@ -922,13 +924,16 @@ pub async fn outcome_update(State(pool): Db, _auth: AuthUser, Path((os_no, os_ye
 
     conn.execute(
         "UPDATE cops_master SET adj_offr_name=?, adj_offr_designation=?, adjudication_date=?,
-         adjudication_time=?, adjn_offr_remarks=?, rf_amount=?, pp_amount=?, ref_amount=?,
+         adjudication_time=?, adjn_offr_remarks=?,
+         adjn_section_ref=COALESCE(?, adjn_section_ref),
+         rf_amount=?, pp_amount=?, ref_amount=?,
          confiscated_value=?, redeemed_value=?, re_export_value=?, total_payable=?, closure_ind=?
          WHERE os_no=? AND os_year=? AND entry_deleted='N'",
         rusqlite::params![
             req.adj_offr_name, req.adj_offr_designation,
             adj_date, now_ts,
-            req.adjn_offr_remarks, rf, pp, refv,
+            req.adjn_offr_remarks, req.adjn_section_ref,
+            rf, pp, refv,
             req.confiscated_value.unwrap_or(0.0),
             req.redeemed_value.unwrap_or(0.0), req.re_export_value.unwrap_or(0.0),
             total_payable,
@@ -1101,7 +1106,14 @@ pub async fn query_search(State(pool): Db, _auth: AuthUser, Json(body): Json<ser
     }
 
     like_cond!("pax_name",             "pax_name");
-    like_cond!("passport_no",          "passport_no");
+    // passport_no: prefix match (LIKE 'value%') so the b-tree index is used.
+    // Officers always type passports from the first character; the internal
+    // OSPrintView prev-offence lookup sends the full number, so this is correct.
+    if let Some(v) = body.get("passport_no").and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        conditions.push("cm.passport_no LIKE ?".to_string());
+        params.push(format!("{}%", v));
+    }
     like_cond!("flight_no",            "flight_no");
     like_cond!("country_of_departure", "country_of_departure");
 
@@ -1175,7 +1187,7 @@ pub async fn query_search(State(pool): Db, _auth: AuthUser, Json(body): Json<ser
                 cm.adjudication_date, cm.adj_offr_name, cm.is_draft, cm.online_adjn,
                 cm.entry_deleted, cm.post_adj_br_entries, cm.post_adj_dr_no,
                 cm.post_adj_dr_date, cm.total_duty_amount, cm.closure_ind,
-                cm.country_of_departure,
+                cm.country_of_departure, cm.pax_date_of_birth,
                 (SELECT GROUP_CONCAT(ci.items_desc, '; ')
                  FROM cops_items ci
                  WHERE ci.os_no=cm.os_no AND ci.os_year=cm.os_year
@@ -1209,7 +1221,8 @@ pub async fn query_search(State(pool): Db, _auth: AuthUser, Json(body): Json<ser
             "total_duty_amount":    r.get::<_, Option<f64>>(18)?,
             "closure_ind":          r.get::<_, Option<String>>(19)?,
             "country_of_departure": r.get::<_, Option<String>>(20)?,
-            "item_desc_summary":    r.get::<_, Option<String>>(21)?,
+            "pax_date_of_birth":    r.get::<_, Option<String>>(21)?,
+            "item_desc_summary":    r.get::<_, Option<String>>(22)?,
             "items": [],  // not hydrated in list view; OSPrintView exact-lookup path includes items
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();

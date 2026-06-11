@@ -26,6 +26,10 @@ export default function PassportScanner({ onScan, label, modalTitle, description
     const [scanBuffer, setScanBuffer] = useState('');
     const [error, setError] = useState('');
     const inputRef = useRef<HTMLInputElement>(null);
+    // Keep a ref to the trigger button so we can return focus to it (with
+    // preventScroll) when the modal closes — otherwise the browser picks an
+    // arbitrary focusable element at the bottom of the form and scrolls to it.
+    const triggerRef = useRef<HTMLButtonElement>(null);
 
     // Auto-focus the hidden input when scanner modal is opened
     useEffect(() => {
@@ -65,6 +69,7 @@ export default function PassportScanner({ onScan, label, modalTitle, description
                 const expYearPrefix = parseInt(expStr.substring(0, 2)) > 50 ? '19' : '20';
                 const expiryDate = `${expYearPrefix}${expStr.substring(0,2)}-${expStr.substring(2,4)}-${expStr.substring(4,6)}`;
 
+                triggerRef.current?.focus({ preventScroll: true });
                 setIsOpen(false);
                 onScan({
                     type: 'PASSPORT',
@@ -104,6 +109,7 @@ export default function PassportScanner({ onScan, label, modalTitle, description
                      flightDate = `${y}-${m}-${d}`;
                  }
 
+                 triggerRef.current?.focus({ preventScroll: true });
                  setIsOpen(false);
                  onScan({
                      type: 'BOARDING_PASS',
@@ -149,8 +155,9 @@ export default function PassportScanner({ onScan, label, modalTitle, description
 
     return (
         <>
-            <button 
-                type="button" 
+            <button
+                ref={triggerRef}
+                type="button"
                 onClick={() => setIsOpen(true)}
                 className="flex items-center px-4 py-2 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md hover:bg-indigo-100 transition-colors font-medium shadow-sm text-sm"
             >
