@@ -8,7 +8,11 @@ import * as XLSX from 'xlsx';
 
 // ── Excel import helpers ──────────────────────────────────────────────────────
 
-type ParsedItem = { items_desc: string; items_qty: number; items_uqc: string; items_value: number; items_duty_type: string };
+type ParsedItem = { _key?: string; items_desc: string; items_qty: number; items_uqc: string; items_value: number; items_duty_type: string };
+
+// Monotonic counter for stable item keys — avoids key={idx} reuse on add/remove
+let _itemKeySeq = 0;
+const _mkItemKey = () => `itm-${++_itemKeySeq}`;
 
 /** Parse "2.5 KGS" or "1 NOS" → { qty, uqc } */
 function parseQtyUqc(raw: string): { qty: number; uqc: string } {
@@ -56,20 +60,17 @@ function parseExcelItems(descCol: string, qtyCol: string): { items: ParsedItem[]
     });
     const matchCount = parsed.filter(p => p.matched).length;
     if (matchCount === parsed.length) {
-      // All tokens have a leading qty — clean, unambiguous parse
       return {
         items: parsed.map(p => ({ items_desc: p.desc.toUpperCase(), items_qty: p.qty, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' })),
         needsManualEntry: false,
       };
     }
     if (matchCount > 0) {
-      // Mixed — pre-populate from what parsed but ask user to review
       return {
         items: parsed.map(p => ({ items_desc: p.desc.toUpperCase(), items_qty: p.qty, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' })),
         needsManualEntry: true,
       };
     }
-    // No leading qty anywhere — treat entire string as one item
     return {
       items: [{ items_desc: descCol.toUpperCase(), items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }],
       needsManualEntry: false,
@@ -98,22 +99,18 @@ function classifyColumn1(col1: string): 'rf' | 'ref' | 'confiscated' | 'none' | 
   return 'ambiguous';
 }
 
-/** Convert Excel serial date number to YYYY-MM-DD, or pass through ISO string */
 function excelDateToIso(raw: any): string {
   if (!raw) return '';
   if (typeof raw === 'number') {
-    // Excel serial date: days since 1899-12-30
     const d = new Date(Math.round((raw - 25569) * 86400 * 1000));
     return d.toISOString().split('T')[0];
   }
   const s = String(raw).trim();
-  // DD/MM/YYYY
   const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
   if (dmy) {
     const y = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
     return `${y}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
   }
-  // Already ISO-ish
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
   return '';
 }
@@ -154,11 +151,7 @@ interface ParsedImportRow {
 
 function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
   if (sheetData.length < 2) return [];
-
-  // Normalize header row to lowercase, trim
   const rawHeaders = (sheetData[0] || []).map((h: any) => String(h || '').toLowerCase().trim());
-
-  // Column aliases (handle both old and new header variants)
   const headerAliases: Record<string, string[]> = {
     'os no':           ['os no', 'os_no', 'os number', 's.no'],
     'os date':         ['os date', 'os_date', 'date'],
@@ -183,8 +176,6 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
     'export/import':             ['export/import', 'case_type'],
     'column 1':                  ['column 1', 'column1', 'col1', 'confiscation type'],
   };
-
-  // Build a resolved col-index map
   const colMap: Record<string, number> = {};
   for (const [canonical, aliases] of Object.entries(headerAliases)) {
     for (const alias of aliases) {
@@ -192,7 +183,6 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
       if (idx >= 0) { colMap[canonical] = idx; break; }
     }
   }
-
   const getCol = (row: any[], canonical: string) => {
     const i = colMap[canonical];
     return i !== undefined ? String(row[i] ?? '').trim() : '';
@@ -203,23 +193,16 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
     const v = row[i];
     return typeof v === 'number' ? v : parseFloat(String(v || '0').replace(/,/g, '')) || 0;
   };
-
   const results: ParsedImportRow[] = [];
-
   for (let ri = 1; ri < sheetData.length; ri++) {
     const row = sheetData[ri];
-    if (!row || row.every((c: any) => !c)) continue; // skip blank rows
-
+    if (!row || row.every((c: any) => !c)) continue;
     const warnings: string[] = [];
-
-    const os_no_raw = getCol(row, 'os no').replace(/\D/g, ''); // strip non-digits
+    const os_no_raw = getCol(row, 'os no').replace(/\D/g, '');
     if (!os_no_raw) { warnings.push('No OS No. — row skipped'); continue; }
-
-    const os_date_raw = getCol(row, 'os date');
-    const os_date = excelDateToIso(colMap['os date'] !== undefined ? row[colMap['os date']] : os_date_raw);
+    const os_date = excelDateToIso(colMap['os date'] !== undefined ? row[colMap['os date']] : '');
     if (!os_date) warnings.push('Could not parse OS Date');
     const os_year = os_date ? parseInt(os_date.split('-')[0]) : new Date().getFullYear();
-
     const descRaw = getCol(row, 'item description');
     const qtyRaw  = getCol(row, 'quantity');
     const { items, needsManualEntry } = descRaw
@@ -227,69 +210,47 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
       : { items: [], needsManualEntry: false };
     if (items.length === 0) warnings.push('No item description found');
     if (needsManualEntry) warnings.push('Item descriptions need review — confirm items before importing');
-
-    // Distribute total value across items proportionally if we have a total
     const totalValue = getColNum(row, 'value in rs.');
-    if (items.length === 1) {
-      items[0].items_value = totalValue;
-    } else if (items.length > 1) {
-      // Equal split — value per item
+    if (items.length === 1) items[0].items_value = totalValue;
+    else if (items.length > 1) {
       const perItem = Math.round((totalValue / items.length) * 100) / 100;
       items.forEach(itm => { itm.items_value = perItem; });
     }
-
-    const rfRefRaw = getColNum(row, 'rf/r.e.f');
-    const col1     = getCol(row, 'column 1');
+    const rfRefRaw  = getColNum(row, 'rf/r.e.f');
+    const col1      = getCol(row, 'column 1');
     const rfRefType = classifyColumn1(col1);
     if (rfRefType === 'ambiguous') warnings.push('RF/REF type ambiguous — please select below');
     // 'none' gets no warning — expected for AIU cases
-
     let rf_amount = 0, ref_amount = 0, confiscated_value = 0;
-    if (rfRefType === 'rf')          rf_amount = rfRefRaw;
-    else if (rfRefType === 'ref')    ref_amount = rfRefRaw;
+    if (rfRefType === 'rf')               rf_amount = rfRefRaw;
+    else if (rfRefType === 'ref')         ref_amount = rfRefRaw;
     else if (rfRefType === 'confiscated') confiscated_value = rfRefRaw;
-
-    // BR entries
     const brNo   = getCol(row, 'b.r no');
     const brDate = excelDateToIso(colMap['b.r date'] !== undefined ? row[colMap['b.r date']] : '');
-    const post_adj_br_entries = brNo
-      ? JSON.stringify([{ no: brNo, date: brDate || null }])
-      : '';
-
-    const fileSpotRaw = getCol(row, 'file / spot -adjudication').toLowerCase();
-    const file_spot = fileSpotRaw.includes('file') ? 'File' : 'Spot';
-
-    const caseTypeRaw = getCol(row, 'export/import').toLowerCase();
-    const case_type = caseTypeRaw.includes('export') ? 'Export Case' : 'Arrival Case';
-
-    const adjDesigRaw = getCol(row, 'adjudicated by jc/adc').toLowerCase();
+    const post_adj_br_entries = brNo ? JSON.stringify([{ no: brNo, date: brDate || null }]) : '';
+    const fileSpotRaw  = getCol(row, 'file / spot -adjudication').toLowerCase();
+    const file_spot    = fileSpotRaw.includes('file') ? 'File' : 'Spot';
+    const caseTypeRaw  = getCol(row, 'export/import').toLowerCase();
+    const case_type    = caseTypeRaw.includes('export') ? 'Export Case' : 'Arrival Case';
+    const adjDesigRaw  = getCol(row, 'adjudicated by jc/adc').toLowerCase();
     const adj_offr_designation = adjDesigRaw.includes('jc') ? 'JC'
       : adjDesigRaw.includes('adc') ? 'ADC'
-      : adjDesigRaw.includes('ac') ? 'AC'
-      : adjDesigRaw.includes('dc') ? 'DC'
+      : adjDesigRaw.includes('ac')  ? 'AC'
+      : adjDesigRaw.includes('dc')  ? 'DC'
       : getCol(row, 'adjudicated by jc/adc');
-
     results.push({
-      sno:             ri,
-      os_no:           os_no_raw,
-      os_date,
-      os_year,
+      sno: ri, os_no: os_no_raw, os_date, os_year,
       booked_by:       getCol(row, 'batch / aiu') || 'BATCH A',
       flight_no:       getCol(row, 'flt no').toUpperCase(),
       pax_name:        getCol(row, 'pax name').toUpperCase(),
       pax_nationality: getCol(row, 'nationality').toUpperCase(),
       passport_no:     getCol(row, 'passport no.').toUpperCase(),
       pax_address1:    getCol(row, 'address').toUpperCase(),
-      file_spot,
-      case_type,
-      items,
+      file_spot, case_type, items,
       total_items_value: totalValue,
       total_duty_amount: getColNum(row, 'duty in rs'),
       total_payable:     getColNum(row, 'total'),
-      rf_amount,
-      ref_amount,
-      pp_amount:         getColNum(row, 'penalty'),
-      confiscated_value,
+      rf_amount, ref_amount, pp_amount: getColNum(row, 'penalty'), confiscated_value,
       adj_offr_name:     getCol(row, 'adjudicated by ac/dc').toUpperCase(),
       adj_offr_designation,
       adjudication_date: os_date,
@@ -300,7 +261,6 @@ function parseExcelRows(sheetData: any[][]): ParsedImportRow[] {
       warnings,
     });
   }
-
   return results;
 }
 
@@ -458,8 +418,8 @@ interface ItemEditPanelProps {
 }
 const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, penalty, onConfirm, onCancel }: ItemEditPanelProps) {
   const seed = initialItems.length > 0
-    ? initialItems
-    : [{ items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }];
+    ? initialItems.map(itm => itm._key ? itm : { ...itm, _key: _mkItemKey() })
+    : [{ _key: _mkItemKey(), items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }];
   const [editItems, setEditItems] = useState<ParsedItem[]>(seed);
 
   const updateItem = useCallback((idx: number, field: string, value: any) => {
@@ -548,7 +508,7 @@ const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, pe
           <tbody className="divide-y divide-slate-100 bg-white">
             {editItems.map((itm, idx) => (
               <SimpleItemRow
-                key={idx}
+                key={itm._key ?? String(idx)}
                 itm={itm}
                 idx={idx}
                 rowErrors={undefined}
@@ -563,7 +523,7 @@ const ItemEditPanel = memo(function ItemEditPanel({ initialItems, totalValue, pe
       </div>
       <div className="flex items-center gap-2 mt-2 flex-wrap">
         <button type="button"
-          onClick={() => setEditItems(prev => [...prev, { items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }])}
+          onClick={() => setEditItems(prev => [...prev, { _key: _mkItemKey(), items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }])}
           className="text-xs px-2 py-1 border border-blue-300 text-blue-700 rounded hover:bg-blue-50 font-medium">
           + Add Item
         </button>
@@ -643,6 +603,7 @@ export default function OfflineAdjudicationForm() {
   });
 
   const [items, setItems] = useState<any[]>([{
+    _key: _mkItemKey(),
     items_desc: '',
     items_qty: 1,
     items_uqc: 'NOS',
@@ -698,6 +659,7 @@ export default function OfflineAdjudicationForm() {
         });
         if (d.items && d.items.length > 0) {
           setItems(d.items.map((itm: any) => ({
+            _key: _mkItemKey(),
             items_desc: itm.items_desc || '',
             items_qty: itm.items_qty ?? 1,
             items_uqc: itm.items_uqc || 'NOS',
@@ -771,9 +733,10 @@ export default function OfflineAdjudicationForm() {
     const ctrl = new AbortController();
     ppLookupAbort.current = ctrl;
     try {
-      const res = await api.post('/passports/lookup', {
-        passport_no: pp.trim().toUpperCase(),
-      }, { signal: ctrl.signal });
+      const res = await api.post('/passports/lookup',
+        { passport_no: pp.trim().toUpperCase() },
+        { signal: ctrl.signal },
+      );
       const data = res.data;
       if (!data || !data.pax_name) return;
 
@@ -950,7 +913,7 @@ export default function OfflineAdjudicationForm() {
       pax_date_of_birth: '', passport_date: '', pp_issue_place: '', father_name: '',
       residence_at: '', old_passport_no: '', case_type: 'Non-Bonafide', shift: 'Day', supdts_remarks: '',
     });
-    setItems([{ items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }]);
+    setItems([{ _key: _mkItemKey(), items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22' }]);
     setFieldErrors({});
     setItemErrors({});
     setErrorMsg('');
@@ -1419,7 +1382,7 @@ export default function OfflineAdjudicationForm() {
             <button
               type="button"
               onClick={() => setItems(prev => [...prev, {
-                items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22'
+                _key: _mkItemKey(), items_desc: '', items_qty: 1, items_uqc: 'NOS', items_value: 0, items_duty_type: 'Miscellaneous-22'
               }])}
               className="text-xs px-3 py-1.5 bg-white text-orange-700 hover:bg-orange-50 border border-orange-200 rounded font-bold flex items-center transition-colors uppercase tracking-wider"
             >
@@ -1451,7 +1414,7 @@ export default function OfflineAdjudicationForm() {
                 ) : (
                   items.map((itm, idx) => (
                     <SimpleItemRow
-                      key={idx}
+                      key={itm._key ?? String(idx)}
                       itm={itm}
                       idx={idx}
                       rowErrors={itemErrors[idx]}
@@ -1713,8 +1676,6 @@ export default function OfflineAdjudicationForm() {
                   </tbody>
                 </table>
               </div>
-
-              {/* Import action bar */}
               <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-4">
                 <div className="text-xs text-slate-500">
                   {parsedRows.filter(r => r.rfRefType === 'ambiguous' && !rowRfRefOverrides[r.sno]).length > 0 && (

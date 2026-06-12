@@ -75,6 +75,46 @@ function mergedItemPhrases(items: any[]): string[] {
   return Object.values(merged).map(m => `${fmtQty(m.qty)} ${uqcLabel(m.uqc)} of ${m.desc}`);
 }
 
+/**
+ * Format serial numbers in legal style.
+ *   [5]            → "Sl.No. 5"
+ *   [1,2]          → "Sl.Nos. 1 & 2"
+ *   [1,2,3] (consec 3+) → "Sl.Nos. 1 to 3"
+ *   [1,2,3,…,10]   → "Sl.Nos. 1 to 10"
+ *   [1,3,5,7]      → "Sl.Nos. 1, 3, 5 & 7"   (non-consec: list all)
+ *   [1,2,3,5,7]    → "Sl.Nos. 1, 2, 3, 5 & 7" (non-consec: list all)
+ */
+function formatSlNos(snos: number[]): string {
+  if (!snos.length) return '';
+  const sorted = [...new Set(snos)].sort((a, b) => a - b);
+  if (sorted.length === 1) return `Sl.No. ${sorted[0]}`;
+  const allConsec = sorted.every((n, i) => i === 0 || n === sorted[i - 1] + 1);
+  if (allConsec && sorted.length > 2)
+    return `Sl.Nos. ${sorted[0]} to ${sorted[sorted.length - 1]}`;
+  const last = sorted[sorted.length - 1];
+  return `Sl.Nos. ${sorted.slice(0, -1).join(', ')} & ${last}`;
+}
+
+/**
+ * Build the preamble line that opens each item-group block, e.g.:
+ * "With regard to the goods at Sl.Nos. 1, 2 & 3 (Mobile Phones) viz.
+ *  1 Nos. of IPHONE 17 PRO MAX 512 GB, 1 Nos. of IPHONE 17 PRO MAX 256 GB
+ *  and 1 Nos. of IPHONE 16 PRO MAX:"
+ */
+function groupPreamble(snos: number[], groupItems: any[], displayName: string): string {
+  const slRef = formatSlNos(snos);
+  const phrases = mergedItemPhrases(groupItems);
+  const typeTag = displayName ? ` (${displayName})` : '';
+  return `With regard to the goods at ${slRef}${typeTag} viz. ${joinNatural(phrases)}:`;
+}
+
+/** Derive a natural short label for mid-sentence use from statute display_name, e.g.
+ *  "Mobile Phones / Smart Phones" → "Mobile Phones" */
+function shortLabel(displayName: string, fallback: string): string {
+  if (!displayName) return fallback;
+  return displayName.split(/[/,]/)[0].trim();
+}
+
 /** Detect which contextual questions are relevant for the current item list */
 export function detectContextualQuestions(items: any[]): ContextualQuestion[] {
   const questions: ContextualQuestion[] = [];
@@ -386,7 +426,7 @@ export function useRemarksGenerator() {
       const text = buildAdjnRemark(items, context, allDutyOnly, confsItems, rfItems, refItems, dutyItems, statuteGroups, ctx);
       return truncate(text, limit);
     } catch (error: any) {
-      console.error('Remark generation error:', error);
+      if (import.meta.env.DEV) console.error('Remark generation error:', error);
       return '';
     }
   };
@@ -444,10 +484,16 @@ export function useRemarksGenerator() {
     }
     parts.push(arrPart);
 
-    // 2. ITEM DISCOVERY
-    const allPhrases = mergedItemPhrases(items);
-    if (allPhrases.length > 0) {
-      parts.push(`On examination of the baggage, the following goods were found: ${joinNatural(allPhrases)}.`);
+    // 2. ITEM DISCOVERY — list each item with its serial number
+    if (items.length > 0) {
+      const inventoryList = items.map((item: any, idx: number) => {
+        const sno = item.items_sno || (idx + 1);
+        const qty = fmtQty(item.items_qty || 1);
+        const uqc = uqcLabel(item.items_uqc || 'NOS');
+        const desc = (item.items_desc || 'goods').trim().toUpperCase();
+        return `Sl.No. ${sno} i.e. ${qty} ${uqc} of ${desc}`;
+      });
+      parts.push(`On examination of the baggage, the following goods were found: ${joinNatural(inventoryList)}.`);
     }
 
     // 3. ALL DUTY ONLY — concise remark
@@ -474,74 +520,93 @@ export function useRemarksGenerator() {
       return parts.join(' ');
     }
 
-    // 4. PROHIBITED ITEMS — legal clause + contextual remarks
+    // 4. PROHIBITED ITEMS — Sl.No. preamble + legal clause + contextual finding
     const prohibitedGroups = [...statuteGroups.values()].filter(g => g.statute.is_prohibited);
     for (const grp of prohibitedGroups) {
       const relevant = grp.items.filter(i => !isDuty(i));
       if (relevant.length === 0) continue;
+      const grpSnos = grp.indices.map(idx => items[idx]?.items_sno || (idx + 1));
+      const slRef   = formatSlNos(grpSnos);
 
-      // Cigarettes with COTPA-specific handling
       if (grp.statute.keyword === 'cigarette') {
         const cigPhrases = mergedItemPhrases(relevant);
         const hasCotpa = answers.cigarettes_has_cotpa_warning;
+        // Preamble identifying these items
+        parts.push(groupPreamble(grpSnos, relevant, grp.statute.display_name || 'Cigarettes/Tobacco Products'));
         if (hasCotpa === false) {
-          // No COTPA warning — stricter language
           parts.push(
-            `The ${joinNatural(cigPhrases)} were examined and found to be without the mandatory pictorial health warning as prescribed under Section 7 of the Cigarettes and Other Tobacco Products (Prohibition of Advertisement and Regulation of Trade and Commerce, Production, Supply and Distribution) Act, 2003 (COTPA). ` +
-            `The import of cigarettes/tobacco products without such statutory warning is strictly prohibited in terms of the COTPA Rules, 2004 read with DGFT policy. ` +
-            `The said goods are therefore absolutely prohibited and are liable for confiscation.`
+            `The aforesaid goods were examined and found to be without the mandatory pictorial health warning as prescribed under Section 7 of the Cigarettes and Other Tobacco Products (Prohibition of Advertisement and Regulation of Trade and Commerce, Production, Supply and Distribution) Act, 2003 (COTPA). ` +
+            `The import of cigarettes/tobacco products without such statutory warning is strictly prohibited in terms of the COTPA Rules, 2004 read with applicable DGFT policy. ` +
+            `The aforesaid goods at ${slRef} are therefore absolutely prohibited from import and are liable for confiscation under the applicable provisions.`
           );
         } else {
-          // Has COTPA warning or unknown — standard commercial quantity language
           parts.push(grp.statute.supdt_goods_clause);
-          parts.push(`The quantity of ${joinNatural(cigPhrases)} found is in commercial quantity and far exceeds the permissible free allowance of 100 Sticks under the Baggage Rules, 2016, and hence the same cannot be considered as bonafide baggage.`);
+          parts.push(`The total quantity of ${joinNatural(cigPhrases)} found in the baggage is in commercial quantity, far exceeding the permissible free allowance of 100 Sticks under the Baggage Rules, 2016, and hence the same cannot be considered as bonafide baggage.`);
         }
       } else {
+        parts.push(groupPreamble(grpSnos, relevant, grp.statute.display_name || ''));
         parts.push(grp.statute.supdt_goods_clause);
         if (grp.statute.keyword !== 'narcotic' && grp.statute.keyword !== 'poppy') {
           parts.push(isExport
-            ? `The said goods are being attempted to be exported without proper export authorization/permit.`
-            : `The said goods are in commercial quantity and hence cannot be considered as bonafide baggage.`
+            ? `The aforesaid goods at ${slRef} are being attempted to be exported without valid export authorization/permit, in contravention of applicable Customs and DGFT regulations.`
+            : `The aforesaid goods at ${slRef} are in commercial quantity and exceed the permissible limits under the Baggage Rules, 2016, and hence the same cannot be considered as bonafide baggage.`
           );
         }
       }
     }
 
     // 5. OVER-ALLOWANCE / DUTIABLE ITEMS — FA deduction detail
-    const nonProhibitedGroups = [...statuteGroups.values()].filter(g => !g.statute.is_prohibited);
-    for (const grp of nonProhibitedGroups) {
+    // Merge groups sharing the same supdt_goods_clause; track Sl.Nos. for each.
+    const _npMerged = new Map<string, { statute: Statute; items: any[]; snos: number[] }>();
+    for (const grp of [...statuteGroups.values()].filter(g => !g.statute.is_prohibited)) {
+      const key = grp.statute.supdt_goods_clause || grp.statute.keyword;
+      if (!_npMerged.has(key)) _npMerged.set(key, { statute: grp.statute, items: [], snos: [] });
+      _npMerged.get(key)!.items.push(...grp.items);
+      _npMerged.get(key)!.snos.push(...grp.indices.map(idx => items[idx]?.items_sno || (idx + 1)));
+    }
+
+    for (const grp of _npMerged.values()) {
       const relevant = grp.items.filter(i => !isDuty(i));
       if (relevant.length === 0 && grp.items.some(isDuty)) continue;
 
       const allGroupItems = grp.items;
-      const totalQty = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_qty || 1), 0);
+      const grpSnos  = grp.snos;
+      const slRef    = formatSlNos(grpSnos);
+      const typeLabel = shortLabel(grp.statute.display_name, '');
+      // In mid-sentence: use type label ("the said Mobile Phones") or generic fallback
+      const descLabel = allGroupItems.length === 1
+        ? (allGroupItems[0].items_desc || 'goods').trim()
+        : typeLabel ? `the said ${typeLabel}` : 'the aforesaid goods';
+
+      const totalQty  = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_qty || 1), 0);
       const totalFaQty = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_fa_qty || 0), 0);
-      const hasFaQty = totalFaQty > 0 && allGroupItems.some(i => (i.items_fa_type || 'value') === 'qty');
+      const hasFaQty  = totalFaQty > 0 && allGroupItems.some(i => (i.items_fa_type || 'value') === 'qty');
       const totalFaVal = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_fa || 0), 0);
-      const desc = (allGroupItems[0].items_desc || 'goods').trim();
-      const uqc = uqcLabel(allGroupItems[0].items_uqc || 'NOS');
-      const totalVal = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_value || 0), 0);
+      const uqc       = uqcLabel(allGroupItems[0].items_uqc || 'NOS');
+      const totalVal  = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_value || 0), 0);
+
+      // Preamble — identifies items by Sl.No. before the legal analysis
+      parts.push(groupPreamble(grpSnos, relevant.length > 0 ? relevant : allGroupItems, grp.statute.display_name || ''));
 
       if (hasFaQty && totalFaQty > 0) {
         const excess = Math.max(0, totalQty - totalFaQty);
         parts.push(
-          `Out of the total ${fmtQty(totalQty)} ${uqc} of ${desc} brought by the pax, a free allowance of ${fmtQty(totalFaQty)} ${uqc} is admissible under the Baggage Rules, 2016. ` +
+          `Out of the total ${fmtQty(totalQty)} ${uqc} of ${descLabel} brought by the pax, a free allowance of ${fmtQty(totalFaQty)} ${uqc} is admissible under the Baggage Rules, 2016. ` +
           (excess > 0
-            ? `The remaining ${fmtQty(excess)} ${uqc} of ${desc}, valued at approximately Rs. ${Math.round(totalVal * excess / totalQty).toLocaleString('en-IN')}/-, exceeds the permissible free allowance and is commercial in nature and non-bonafide baggage.`
-            : ``)
+            ? `The remaining ${fmtQty(excess)} ${uqc} of ${descLabel} at ${slRef}, valued at approximately Rs. ${Math.round(totalVal * excess / totalQty).toLocaleString('en-IN')}/-, exceeds the permissible free allowance and is of commercial nature and non-bonafide baggage.`
+            : `The aforesaid goods at ${slRef} fall entirely within the permissible free allowance.`)
         );
       } else if (totalFaVal > 0) {
         const excessVal = Math.max(0, totalVal - totalFaVal);
         parts.push(
-          `Out of the total value of Rs. ${Math.round(totalVal).toLocaleString('en-IN')}/- of ${desc} brought by the pax, a free allowance of Rs. ${Math.round(totalFaVal).toLocaleString('en-IN')}/- is admissible under the Baggage Rules, 2016. ` +
+          `Out of the total assessed value of Rs. ${Math.round(totalVal).toLocaleString('en-IN')}/- in respect of ${descLabel} at ${slRef}, a free allowance of Rs. ${Math.round(totalFaVal).toLocaleString('en-IN')}/- is admissible under the Baggage Rules, 2016. ` +
           (excessVal > 0
-            ? `The remaining value of Rs. ${Math.round(excessVal).toLocaleString('en-IN')}/- exceeds the permissible free allowance and is therefore dutiable.`
-            : `The goods fall entirely within the free allowance.`)
+            ? `The excess value of Rs. ${Math.round(excessVal).toLocaleString('en-IN')}/- beyond the permissible free allowance is liable to Customs duty as applicable.`
+            : `The aforesaid goods fall entirely within the permissible free allowance under the Baggage Rules, 2016.`)
         );
       } else if (relevant.length > 0) {
-        // No FA at all — commercial goods
         parts.push(grp.statute.supdt_goods_clause);
-        parts.push(`The said goods are commercial in nature and not bonafide baggage.`);
+        parts.push(`The aforesaid goods at ${slRef} are of commercial nature and non-bonafide, being in excess of the permissible limits under the Baggage Rules, 2016 and cannot be considered as bonafide baggage.`);
       }
     }
 
@@ -590,12 +655,18 @@ export function useRemarksGenerator() {
       'Translated vernacularly as understood.'
     );
 
-    // 2. PAX STATEMENT — what pax claimed
-    const allPhrases = mergedItemPhrases(items);
-    if (allPhrases.length > 0) {
+    // 2. PAX STATEMENT — what pax claimed, with Sl.No. references
+    if (items.length > 0) {
+      const inventoryList = items.map((item: any, idx: number) => {
+        const sno = item.items_sno || (idx + 1);
+        const qty = fmtQty(item.items_qty || 1);
+        const uqc = uqcLabel(item.items_uqc || 'NOS');
+        const desc = (item.items_desc || 'goods').trim().toUpperCase();
+        return `Sl.No. ${sno} i.e. ${qty} ${uqc} of ${desc}`;
+      });
       parts.push(isExport
-        ? `The pax stated that the ${joinNatural(allPhrases)} were being carried for personal use and were not meant for commercial purposes.`
-        : `The pax stated that the ${joinNatural(allPhrases)} were brought by him/her for personal use and were not meant for commercial purposes.`
+        ? `The pax stated that the goods viz. ${joinNatural(inventoryList)} were being carried for personal/bonafide use and were not intended for commercial purposes.`
+        : `The pax stated that the goods viz. ${joinNatural(inventoryList)} were brought by him/her for personal/bonafide use and were not intended for commercial purposes.`
       );
     }
 
@@ -631,71 +702,90 @@ export function useRemarksGenerator() {
       return parts.join(' ');
     }
 
-    // 4. LEGAL FINDINGS — for each prohibited item group
+    // 4. LEGAL FINDINGS — Sl.No. preamble + clause for each prohibited group
     const prohibitedGroups = [...statuteGroups.values()].filter(g => g.statute.is_prohibited);
     for (const grp of prohibitedGroups) {
       const relevant = grp.items.filter(i => !isDuty(i));
       if (relevant.length === 0) continue;
-      const itemPhrases = mergedItemPhrases(relevant);
+      const grpSnos = grp.indices.map(idx => items[idx]?.items_sno || (idx + 1));
+      const slRef   = formatSlNos(grpSnos);
 
       if (grp.statute.keyword === 'cigarette') {
         const hasCotpa = answers.cigarettes_has_cotpa_warning;
+        parts.push(groupPreamble(grpSnos, relevant, grp.statute.display_name || 'Cigarettes/Tobacco Products'));
         if (hasCotpa === false) {
           parts.push(
-            `The ${joinNatural(itemPhrases)} found were examined and were without the mandatory statutory pictorial health warning as prescribed under Section 7 of the COTPA Act, 2003. ` +
+            `The aforesaid goods were examined and found to be without the mandatory statutory pictorial health warning as prescribed under Section 7 of the Cigarettes and Other Tobacco Products Act, 2003 (COTPA). ` +
             `The import of cigarettes/tobacco products not bearing the statutory warning is absolutely prohibited in terms of the COTPA Rules, 2004. ` +
-            `The pax's claim of personal use is not accepted as the goods are in excess of reasonable personal consumption and are absolutely prohibited from import in this form. ` +
-            `No free allowance is admissible on goods that are absolutely prohibited.`
+            `The pax's claim of personal/bonafide use is not accepted as the aforesaid goods are absolutely prohibited from import in this form. ` +
+            `No free allowance is admissible on goods that are absolutely prohibited from import.`
           );
         } else {
           parts.push(grp.statute.adjn_goods_clause);
-          // Check if there's excess beyond FA
-          const totalQty = relevant.reduce((s: number, i: any) => s + Number(i.items_qty || 1), 0);
+          const totalQty  = relevant.reduce((s: number, i: any) => s + Number(i.items_qty || 1), 0);
           const totalFaQty = relevant.reduce((s: number, i: any) => s + Number(i.items_fa_qty || 0), 0);
           if (totalFaQty > 0 && totalQty > totalFaQty) {
             const excess = totalQty - totalFaQty;
             const uqc = uqcLabel(relevant[0].items_uqc || 'STK');
+            const cigLabel = relevant.length === 1 ? (relevant[0].items_desc || 'Cigarettes') : 'the cigarettes/tobacco products';
             parts.push(
-              `Out of the total ${fmtQty(totalQty)} ${uqc}, a free allowance of ${fmtQty(totalFaQty)} ${uqc} is permissible under the Baggage Rules, 2016. ` +
-              `The remaining ${fmtQty(excess)} ${uqc} of ${grp.items[0].items_desc || 'Cigarettes'} beyond the free allowance are not bonafide baggage and are in commercial quantity.`
+              `Out of the total ${fmtQty(totalQty)} ${uqc} at ${slRef}, a free allowance of ${fmtQty(totalFaQty)} ${uqc} is permissible under the Baggage Rules, 2016. ` +
+              `The remaining ${fmtQty(excess)} ${uqc} of ${cigLabel} beyond the permissible free allowance are non-bonafide and are in commercial quantity.`
             );
           }
         }
       } else {
+        parts.push(groupPreamble(grpSnos, relevant, grp.statute.display_name || ''));
         parts.push(grp.statute.adjn_goods_clause);
       }
     }
 
     // 5. NON-PROHIBITED OVER-ALLOWANCE ITEMS — FA detail in AC findings
-    const nonProhibitedGroups = [...statuteGroups.values()].filter(g => !g.statute.is_prohibited);
-    for (const grp of nonProhibitedGroups) {
+    // Same clause-merge as Supdt builder: identical adjn_goods_clause → one block.
+    const _npMergedAc = new Map<string, { statute: Statute; items: any[]; snos: number[] }>();
+    for (const grp of [...statuteGroups.values()].filter(g => !g.statute.is_prohibited)) {
+      const key = grp.statute.adjn_goods_clause || grp.statute.keyword;
+      if (!_npMergedAc.has(key)) _npMergedAc.set(key, { statute: grp.statute, items: [], snos: [] });
+      _npMergedAc.get(key)!.items.push(...grp.items);
+      _npMergedAc.get(key)!.snos.push(...grp.indices.map(idx => items[idx]?.items_sno || (idx + 1)));
+    }
+
+    for (const grp of _npMergedAc.values()) {
       const relevant = grp.items.filter(i => !isDuty(i));
       if (relevant.length === 0 && grp.items.some(isDuty)) continue;
 
       const allGroupItems = grp.items;
-      const totalQty = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_qty || 1), 0);
+      const grpSnos   = grp.snos;
+      const slRef     = formatSlNos(grpSnos);
+      const typeLabel = shortLabel(grp.statute.display_name, '');
+      const descLabel = allGroupItems.length === 1
+        ? (allGroupItems[0].items_desc || 'goods').trim()
+        : typeLabel ? `the said ${typeLabel}` : 'the aforesaid goods';
+
+      const totalQty  = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_qty || 1), 0);
       const totalFaQty = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_fa_qty || 0), 0);
-      const hasFaQty = totalFaQty > 0 && allGroupItems.some(i => (i.items_fa_type || 'value') === 'qty');
+      const hasFaQty  = totalFaQty > 0 && allGroupItems.some(i => (i.items_fa_type || 'value') === 'qty');
       const totalFaVal = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_fa || 0), 0);
-      const desc = (allGroupItems[0].items_desc || 'goods').trim();
-      const uqc = uqcLabel(allGroupItems[0].items_uqc || 'NOS');
-      const totalVal = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_value || 0), 0);
+      const uqc       = uqcLabel(allGroupItems[0].items_uqc || 'NOS');
+      const totalVal  = allGroupItems.reduce((s: number, i: any) => s + Number(i.items_value || 0), 0);
+
+      parts.push(groupPreamble(grpSnos, relevant.length > 0 ? relevant : allGroupItems, grp.statute.display_name || ''));
 
       if (hasFaQty && totalFaQty > 0) {
         const excess = Math.max(0, totalQty - totalFaQty);
         parts.push(
-          `Out of the total ${fmtQty(totalQty)} ${uqc} of ${desc} found in the baggage, a free allowance of ${fmtQty(totalFaQty)} ${uqc} is admissible under the Baggage Rules, 2016. ` +
+          `Out of the total ${fmtQty(totalQty)} ${uqc} of ${descLabel} at ${slRef}, a free allowance of ${fmtQty(totalFaQty)} ${uqc} is admissible under the Baggage Rules, 2016. ` +
           (excess > 0
-            ? `The remaining ${fmtQty(excess)} ${uqc} of ${desc}, valued at Rs. ${Math.round(totalVal * excess / totalQty).toLocaleString('en-IN')}/-, is in excess of the permissible limit and is non-bonafide in nature.`
-            : '')
+            ? `The remaining ${fmtQty(excess)} ${uqc} of ${descLabel}, valued at Rs. ${Math.round(totalVal * excess / totalQty).toLocaleString('en-IN')}/-, is in excess of the permissible limit and is non-bonafide in nature.`
+            : `The aforesaid goods at ${slRef} fall entirely within the permissible free allowance.`)
         );
       } else if (totalFaVal > 0) {
         const excessVal = Math.max(0, totalVal - totalFaVal);
         parts.push(
-          `Out of the total value of Rs. ${Math.round(totalVal).toLocaleString('en-IN')}/- of ${desc}, a free allowance of Rs. ${Math.round(totalFaVal).toLocaleString('en-IN')}/- is admissible under the Baggage Rules, 2016. ` +
+          `Out of the total assessed value of Rs. ${Math.round(totalVal).toLocaleString('en-IN')}/- in respect of ${descLabel} at ${slRef}, a free allowance of Rs. ${Math.round(totalFaVal).toLocaleString('en-IN')}/- is admissible under the Baggage Rules, 2016. ` +
           (excessVal > 0
-            ? `The balance value of Rs. ${Math.round(excessVal).toLocaleString('en-IN')}/- is dutiable.`
-            : `The goods are fully within the free allowance.`)
+            ? `The balance value of Rs. ${Math.round(excessVal).toLocaleString('en-IN')}/- is in excess of the permissible free allowance and is liable to Customs duty as applicable.`
+            : `The aforesaid goods fall entirely within the permissible free allowance under the Baggage Rules, 2016.`)
         );
       } else if (relevant.length > 0) {
         parts.push(grp.statute.adjn_goods_clause);

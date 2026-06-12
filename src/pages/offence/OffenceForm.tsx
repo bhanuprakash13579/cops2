@@ -6,6 +6,7 @@ import DatePicker from '@/components/DatePicker';
 import PassportScanner from '@/components/PassportScanner';
 import api from '@/lib/api';
 import { useRemarksGenerator, detectContextualQuestions, ContextualAnswers, ContextualQuestion } from '@/hooks/useRemarksGenerator';
+import { useAuth } from '@/contexts/AuthContext';
 
 // ── Static seed list for item-description autocomplete ───────────────────────
 // Merged at runtime with DB-fetched suggestions (most-frequent first).
@@ -54,6 +55,10 @@ const DUTY_TYPES = [
 const DUTY_TYPE_OPTIONS = DUTY_TYPES.map(type => (
   <option key={type} value={type}>{type}</option>
 ));
+
+// Monotonic counter for stable item keys — avoids key={idx} reuse on add/remove
+let _itemKeySeq = 0;
+const _mkItemKey = () => `itm-${++_itemKeySeq}`;
 
 // Module-level constants — defined once, never reallocated per render
 
@@ -510,6 +515,7 @@ export default function OffenceForm() {
 
   const isEditing = !!osNo;
   const isViewOnly = location.pathname.endsWith('/view');
+  const { user } = useAuth();
   // When the form is opened from inside the adjudication module (edit-sdo route),
   // navigate back to the adjudication case form instead of the SDO list.
   const isInAdjModule = location.pathname.startsWith('/adjudication');
@@ -562,6 +568,7 @@ export default function OffenceForm() {
   });
 
   const [items, setItems] = useState<any[]>([{
+      _key: _mkItemKey(),
       items_desc: '',
       items_qty: 1,
       items_uqc: 'NOS',
@@ -589,6 +596,66 @@ export default function OffenceForm() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [itemErrors, setItemErrors] = useState<Record<number, Record<string, string>>>({});
   const osNoCheckTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // submitDataRef: always points to the current render's submitData so the
+  // stable Ctrl+S event listener never calls a stale closure.
+  const submitDataRef = useRef<(draftValue: string) => void>(() => {});
+  const [osNoStatus, setOsNoStatus] = useState<'idle' | 'checking' | 'available' | 'taken'>('idle');
+
+  // ── Local-draft auto-save (new cases only) ──────────────────────────────────
+  // Key is scoped by username so two officers on the same machine in different
+  // tabs never overwrite each other's in-progress work.
+  const DRAFT_KEY = `cops_new_case_draft_${user?.user_id ?? 'anon'}`;
+  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [draftRestoredAt, setDraftRestoredAt] = useState<number | null>(null); // non-null = banner visible
+
+  // Offer to restore draft once auth has resolved (user_id in deps so it re-runs
+  // when the AuthContext finishes loading after mount).
+  useEffect(() => {
+    if (isEditing) return;
+    if (!user?.user_id) return; // wait until auth resolves — DRAFT_KEY is 'anon' until then
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (saved?.formData?.os_no || saved?.supdtsRemarks) {
+        setDraftRestoredAt(saved.savedAt ?? Date.now());
+      }
+    } catch { localStorage.removeItem(DRAFT_KEY); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.user_id, isEditing]);
+
+  // Auto-save silently 1.5 s after any change (new cases only)
+  useEffect(() => {
+    if (isEditing) return;
+    // Don't bother saving a completely blank form
+    const hasContent = formData.os_no || formData.pax_name || supdtsRemarks || items.some(i => i.items_desc);
+    if (!hasContent) return;
+    clearTimeout(draftSaveTimer.current);
+    draftSaveTimer.current = setTimeout(() => {
+      try {
+        localStorage.setItem(DRAFT_KEY, JSON.stringify({ savedAt: Date.now(), formData, items, supdtsRemarks }));
+      } catch { /* storage full — silently ignore */ }
+    }, 1500);
+    return () => clearTimeout(draftSaveTimer.current);
+  }, [DRAFT_KEY, formData, items, supdtsRemarks, isEditing]);
+
+  const clearDraft = () => {
+    clearTimeout(draftSaveTimer.current);
+    localStorage.removeItem(DRAFT_KEY);
+    setDraftRestoredAt(null);
+  };
+
+  const restoreDraft = () => {
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (saved.formData) setFormData(prev => ({ ...prev, ...saved.formData }));
+      if (saved.items?.length) setItems(saved.items);
+      if (saved.supdtsRemarks) setSupdtsRemarks(saved.supdtsRemarks);
+    } catch { /* ignore */ }
+    setDraftRestoredAt(null); // hide banner after restoring
+  };
 
   const setItemFieldError = useCallback((idx: number, field: string, message: string) => {
     setItemErrors(prev => ({
@@ -683,9 +750,10 @@ export default function OffenceForm() {
     const ctrl = new AbortController();
     const timer = setTimeout(async () => {
       try {
-        const res = await api.post('/passports/search', {
-          name: formData.pax_name, dob: formData.pax_date_of_birth,
-        }, { signal: ctrl.signal });
+        const res = await api.post('/passports/search',
+          { name: formData.pax_name, dob: formData.pax_date_of_birth },
+          { signal: ctrl.signal },
+        );
         const data = res.data;
         if (data.passports && data.passports.length > 0) {
           const existing = (formData.old_passport_no || '').split(';').map((s: string) => s.trim()).filter(Boolean);
@@ -748,17 +816,20 @@ export default function OffenceForm() {
   // Abort all pending classify calls on unmount
   useEffect(() => () => { Object.values(classifyAbortRefs.current).forEach(c => c.abort()); }, []);
 
-  // Ctrl+S / Cmd+S → save as draft without leaving the page
+  // Ctrl+S / Cmd+S → save as draft without leaving the page.
+  // The listener is registered once (empty deps) and stays stable across renders.
+  // It calls submitDataRef.current so it always invokes the latest submitData,
+  // never a stale closure from the first render.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        submitData('Y');
+        submitDataRef.current('Y');
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   const onDescBlur = useCallback(async (idx: number, desc: string) => {
     if (!desc || desc.trim().length < 3) return;
@@ -881,6 +952,35 @@ export default function OffenceForm() {
 
   const submitData = async (draftValue: string) => {
     setErrorMsg('');
+
+    // Block immediately if the debounced check already found a conflict.
+    // Also re-check live for cases where the user submits faster than the debounce.
+    if (!isEditing && formData.os_no && /^\d+$/.test(formData.os_no)) {
+      if (osNoStatus === 'taken') {
+        const yr = formData.os_date ? new Date(formData.os_date).getFullYear() : new Date().getFullYear();
+        setFieldErrors({ os_no: `O.S. No. ${formData.os_no}/${yr} is already taken!` });
+        setErrorMsg('O.S. No. already taken — please use a different number.');
+        document.getElementById('field-os_no')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
+      // If still checking or idle (user submitted before debounce fired) — do a fresh check now
+      if (osNoStatus === 'checking' || osNoStatus === 'idle') {
+        try {
+          const yr = formData.os_date ? new Date(formData.os_date).getFullYear() : new Date().getFullYear();
+          setOsNoStatus('checking');
+          const { data: checkResult } = await api.get('/os/check-os-no', { params: { os_no: formData.os_no, os_year: yr } });
+          if (checkResult.exists) {
+            setOsNoStatus('taken');
+            setFieldErrors({ os_no: `O.S. No. ${formData.os_no}/${yr} is already taken!` });
+            setErrorMsg('O.S. No. already taken — please use a different number.');
+            document.getElementById('field-os_no')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return;
+          }
+          setOsNoStatus('available');
+        } catch { /* network error — proceed, backend will enforce */ }
+      }
+    }
+
     setFieldErrors({});
     setItemErrors({});
 
@@ -1061,6 +1161,7 @@ export default function OffenceForm() {
             ? api.put(`/os/${osNo}/${osYear}`, finalPayload)
             : api.post('/os', finalPayload));
 
+        clearDraft();
         navigate(goBackPath);
 
     } catch(err: any) {
@@ -1070,11 +1171,22 @@ export default function OffenceForm() {
         } else if (typeof errMsg === 'object') {
             errMsg = JSON.stringify(errMsg);
         }
+        // 409 Conflict = OS number race condition — surface it on the field, not just the banner
+        if (err.response?.status === 409 || (typeof errMsg === 'string' && errMsg.toLowerCase().includes('already'))) {
+            setOsNoStatus('taken');
+            setFieldErrors(prev => ({ ...prev, os_no: errMsg }));
+            document.getElementById('field-os_no')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
         setErrorMsg(errMsg);
     } finally {
         setIsSubmitting(false);
     }
   };
+
+  // Keep submitDataRef in sync with the current render's submitData so the
+  // stable Ctrl+S listener always calls the latest version (no stale closure).
+  // No deps = runs after every render, negligible cost.
+  useEffect(() => { submitDataRef.current = submitData; });
 
   const handleScan = useCallback((scanData: any) => {
     if (scanData.type === 'PASSPORT') {
@@ -1120,6 +1232,32 @@ export default function OffenceForm() {
 
   return (
     <div className="space-y-4 w-full pb-20">
+      {/* Draft restore banner — shown once on load if unsaved work exists */}
+      {draftRestoredAt !== null && !isEditing && (
+        <div className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-300 rounded-lg px-4 py-2.5 text-sm text-amber-800">
+          <span>
+            You have unsaved work from{' '}
+            {(() => {
+              const mins = Math.round((Date.now() - draftRestoredAt) / 60000);
+              return mins < 1 ? 'just now' : `${mins} minute${mins === 1 ? '' : 's'} ago`;
+            })()}.
+          </span>
+          <div className="flex gap-2 shrink-0">
+            <button
+              onClick={restoreDraft}
+              className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold"
+            >
+              Restore
+            </button>
+            <button
+              onClick={clearDraft}
+              className="px-3 py-1 bg-white hover:bg-amber-100 border border-amber-300 text-amber-700 rounded text-xs font-semibold"
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
       {/* Header Panel */}
       <div className="flex justify-between items-center bg-white px-4 py-3 border-b border-slate-200 rounded-xl border">
         <div className="flex items-center space-x-4">
@@ -1220,6 +1358,7 @@ export default function OffenceForm() {
                                   setFormData(prev => ({ ...prev, os_no: sanitized }));
 
                                   if (!sanitized) {
+                                    setOsNoStatus('idle');
                                     setFieldError('os_no', 'O.S. No. is required.');
                                     return;
                                   }
@@ -1231,13 +1370,20 @@ export default function OffenceForm() {
 
                                   // Debounced uniqueness check — waits 500ms after user stops typing
                                   if (!isEditing) {
+                                    setOsNoStatus('idle');
                                     clearTimeout(osNoCheckTimer.current);
                                     osNoCheckTimer.current = setTimeout(async () => {
                                       try {
                                         const yr = formData.os_date ? new Date(formData.os_date).getFullYear() : new Date().getFullYear();
+                                        setOsNoStatus('checking');
                                         const { data: result } = await api.get('/os/check-os-no', { params: { os_no: sanitized, os_year: yr } });
-                                        if (result.exists) setFieldError('os_no', `O.S. No. ${sanitized}/${yr} already exists!`);
-                                      } catch { /* ignore network errors */ }
+                                        if (result.exists) {
+                                          setOsNoStatus('taken');
+                                          setFieldError('os_no', `O.S. No. ${sanitized}/${yr} is already taken!`);
+                                        } else {
+                                          setOsNoStatus('available');
+                                        }
+                                      } catch { setOsNoStatus('idle'); }
                                     }, 500);
                                   }
                                 }}
@@ -1245,13 +1391,45 @@ export default function OffenceForm() {
                             {fieldErrors.os_no && (
                               <p className="mt-1 text-xs font-semibold text-red-600">{fieldErrors.os_no}</p>
                             )}
+                            {!fieldErrors.os_no && !isEditing && osNoStatus === 'checking' && (
+                              <p className="mt-1 text-xs text-slate-500 flex items-center gap-1">
+                                <span className="inline-block w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+                                Checking…
+                              </p>
+                            )}
+                            {!fieldErrors.os_no && !isEditing && osNoStatus === 'available' && (
+                              <p className="mt-1 text-xs font-semibold text-green-600">✓ Available</p>
+                            )}
                         </div>
                         <div>
                             <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">O.S. Date</label>
                             <DatePicker
                                 id="field-os_date"
                                 value={formData.os_date}
-                                onChange={isoDate => setFormData({ ...formData, os_date: isoDate })}
+                                onChange={isoDate => {
+                                  setFormData({ ...formData, os_date: isoDate });
+                                  // Year may have changed — the previous availability result is no longer valid
+                                  if (!isEditing && formData.os_no && /^\d+$/.test(formData.os_no)) {
+                                    setOsNoStatus('idle');
+                                    clearFieldError('os_no');
+                                    clearTimeout(osNoCheckTimer.current);
+                                    // Capture os_no NOW (before the async gap) to avoid stale closure
+                                    const _osNo = formData.os_no;
+                                    osNoCheckTimer.current = setTimeout(async () => {
+                                      try {
+                                        const yr = isoDate ? new Date(isoDate).getFullYear() : new Date().getFullYear();
+                                        setOsNoStatus('checking');
+                                        const { data: result } = await api.get('/os/check-os-no', { params: { os_no: _osNo, os_year: yr } });
+                                        if (result.exists) {
+                                          setOsNoStatus('taken');
+                                          setFieldError('os_no', `O.S. No. ${_osNo}/${yr} is already taken!`);
+                                        } else {
+                                          setOsNoStatus('available');
+                                        }
+                                      } catch { setOsNoStatus('idle'); }
+                                    }, 400);
+                                  }
+                                }}
                                 inputClassName="w-full px-3 py-2 bg-slate-50 border border-slate-300 focus:ring-brand-500 rounded focus:ring-2 text-sm"
                                 error={!!fieldErrors.os_date}
                             />
@@ -1508,7 +1686,7 @@ export default function OffenceForm() {
                     <FileText className="mr-2 text-orange-500" size={16} /> Seized Goods Registration
                 </h2>
                 <button 
-                   onClick={(e) => { e.preventDefault(); setItems([...items, { items_desc: '', items_qty: 1, items_uqc: 'NOS', value_per_piece: 0, items_value: 0, items_fa: 0, items_fa_type: 'value', items_fa_qty: 0, items_fa_uqc: 'NOS', cumulative_duty_rate: 35, items_duty: 0, items_release_category: '', items_duty_type: 'Miscellaneous-22'}]); }}
+                   onClick={(e) => { e.preventDefault(); setItems([...items, { _key: _mkItemKey(), items_desc: '', items_qty: 1, items_uqc: 'NOS', value_per_piece: 0, items_value: 0, items_fa: 0, items_fa_type: 'value', items_fa_qty: 0, items_fa_uqc: 'NOS', cumulative_duty_rate: 35, items_duty: 0, items_release_category: '', items_duty_type: 'Miscellaneous-22'}]); }}
                    className="text-xs px-3 py-1.5 bg-white text-orange-700 hover:bg-orange-50 border border-orange-200 rounded font-bold flex items-center transition-colors uppercase tracking-wider">
                     <Plus size={14} className="mr-1" /> Add Item
                 </button>
@@ -1540,7 +1718,7 @@ export default function OffenceForm() {
                         ) : (
                             items.map((itm, idx) => (
                                 <ItemRow
-                                    key={idx}
+                                    key={itm._key ?? String(idx)}
                                     itm={itm}
                                     idx={idx}
                                     rowErrors={itemErrors[idx]}
