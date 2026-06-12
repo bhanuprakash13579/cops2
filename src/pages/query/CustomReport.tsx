@@ -300,14 +300,17 @@ function ColSortIcon({ col, sortCol, sortDir }: { col: string; sortCol: string |
     : <ArrowDown size={10} className="ml-1 text-emerald-600" />;
 }
 
-/** Render a cell value. Item cells with \n are split into stacked sub-rows. */
+/** Render a cell value. Item cells with \n are split into numbered sub-rows. */
 function ItemCell({ value }: { value: string }) {
   const parts = value.split('\n');
   if (parts.length <= 1) return <span>{value || '—'}</span>;
   return (
-    <div className="divide-y divide-amber-100 -my-1">
+    <div className="divide-y divide-slate-200 -my-1">
       {parts.map((p, i) => (
-        <div key={i} className="py-0.5 text-xs">{p || '—'}</div>
+        <div key={i} className="py-0.5 text-xs flex items-baseline gap-1">
+          <span className="text-slate-400 shrink-0 tabular-nums select-none">{i + 1}.</span>
+          <span>{p || '—'}</span>
+        </div>
       ))}
     </div>
   );
