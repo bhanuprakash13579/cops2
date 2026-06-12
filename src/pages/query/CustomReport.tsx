@@ -129,9 +129,17 @@ const ITEM_GROUP: { group: string; cols: ColDef[] } = {
 
 // ── Excel-upload helpers ──────────────────────────────────────────────────────
 
-interface ParsedOsRow { os_no: string; os_year: number; rowNum: number }
+interface ParsedOsRow {
+  os_no: string;
+  os_year: number | null;  // null when year column is blank — backend resolves via name
+  pax_name?: string;
+  rowNum: number;
+  originalCols: Record<string, string>;  // all original Excel columns (for merged download)
+}
 
-async function parseExcelOsList(file: File): Promise<{ rows: ParsedOsRow[]; errors: string[] }> {
+async function parseExcelOsList(file: File): Promise<{
+  rows: ParsedOsRow[]; errors: string[]; hasName: boolean; originalKeys: string[];
+}> {
   const XLSX = await import('xlsx');
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: 'array' });
@@ -139,33 +147,112 @@ async function parseExcelOsList(file: File): Promise<{ rows: ParsedOsRow[]; erro
   const raw: Record<string, unknown>[] = XLSX.utils.sheet_to_json(ws, { defval: '' });
   const rows: ParsedOsRow[] = [];
   const errors: string[] = [];
+  const originalKeys = raw.length > 0 ? Object.keys(raw[0]) : [];
 
   // Detect column names case-insensitively
-  const sampleKeys = raw.length > 0 ? Object.keys(raw[0]) : [];
   const findKey = (candidates: string[]) =>
-    sampleKeys.find(k => candidates.some(c => k.trim().toLowerCase() === c.toLowerCase())) ?? null;
+    originalKeys.find(k => candidates.some(c => k.trim().toLowerCase() === c.toLowerCase())) ?? null;
 
   const osNoKey  = findKey(['os_no', 'os no', 'osno', 'os.no', 'os.no.', 'os number', 'os_number']);
   const osYrKey  = findKey(['os_year', 'os year', 'year', 'os yr', 'osyear']);
+  // Passenger name is optional — used to resolve year when it's missing
+  const nameKey  = findKey(['pax_name', 'pax name', 'passenger name', 'passenger', 'name', 'pax']);
 
-  if (!osNoKey || !osYrKey) {
-    return { rows: [], errors: [`Could not find required columns. Expected headers: OS_NO and OS_YEAR (found: ${sampleKeys.join(', ')})`] };
+  if (!osNoKey) {
+    return { rows: [], errors: [`Could not find OS_NO column (found: ${originalKeys.join(', ')})`], hasName: false, originalKeys };
   }
 
+  let yearMissingCount = 0;
   raw.forEach((r, idx) => {
-    const rowNum = idx + 2; // 1-based + header row
+    const rowNum = idx + 2;
     const rawNo = String(r[osNoKey] ?? '').trim();
-    const rawYr = String(r[osYrKey] ?? '').trim();
-    if (!rawNo || !rawYr) return; // skip blank rows silently
-    const yr = parseInt(rawYr, 10);
-    if (isNaN(yr) || yr < 1990 || yr > 2099) {
-      errors.push(`Row ${rowNum}: invalid year "${rawYr}"`);
-      return;
+    if (!rawNo) return; // skip blank rows
+
+    const rawYr = osYrKey ? String(r[osYrKey] ?? '').trim() : '';
+    const rawName = nameKey ? String(r[nameKey] ?? '').trim() : '';
+
+    let yr: number | null = null;
+    if (rawYr) {
+      const parsed = parseInt(rawYr, 10);
+      if (isNaN(parsed) || parsed < 1990 || parsed > 2099) {
+        errors.push(`Row ${rowNum}: invalid year "${rawYr}"`);
+        return;
+      }
+      yr = parsed;
+    } else {
+      yearMissingCount++;
     }
-    rows.push({ os_no: rawNo, os_year: yr, rowNum });
+
+    // Capture all original columns for merged-download
+    const originalCols: Record<string, string> = {};
+    for (const k of originalKeys) originalCols[k] = String(r[k] ?? '');
+
+    rows.push({ os_no: rawNo, os_year: yr, pax_name: rawName || undefined, rowNum, originalCols });
   });
 
-  return { rows, errors };
+  if (yearMissingCount > 0) {
+    const hint = nameKey ? 'will try to resolve using passenger name' : 'add a PAX_NAME column to help resolve these';
+    errors.push(`${yearMissingCount} row${yearMissingCount !== 1 ? 's' : ''} missing OS_YEAR — ${hint}`);
+  }
+
+  return { rows, errors, hasName: !!nameKey, originalKeys };
+}
+
+/** Download merged XLSX: original Excel columns + selected DB columns appended. */
+async function exportXlsxMerged(
+  originalKeys: string[],
+  parsedRows: ParsedOsRow[],
+  dbResult: {
+    columns: string[];
+    rows: Record<string, string>[];
+    resolved_by_name?: { os_no: string; resolved_year: number }[];
+  },
+  colLabels: Record<string, string>,
+) {
+  const XLSX = await import('xlsx');
+
+  // Lookup: "os_no||os_year_str" → db row
+  const dbMap = new Map<string, Record<string, string>>();
+  for (const row of dbResult.rows) {
+    dbMap.set(`${row.os_no ?? ''}||${row.os_year ?? ''}`, row);
+  }
+  // Fuzzy-resolved year map: os_no → resolved_year
+  const resolvedMap = new Map<string, number>();
+  for (const r of (dbResult.resolved_by_name ?? [])) resolvedMap.set(r.os_no, r.resolved_year);
+
+  const dbCols = dbResult.columns;
+  const outRows = parsedRows.map(xlRow => {
+    const out: Record<string, string> = {};
+    for (const k of originalKeys) out[k] = xlRow.originalCols[k] ?? '';
+    const dbYear = xlRow.os_year ?? resolvedMap.get(xlRow.os_no) ?? null;
+    const dbRow  = dbYear != null ? dbMap.get(`${xlRow.os_no}||${dbYear}`) : undefined;
+    for (const col of dbCols) out[colLabels[col] ?? col] = dbRow?.[col] ?? '';
+    return out;
+  });
+
+  const headers = [...originalKeys, ...dbCols.map(c => colLabels[c] ?? c)];
+  const ws = XLSX.utils.json_to_sheet(outRows, { header: headers });
+  const wb2 = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb2, ws, 'Report');
+
+  const defaultName = `cops_report_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  try {
+    const { save } = await import('@tauri-apps/plugin-dialog');
+    const { writeFile } = await import('@tauri-apps/plugin-fs');
+    const savePath = await save({ title: 'Save Enhanced Report', defaultPath: defaultName, filters: [{ name: 'Excel', extensions: ['xlsx'] }] });
+    if (savePath) {
+      const xbuf: ArrayBuffer = XLSX.write(wb2, { type: 'array', bookType: 'xlsx' });
+      await writeFile(savePath, new Uint8Array(xbuf));
+      showDownloadToast(`Report saved to ${savePath}`);
+    }
+  } catch {
+    const xbuf: ArrayBuffer = XLSX.write(wb2, { type: 'array', bookType: 'xlsx' });
+    const blob = new Blob([xbuf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = defaultName; a.click();
+    URL.revokeObjectURL(url);
+    showDownloadToast(`Report downloaded as ${defaultName}`);
+  }
 }
 
 // These 3 are always auto-included when any item column is selected.
@@ -247,17 +334,24 @@ export default function CustomReport() {
   const [filterItemDesc,   setFilterItemDesc]   = useState('');
 
   const [loading, setLoading]   = useState(false);
-  const [result, setResult]     = useState<{ columns: string[]; rows: Record<string, string>[]; total: number; not_found?: {os_no:string;os_year:number}[] } | null>(null);
+  const [result, setResult]     = useState<{
+    columns: string[]; rows: Record<string, string>[]; total: number;
+    not_found?: { os_no: string; os_year: number | null; reason?: string }[];
+    resolved_by_name?: { os_no: string; resolved_year: number; matched_name: string; method: string; score?: number }[];
+  } | null>(null);
   const [error, setError]       = useState('');
   const [sortCol, setSortCol]   = useState<string | null>(null);
   const [sortDir, setSortDir]   = useState<'asc' | 'desc'>('asc');
 
   // ── Excel-upload state ────────────────────────────────────────────────────
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [xlsxRows,    setXlsxRows]    = useState<ParsedOsRow[]>([]);
-  const [xlsxErrors,  setXlsxErrors]  = useState<string[]>([]);
-  const [xlsxFileName,setXlsxFileName]= useState('');
-  const [xlsxLoading, setXlsxLoading] = useState(false);
+  const [xlsxRows,        setXlsxRows]        = useState<ParsedOsRow[]>([]);
+  const [xlsxErrors,      setXlsxErrors]      = useState<string[]>([]);
+  const [xlsxFileName,    setXlsxFileName]    = useState('');
+  const [xlsxHasName,     setXlsxHasName]     = useState(false);
+  const [xlsxLoading,     setXlsxLoading]     = useState(false);
+  const [xlsxOriginalKeys,setXlsxOriginalKeys]= useState<string[]>([]);
+  const [xlsxHasResult,   setXlsxHasResult]   = useState(false);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -265,15 +359,19 @@ export default function CustomReport() {
     setXlsxLoading(true);
     setXlsxRows([]); setXlsxErrors([]); setResult(null);
     setXlsxFileName(file.name);
-    const { rows, errors } = await parseExcelOsList(file);
+    const { rows, errors, hasName, originalKeys } = await parseExcelOsList(file);
     setXlsxRows(rows);
     setXlsxErrors(errors);
+    setXlsxHasName(hasName);
+    setXlsxOriginalKeys(originalKeys);
+    setXlsxHasResult(false);
     setXlsxLoading(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const clearXlsx = () => {
     setXlsxRows([]); setXlsxErrors([]); setXlsxFileName(''); setResult(null);
+    setXlsxOriginalKeys([]); setXlsxHasResult(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -285,9 +383,10 @@ export default function CustomReport() {
       const res = await api.post('/backup/custom-report', {
         master_cols: [...selectedMaster],
         item_cols:   effectiveItemCols,
-        os_list:     xlsxRows.map(r => ({ os_no: r.os_no, os_year: r.os_year })),
+        os_list:     xlsxRows.map(r => ({ os_no: r.os_no, os_year: r.os_year ?? null, pax_name: r.pax_name ?? null })),
       });
       setResult(res.data);
+      setXlsxHasResult(true);
     } catch (err: any) {
       let detail = err.response?.data?.detail || 'Failed to generate report.';
       if (Array.isArray(detail)) detail = detail.map((e: any) => `${e.loc?.join('.')} - ${e.msg}`).join(', ');
@@ -355,6 +454,7 @@ export default function CustomReport() {
       setError('Select at least one column.'); return;
     }
     setError(''); setLoading(true); setResult(null); setSortCol(null); setSortDir('asc');
+    setXlsxHasResult(false);
     try {
       const res = await api.post('/backup/custom-report', {
         master_cols: [...selectedMaster],
@@ -614,6 +714,7 @@ export default function CustomReport() {
                           <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">#</th>
                           <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">OS No.</th>
                           <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">Year</th>
+                          {xlsxHasName && <th className="px-2 py-1 text-left text-indigo-600 font-semibold border-b border-indigo-100">Pax Name</th>}
                         </tr>
                       </thead>
                       <tbody>
@@ -621,11 +722,14 @@ export default function CustomReport() {
                           <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-indigo-50/40'}>
                             <td className="px-2 py-0.5 text-slate-400">{r.rowNum}</td>
                             <td className="px-2 py-0.5 text-slate-700 font-medium">{r.os_no}</td>
-                            <td className="px-2 py-0.5 text-slate-700">{r.os_year}</td>
+                            <td className={`px-2 py-0.5 ${r.os_year == null ? 'text-amber-500 font-semibold' : 'text-slate-700'}`}>
+                              {r.os_year ?? '?'}
+                            </td>
+                            {xlsxHasName && <td className="px-2 py-0.5 text-slate-500">{r.pax_name ?? ''}</td>}
                           </tr>
                         ))}
                         {xlsxRows.length > 8 && (
-                          <tr><td colSpan={3} className="px-2 py-1 text-center text-slate-400 italic">…and {xlsxRows.length - 8} more</td></tr>
+                          <tr><td colSpan={xlsxHasName ? 4 : 3} className="px-2 py-1 text-center text-slate-400 italic">…and {xlsxRows.length - 8} more</td></tr>
                         )}
                       </tbody>
                     </table>
@@ -636,7 +740,44 @@ export default function CustomReport() {
                       <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
                       {loading ? 'Fetching…' : `Fetch Details (${xlsxRows.length} records)`}
                     </button>
+                    {xlsxHasResult && result && xlsxOriginalKeys.length > 0 && (
+                      <button
+                        onClick={() => exportXlsxMerged(xlsxOriginalKeys, xlsxRows, result!, labelOf)}
+                        className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-indigo-700 text-white hover:bg-indigo-800">
+                        <Download size={12} />
+                        Download Enhanced XLSX
+                      </button>
+                    )}
+                    {xlsxHasResult && result && xlsxOriginalKeys.length === 0 && result.rows.length > 0 && (
+                      <button onClick={() => exportCsv(result.columns, result.rows, labelOf)}
+                        className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-indigo-700 text-white hover:bg-indigo-800">
+                        <Download size={12} />
+                        Download CSV ({result.total.toLocaleString()} rows)
+                      </button>
+                    )}
                     {totalSelected === 0 && <span className="text-[10px] text-amber-600">← Select columns first</span>}
+                  </div>
+                </div>
+              )}
+
+              {/* Resolved-by-name list */}
+              {result?.resolved_by_name && result.resolved_by_name.length > 0 && (
+                <div className="flex items-start gap-2 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5">
+                  <CheckCircle2 size={13} className="text-emerald-600 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-[10px] font-semibold text-emerald-700 mb-1">
+                      {result.resolved_by_name.length} OS number{result.resolved_by_name.length !== 1 ? 's' : ''} resolved by name matching:
+                    </p>
+                    <div className="space-y-0.5">
+                      {result.resolved_by_name.map((x, i) => (
+                        <p key={i} className="text-[10px] text-emerald-700">
+                          <span className="font-medium">{x.os_no}/{x.resolved_year}</span>
+                          <span className="text-emerald-500"> → matched "{x.matched_name}"</span>
+                          {x.method === 'unique' && <span className="ml-1 text-emerald-400">(only entry)</span>}
+                          {x.score != null && <span className="ml-1 text-emerald-400">({Math.round(x.score * 100)}% match)</span>}
+                        </p>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}
@@ -646,8 +787,16 @@ export default function CustomReport() {
                 <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg p-2.5">
                   <AlertTriangle size={13} className="text-amber-500 shrink-0 mt-0.5" />
                   <div>
-                    <p className="text-[10px] font-semibold text-amber-700 mb-1">{result.not_found.length} OS number{result.not_found.length !== 1 ? 's' : ''} not found in the database:</p>
-                    <p className="text-[10px] text-amber-600">{result.not_found.map(x => `${x.os_no}/${x.os_year}`).join(', ')}</p>
+                    <p className="text-[10px] font-semibold text-amber-700 mb-1">{result.not_found.length} OS number{result.not_found.length !== 1 ? 's' : ''} not found / unresolved:</p>
+                    <div className="space-y-0.5">
+                      {result.not_found.map((x, i) => (
+                        <p key={i} className="text-[10px] text-amber-600">
+                          <span className="font-medium">{x.os_no}{x.os_year ? `/${x.os_year}` : ''}</span>
+                          {x.reason === 'ambiguous' && <span className="ml-1 text-amber-500">(multiple years exist — add PAX_NAME column to resolve)</span>}
+                          {x.reason === 'low_confidence' && <span className="ml-1 text-amber-500">(name match too low confidence)</span>}
+                        </p>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

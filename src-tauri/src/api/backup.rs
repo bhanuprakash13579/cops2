@@ -670,10 +670,22 @@ fn confiscation_label(rc: &str) -> &'static str {
     }
 }
 
+/// Token-overlap name similarity (0..1). Mirrors Python _name_score() and frontend nameScore().
+fn name_score(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    let ta: std::collections::HashSet<String> = a.to_uppercase().split_whitespace().map(String::from).collect();
+    let tb: std::collections::HashSet<String> = b.to_uppercase().split_whitespace().map(String::from).collect();
+    let overlap = ta.iter().filter(|t| tb.contains(*t)).count() as f64;
+    overlap / ta.len().max(tb.len()).max(1) as f64
+}
+
 #[derive(Deserialize)]
 pub struct OsListItem {
-    os_no:   String,
-    os_year: i64,
+    os_no:    String,
+    #[serde(default)]
+    os_year:  Option<i64>,   // null = year unknown; backend resolves via pax_name
+    #[serde(default)]
+    pax_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -721,14 +733,93 @@ pub async fn custom_report(
     // Build parameterized WHERE clause
     let mut conditions = vec!["cm.entry_deleted = 'N'".to_string()];
     let mut params: Vec<String> = Vec::new();
+    let mut resolved_by_name_list: Vec<Value> = Vec::new();
+    let mut unresolved_list: Vec<Value> = Vec::new();
+    let mut resolved_pairs: Vec<(String, i64)> = Vec::new();
 
     if !body.os_list.is_empty() {
-        // Excel-upload mode: match exactly these (os_no, os_year) pairs
-        let or_parts = body.os_list.iter().map(|_| "(cm.os_no=? AND cm.os_year=?)").collect::<Vec<_>>().join(" OR ");
+        // Split into known-year (exact) and unknown-year (fuzzy) items
+        let exact: Vec<(String, i64)> = body.os_list.iter()
+            .filter_map(|item| item.os_year.map(|yr| (item.os_no.clone(), yr)))
+            .collect();
+        let fuzzy: Vec<&OsListItem> = body.os_list.iter()
+            .filter(|item| item.os_year.is_none())
+            .collect();
+        resolved_pairs.extend(exact);
+
+        if !fuzzy.is_empty() {
+            let fuzzy_nos: Vec<&str> = {
+                let mut seen = std::collections::HashSet::new();
+                fuzzy.iter().filter_map(|item| {
+                    if seen.insert(item.os_no.as_str()) { Some(item.os_no.as_str()) } else { None }
+                }).collect()
+            };
+            let placeholders = fuzzy_nos.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let cand_sql = format!(
+                "SELECT os_no, os_year, pax_name FROM cops_master WHERE entry_deleted='N' AND os_no IN ({placeholders})"
+            );
+            let mut cstmt = conn.prepare(&cand_sql).map_err(|e| e500(&e.to_string()))?;
+            let candidates: Vec<(String, i64, String)> = cstmt.query_map(
+                rusqlite::params_from_iter(fuzzy_nos.iter()),
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                )),
+            ).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+
+            let mut cands_map: std::collections::HashMap<String, Vec<(i64, String)>> =
+                std::collections::HashMap::new();
+            for (no, yr, name) in candidates {
+                cands_map.entry(no).or_default().push((yr, name));
+            }
+
+            for item in &fuzzy {
+                let cands = cands_map.get(&item.os_no).map(|v| v.as_slice()).unwrap_or(&[]);
+                if cands.is_empty() {
+                    unresolved_list.push(json!({ "os_no": item.os_no, "os_year": null, "reason": "not_found" }));
+                } else if cands.len() == 1 {
+                    resolved_pairs.push((item.os_no.clone(), cands[0].0));
+                    resolved_by_name_list.push(json!({
+                        "os_no": item.os_no, "resolved_year": cands[0].0,
+                        "matched_name": cands[0].1, "method": "unique"
+                    }));
+                } else if let Some(pax) = &item.pax_name {
+                    let best = cands.iter().max_by(|a, b| {
+                        name_score(pax, &a.1).partial_cmp(&name_score(pax, &b.1))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }).unwrap();
+                    let score = name_score(pax, &best.1);
+                    if score >= 0.3 {
+                        resolved_pairs.push((item.os_no.clone(), best.0));
+                        resolved_by_name_list.push(json!({
+                            "os_no": item.os_no, "resolved_year": best.0,
+                            "matched_name": best.1,
+                            "score": (score * 100.0).round() / 100.0,
+                            "method": "name_match"
+                        }));
+                    } else {
+                        unresolved_list.push(json!({ "os_no": item.os_no, "os_year": null, "reason": "low_confidence" }));
+                    }
+                } else {
+                    unresolved_list.push(json!({ "os_no": item.os_no, "os_year": null, "reason": "ambiguous" }));
+                }
+            }
+        }
+
+        if resolved_pairs.is_empty() {
+            let all_cols: Vec<String> = body.master_cols.iter().chain(body.item_cols.iter()).cloned().collect();
+            return Ok(Json(json!({
+                "columns": all_cols, "rows": [], "total": 0,
+                "not_found": unresolved_list, "resolved_by_name": resolved_by_name_list
+            })));
+        }
+
+        let or_parts = resolved_pairs.iter().map(|_| "(cm.os_no=? AND cm.os_year=?)").collect::<Vec<_>>().join(" OR ");
         conditions.push(format!("({or_parts})"));
-        for item in &body.os_list {
-            params.push(item.os_no.clone());
-            params.push(item.os_year.to_string());
+        for (no, yr) in &resolved_pairs {
+            params.push(no.clone());
+            params.push(yr.to_string());
         }
     } else {
         // Filter-based mode
@@ -838,18 +929,23 @@ pub async fn custom_report(
     }).collect();
 
     // When os_list was provided, report which pairs were not found.
-    let not_found: Vec<Value> = if !body.os_list.is_empty() {
+    let not_found: Vec<Value>;
+    if !body.os_list.is_empty() {
         let found: std::collections::HashSet<(String, String)> =
             master_rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
-        body.os_list.iter()
-            .filter(|item| !found.contains(&(item.os_no.clone(), item.os_year.to_string())))
-            .map(|item| json!({ "os_no": item.os_no, "os_year": item.os_year }))
-            .collect()
+        let db_not_found: Vec<Value> = resolved_pairs.iter()
+            .filter(|(no, yr)| !found.contains(&(no.clone(), yr.to_string())))
+            .map(|(no, yr)| json!({ "os_no": no, "os_year": yr, "reason": "not_found" }))
+            .collect();
+        not_found = unresolved_list.into_iter().chain(db_not_found.into_iter()).collect();
     } else {
-        vec![]
+        not_found = vec![];
     };
 
-    Ok(Json(json!({ "columns": all_cols, "rows": json_rows, "total": json_rows.len(), "not_found": not_found })))
+    Ok(Json(json!({
+        "columns": all_cols, "rows": json_rows, "total": json_rows.len(),
+        "not_found": not_found, "resolved_by_name": resolved_by_name_list
+    })))
 }
 
 // ── Adjudication summary PDF ──────────────────────────────────────────────────
