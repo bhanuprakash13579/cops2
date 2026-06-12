@@ -226,7 +226,10 @@ async function exportXlsxMerged(
     for (const k of originalKeys) out[k] = xlRow.originalCols[k] ?? '';
     const dbYear = xlRow.os_year ?? resolvedMap.get(xlRow.os_no) ?? null;
     const dbRow  = dbYear != null ? dbMap.get(`${xlRow.os_no}||${dbYear}`) : undefined;
-    for (const col of dbCols) out[colLabels[col] ?? col] = dbRow?.[col] ?? '';
+    for (const col of dbCols) {
+      const raw = dbRow?.[col] ?? '';
+      out[colLabels[col] ?? col] = raw.replace(/\n/g, ' | ');
+    }
     return out;
   });
 
@@ -267,8 +270,10 @@ async function exportCsv(columns: string[], rows: Record<string, string>[], colL
   const header = columns.map(c => colLabels[c] ?? c).join(',');
   const body = rows.map(r =>
     columns.map(c => {
-      const v = r[c] ?? '';
-      return v.includes(',') || v.includes('"') || v.includes('\n')
+      // Replace newline item separators with " | " so LibreOffice/Excel show them
+      // clearly in a single cell without needing wrap-text enabled.
+      const v = (r[c] ?? '').replace(/\n/g, ' | ');
+      return v.includes(',') || v.includes('"')
         ? `"${v.replace(/"/g, '""')}"` : v;
     }).join(',')
   ).join('\n');
