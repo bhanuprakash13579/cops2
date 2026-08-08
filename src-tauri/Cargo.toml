@@ -76,5 +76,5 @@ calamine         = { version = "0.25", features = ["dates"] }
 [dev-dependencies]
 # Integration tests drive the real router over a real socket, so they need an
 # HTTP client. Both are already in the lock file — no new downloads.
-reqwest  = { version = "0.13", features = ["json"] }
+reqwest  = { version = "0.13", features = ["json", "multipart"] }
 tempfile = "3"

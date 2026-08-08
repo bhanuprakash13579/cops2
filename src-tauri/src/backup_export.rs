@@ -124,15 +124,19 @@ fn tables_worth_copying(conn: &rusqlite::Connection) -> Result<Vec<String>> {
 /// the target with `CREATE TABLE ... AS SELECT` instead would be shorter and
 /// would silently drop every constraint — the restored database would accept
 /// rows the original rejected.
-fn schema_for(conn: &rusqlite::Connection, tables: &[String]) -> Result<Vec<String>> {
+fn schema_for(
+    conn: &rusqlite::Connection,
+    tables: &[String],
+    kinds: &[&str],
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for kind in ["table", "index", "trigger"] {
+    for kind in kinds {
         let mut stmt = conn.prepare(
             "SELECT tbl_name, sql FROM sqlite_master
              WHERE type = ?1 AND sql IS NOT NULL",
         )?;
         let rows: Vec<(String, String)> = stmt
-            .query_map([kind], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([*kind], |r| Ok((r.get(0)?, r.get(1)?)))?
             .filter_map(|r| r.ok())
             .collect();
         for (owner, sql) in rows {
@@ -159,13 +163,24 @@ fn build_plain_export(pool: &DbPool, plain_path: &Path) -> Result<Vec<String>> {
     if tables.is_empty() {
         return Err(anyhow!("nothing to export: no table holds any rows"));
     }
-    let ddl = schema_for(&src, &tables)?;
+    let table_ddl = schema_for(&src, &tables, &["table"])?;
 
-    // Pass 1 — schema, on its own plain (unencrypted) connection.
+    // Indexes are NOT copied. They hold no information — every one can be
+    // rebuilt from the rows — and on the real Chennai data they cost 13.2 MB of
+    // the archive, 23% of it, to store something already implied by the data
+    // beside them. A restore goes into the live database, which has its own
+    // indexes from the migrations, so they are not wanted at the far end either.
+    //
+    // Triggers ARE copied, and only after the rows: they are behaviour rather
+    // than derived data, and one active during the copy would fire on rows that
+    // are not new and could rewrite the data being backed up.
+    let trigger_ddl = schema_for(&src, &tables, &["trigger"])?;
+
+    // Pass 1 — tables only, on their own plain (unencrypted) connection.
     {
         let plain = rusqlite::Connection::open(plain_path)?;
         plain.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
-        for stmt in &ddl {
+        for stmt in &table_ddl {
             // A failure here is worth reporting with the statement attached;
             // silently continuing would produce an export missing a table.
             plain
@@ -179,6 +194,17 @@ fn build_plain_export(pool: &DbPool, plain_path: &Path) -> Result<Vec<String>> {
     // works on plaintext. The file is deleted at the end of `write_archive`.
     let path_str = plain_path.to_string_lossy().replace('\'', "''");
     src.execute_batch(&format!("ATTACH DATABASE '{path_str}' AS exp KEY '';"))?;
+
+    // Foreign keys OFF for the copy, and it MUST be set before BEGIN — the
+    // pragma is silently ignored inside a transaction.
+    //
+    // Tables are copied in whatever order they come back in, so a child row can
+    // land before the table holding its parent has been filled. On the real
+    // Chennai data this failed on dr_entries. Enforcement is not wanted here in
+    // any case: the rows come from a database that already satisfies every
+    // constraint, and re-checking them mid-copy only means the copy has to guess
+    // a valid insertion order that does not always exist.
+    let _ = src.execute_batch("PRAGMA foreign_keys = OFF");
     let copy = (|| -> Result<()> {
         src.execute_batch("BEGIN")?;
         for t in &tables {
@@ -190,11 +216,25 @@ fn build_plain_export(pool: &DbPool, plain_path: &Path) -> Result<Vec<String>> {
         src.execute_batch("COMMIT")?;
         Ok(())
     })();
+    // This connection goes back to the pool for ordinary case work, where the
+    // constraints very much are wanted.
+    let _ = src.execute_batch("PRAGMA foreign_keys = ON");
     // DETACH whether or not the copy worked, or the file stays locked and the
     // next run fails for a reason that has nothing to do with the next run.
     let _ = src.execute_batch("ROLLBACK");
     let _ = src.execute_batch("DETACH DATABASE exp;");
     copy?;
+
+    // Pass 3 — triggers, now that the rows are already in place.
+    if !trigger_ddl.is_empty() {
+        let plain = rusqlite::Connection::open(plain_path)?;
+        plain.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
+        for stmt in &trigger_ddl {
+            plain
+                .execute_batch(stmt)
+                .map_err(|e| anyhow!("creating trigger failed: {e}\n  statement: {stmt}"))?;
+        }
+    }
 
     Ok(tables)
 }
@@ -354,6 +394,146 @@ pub fn extract(archive_path: &Path, dest_db: &Path) -> Result<()> {
     std::io::copy(&mut entry, &mut out)?;
     out.sync_all()?;
     Ok(())
+}
+
+pub struct RestoreReport {
+    pub tables_restored: usize,
+    pub rows: i64,
+    pub tables_cleared: usize,
+}
+
+/// Load a plaintext export back into the live encrypted database.
+///
+/// The exact inverse of `build_plain_export`, and it lives next to it so the two
+/// cannot drift apart. It has to be the inverse rather than a page copy:
+/// SQLCipher's backup API refuses to copy between a plaintext source and an
+/// encrypted destination — "backup is not supported with encrypted databases" —
+/// which is the same constraint that makes the export use ATTACH.
+///
+/// Everything happens in ONE transaction. A restore that failed half way would
+/// otherwise leave the office with part of yesterday and part of today, which
+/// is worse than either and impossible to untangle afterwards.
+///
+/// Tables absent from the archive are emptied, not left alone. The archive holds
+/// every table that had rows, so a table missing from it was empty when the
+/// backup was taken; leaving today's rows in place would produce a database that
+/// never existed at any point in time.
+pub fn restore_into(pool: &DbPool, plain_path: &Path) -> Result<RestoreReport> {
+    let incoming = {
+        let plain = rusqlite::Connection::open(plain_path)?;
+        let mut st = plain.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )?;
+        let names: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter(|n| !is_internal(n))
+            .collect();
+        let mut out = Vec::new();
+        for n in names {
+            let sql: Option<String> = plain
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [&n],
+                    |r| r.get(0),
+                )
+                .ok();
+            out.push((n, sql));
+        }
+        out
+    };
+    if incoming.is_empty() {
+        return Err(anyhow!("the backup contains no tables"));
+    }
+
+    let conn = pool.get()?;
+    let existing: Vec<String> = {
+        let mut st = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+        let v: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter(|n| !is_internal(n))
+            .collect();
+        v
+    };
+
+    let path_str = plain_path.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!("ATTACH DATABASE '{path_str}' AS src KEY '';"))?;
+
+    // Same reasoning as the export, and more forcefully: a restore DELETEs every
+    // table and refills it, so with enforcement on, deleting a parent before its
+    // children — or refilling a child before its parent — fails. No ordering
+    // avoids that in general, and the rows being restored already satisfied
+    // every constraint when they were backed up. Must precede BEGIN.
+    let _ = conn.execute_batch("PRAGMA foreign_keys = OFF");
+
+    let work = (|| -> Result<RestoreReport> {
+        conn.execute_batch("BEGIN")?;
+        let mut rows = 0i64;
+        for (t, ddl) in &incoming {
+            if !existing.iter().any(|e| e == t) {
+                // A table the running version has never created — the backup is
+                // from a build that knew about it, so recreate it rather than
+                // dropping its data on the floor.
+                if let Some(sql) = ddl {
+                    conn.execute_batch(sql)?;
+                }
+            }
+            conn.execute_batch(&format!("DELETE FROM main.\"{t}\""))?;
+            conn.execute_batch(&format!(
+                "INSERT INTO main.\"{t}\" SELECT * FROM src.\"{t}\""
+            ))
+            .map_err(|e| anyhow!("restoring {t} failed: {e}"))?;
+            rows += conn
+                .query_row(&format!("SELECT COUNT(*) FROM main.\"{t}\""), [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap_or(0);
+        }
+
+        let mut cleared = 0usize;
+        for t in &existing {
+            if !incoming.iter().any(|(n, _)| n == t) {
+                let n: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM main.\"{t}\""), [], |r| r.get(0))
+                    .unwrap_or(0);
+                if n > 0 {
+                    conn.execute_batch(&format!("DELETE FROM main.\"{t}\""))?;
+                    cleared += 1;
+                }
+            }
+        }
+
+        conn.execute_batch("COMMIT")?;
+        Ok(RestoreReport { tables_restored: incoming.len(), rows, tables_cleared: cleared })
+    })();
+
+    if work.is_err() {
+        // Put the database back exactly as it was. A partial restore is worse
+        // than a refused one.
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    let _ = conn.execute_batch("DETACH DATABASE src;");
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+
+    // The restored rows have never been constraint-checked as a set, so check
+    // them now — after the transaction, where a failure can be reported rather
+    // than silently accepted. A restore that quietly loads inconsistent data is
+    // exactly the kind of damage that is not noticed for months.
+    if work.is_ok() {
+        if let Ok(mut st) = conn.prepare("PRAGMA foreign_key_check") {
+            if let Ok(mut rows) = st.query([]) {
+                if let Ok(Some(r)) = rows.next() {
+                    let table: String = r.get(0).unwrap_or_default();
+                    tracing::error!(
+                        "restored data violates a foreign key in {table} — \
+                         the backup may be from an inconsistent database"
+                    );
+                }
+            }
+        }
+    }
+    work
 }
 
 /// The row counts recorded when this archive was written.

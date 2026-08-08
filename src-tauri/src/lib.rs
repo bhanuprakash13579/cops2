@@ -609,6 +609,72 @@ mod migration_tests {
                 "the message must tell the officer the original is safe: {e}");
     }
 
+    /// The complete cycle on real data: upgrade from cops1, take a backup,
+    /// wipe the live database, restore it, and prove the case records came back.
+    ///
+    /// Every stage of this has been tested in isolation. This is the only test
+    /// that proves they compose — which is where backup schemes actually fail.
+    #[test]
+    fn real_data_survives_upgrade_backup_wipe_and_restore() {
+        let Ok(real) = std::env::var("COPS1_TEST_DB") else {
+            eprintln!("skipping: set COPS1_TEST_DB to a COPY of a real cops1 database");
+            return;
+        };
+        let d = tmp("cycle");
+        let src = d.join("cops_br_database.db");
+        std::fs::copy(&real, &src).unwrap();
+        let live = d.join("cops.db");
+
+        migrate_cops1(&src, &live).expect("upgrade");
+        let pool = crate::db::create_pool(&live).unwrap();
+
+        let before: Vec<(String, i64)> = ["cops_master", "cops_items", "br_master",
+                                         "br_items", "dr_master", "dr_items",
+                                         "print_template_config"]
+            .iter()
+            .map(|t| {
+                let n: i64 = pool.get().unwrap()
+                    .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
+                (t.to_string(), n)
+            })
+            .collect();
+        let total: i64 = before.iter().map(|(_, n)| *n).sum();
+
+        let archive = d.join("backup.cops");
+        let t0 = std::time::Instant::now();
+        let rep = crate::backup_export::write_archive(&pool, &archive).expect("backup");
+        let backup_secs = t0.elapsed().as_secs_f64();
+
+        // Destroy the live data, exactly as a failed disk or a bad import would.
+        {
+            let c = pool.get().unwrap();
+            for (t, _) in &before {
+                c.execute(&format!("DELETE FROM {t}"), []).unwrap();
+            }
+        }
+        let wiped: i64 = pool.get().unwrap()
+            .query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0)).unwrap();
+        assert_eq!(wiped, 0, "the wipe must actually have happened");
+
+        let unpacked = d.join("restore.db");
+        crate::backup_export::extract(&archive, &unpacked).expect("extract");
+        let t1 = std::time::Instant::now();
+        crate::backup_export::restore_into(&pool, &unpacked).expect("restore");
+        let restore_secs = t1.elapsed().as_secs_f64();
+
+        for (t, want) in &before {
+            let got: i64 = pool.get().unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(got, *want, "{t} did not come back intact");
+        }
+
+        eprintln!(
+            "REAL CYCLE: {total} rows | backup {:.1} MB in {backup_secs:.1}s ({:.1}x) \
+             | restore {restore_secs:.1}s | every table matched",
+            rep.archive_bytes as f64 / 1_048_576.0, rep.ratio()
+        );
+    }
+
     /// Runs against a real cops1 database when COPS1_TEST_DB points at a copy.
     /// Skipped otherwise, so this suite still passes on a machine without one.
     #[test]

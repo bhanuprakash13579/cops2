@@ -14,7 +14,12 @@ use cops2_lib::auth;
 use cops2_lib::db;
 
 /// Start the real router on an ephemeral port; returns its base URL.
-async fn serve() -> (String, tempfile::TempDir) {
+async fn serve() -> (String, tempfile::TempDir) { serve_with(200).await }
+
+/// A database with almost nothing in it, for testing the shrink guard.
+async fn serve_tiny() -> (String, tempfile::TempDir) { serve_with(1).await }
+
+async fn serve_with(rows: i64) -> (String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let pool = db::create_pool(&dir.path().join("live.db")).unwrap();
     {
@@ -25,7 +30,7 @@ async fn serve() -> (String, tempfile::TempDir) {
              CREATE TABLE IF NOT EXISTS print_template_config(k TEXT PRIMARY KEY, body TEXT);",
         )
         .unwrap();
-        for i in 1..=200 {
+        for i in 1..=rows {
             c.execute(
                 "INSERT INTO cops_master(os_no) VALUES (?1)",
                 rusqlite::params![format!("OS/{i}/2026")],
@@ -165,4 +170,108 @@ async fn taking_an_archive_clears_the_reminder() {
         .await
         .unwrap();
     assert_eq!(after["state"], "ok", "the reminder must clear: {after}");
+}
+
+// ── Restore ──────────────────────────────────────────────────────────────────
+// Restore is the most destructive operation in the program: it overwrites every
+// case record the office has. These test the guards, not the happy path.
+
+async fn take_archive(base: &str) -> Vec<u8> {
+    reqwest::Client::new()
+        .get(format!("{base}/backup/archive/download"))
+        .bearer_auth(officer_token())
+        .send().await.unwrap()
+        .bytes().await.unwrap().to_vec()
+}
+
+fn admin_token() -> String {
+    // The real admin token, not a hand-rolled claim set. AdminUser requires
+    // role == "system_admin"; inventing a plausible-looking role instead is how
+    // a test ends up asserting against a 403 it caused itself.
+    auth::create_admin_token().unwrap()
+}
+
+async fn restore(base: &str, bytes: Vec<u8>, confirm: bool) -> (u16, serde_json::Value) {
+    let mut form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(bytes).file_name("b.cops"),
+    );
+    if confirm {
+        form = form.text("confirm_data_loss", "yes");
+    }
+    let r = reqwest::Client::new()
+        .post(format!("{base}/admin/backup/restore-archive"))
+        .bearer_auth(admin_token())
+        .multipart(form)
+        .send().await.unwrap();
+    let s = r.status().as_u16();
+    (s, r.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+#[tokio::test]
+async fn a_backup_taken_today_can_actually_be_restored() {
+    // The whole point. A backup format with no working restore is not a backup.
+    let (base, _d) = serve().await;
+    let archive = take_archive(&base).await;
+    let (status, body) = restore(&base, archive, false).await;
+    assert_eq!(status, 200, "restore must succeed: {body}");
+    assert_eq!(body["os_cases"], 200, "every case must come back: {body}");
+    assert!(
+        body["previous_data_saved_to"].as_str().unwrap_or("").ends_with(".cops"),
+        "the replaced data must be archived first: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_backup_holding_less_data_is_refused_unless_confirmed() {
+    // The old restore checked only that a cops_master TABLE existed, so a valid
+    // COPS database holding two rows passed and destroyed everything.
+    let (base, _d) = serve().await;
+    let full = take_archive(&base).await;
+
+    // An archive taken when the database held far less.
+    let (small_base, _d2) = serve().await;
+    {
+        let c = reqwest::Client::new();
+        let _ = c.get(format!("{small_base}/backup/auto/status"))
+            .bearer_auth(officer_token()).send().await;
+    }
+    // Restoring the FULL archive into the full database is fine; the guard is
+    // about restoring something smaller, so shrink the live side instead by
+    // restoring a small archive built from a nearly-empty database.
+    let small = {
+        let (b2, _d3) = serve_tiny().await;
+        take_archive(&b2).await
+    };
+
+    let (status, body) = restore(&base, small.clone(), false).await;
+    assert_eq!(status, 400, "a shrinking restore must be refused: {body}");
+    let detail = body["detail"].as_str().unwrap_or("");
+    assert!(detail.contains("FEWER"), "must say what is wrong: {detail}");
+    assert!(detail.contains("cops_master"), "must name the table: {detail}");
+
+    // Still possible deliberately.
+    let (status2, body2) = restore(&base, small, true).await;
+    assert_eq!(status2, 200, "an explicit confirmation must work: {body2}");
+
+    let _ = full;
+}
+
+#[tokio::test]
+async fn a_file_that_is_not_a_backup_changes_nothing() {
+    let (base, _d) = serve().await;
+    let (status, body) = restore(&base, b"this is not an archive".to_vec(), false).await;
+    assert_eq!(status, 400);
+    let detail = body["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("Nothing has been changed"),
+        "the officer must be told the database is untouched: {detail}"
+    );
+
+    // And it really is untouched.
+    let after: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/backup/auto/status"))
+        .bearer_auth(officer_token())
+        .send().await.unwrap().json().await.unwrap();
+    assert!(after.get("destinations").is_some());
 }

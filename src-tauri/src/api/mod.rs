@@ -173,6 +173,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/admin/backup/auto/run",            post(backup::auto_run_now))
         .route("/admin/backup/auto/settings",       post(backup::auto_settings))
         .route("/admin/backup/auto/test-folder",    post(backup::auto_test_folder))
+        .route("/admin/backup/restore-archive",     post(backup::admin_restore_archive))
 
         // ── Admin Backup / Restore ─────────────────────────────────────────────
         .route("/admin/backup/export",              get(backup::admin_export_csv))

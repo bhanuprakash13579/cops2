@@ -1874,3 +1874,136 @@ pub async fn archive_download(State(pool): Db, _auth: AuthUser) -> Result<axum::
     )
         .into_response())
 }
+
+/// Restore from a `.cops` archive.
+///
+/// Separate from `admin_restore_fulldb`, which takes an encrypted cops2 `.db`
+/// and would reject an archive outright — the database inside a `.cops` is
+/// plaintext, because compression only works before encryption.
+///
+/// Three things happen here that the older restore does not do, and each exists
+/// because restore is the single most destructive operation in the program: it
+/// overwrites every case record the office has.
+///
+///  1. The CURRENT data is archived first. If the upload turns out to be the
+///     wrong file, or a year out of date, what was replaced still exists.
+///  2. Row counts in the upload are compared against what is live, and a large
+///     drop is refused unless the caller explicitly confirms. The old restore
+///     checked only that a `cops_master` TABLE existed — a valid COPS database
+///     holding two rows passed that check and destroyed everything.
+///  3. The archive is verified before the live database is touched at all.
+pub async fn admin_restore_archive(
+    State(pool): Db,
+    _admin: AdminUser,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, Err> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut confirm = false;
+    while let Some(field) = multipart.next_field().await.map_err(|e| e400(&e.to_string()))? {
+        match field.name().unwrap_or("") {
+            "file" => {
+                file_bytes = Some(field.bytes().await.map_err(|e| e400(&e.to_string()))?.to_vec())
+            }
+            // Set only from an explicit confirmation in the UI, never a default.
+            "confirm_data_loss" => {
+                confirm = field.text().await.unwrap_or_default().trim() == "yes"
+            }
+            _ => {}
+        }
+    }
+    let bytes = file_bytes.ok_or_else(|| e400("No file uploaded"))?;
+    if bytes.is_empty() {
+        return Err(e400("Empty file"));
+    }
+
+    let id = uuid::Uuid::new_v4();
+    let up = std::env::temp_dir().join(format!("cops_up_{id}.cops"));
+    let unpacked = std::env::temp_dir().join(format!("cops_up_{id}.db"));
+    tokio::fs::write(&up, &bytes).await.map_err(|e| e500(&e.to_string()))?;
+
+    let result: Result<Value, String> = tokio::task::spawn_blocking({
+        let (up, unpacked, pool) = (up.clone(), unpacked.clone(), Arc::clone(&pool));
+        move || {
+            crate::backup_export::extract(&up, &unpacked).map_err(|e| {
+                format!("This file could not be opened as a COPS backup ({e}). \
+                         Nothing has been changed.")
+            })?;
+            let src = rusqlite::Connection::open(&unpacked).map_err(|e| e.to_string())?;
+            let check: String = src
+                .query_row("PRAGMA quick_check", [], |r| r.get(0))
+                .map_err(|e| format!("The backup is damaged and cannot be read ({e}). \
+                                      Nothing has been changed."))?;
+            if check != "ok" {
+                return Err(format!("The backup failed its integrity check ({check}). \
+                                    Nothing has been changed."));
+            }
+
+            // Compare against what is live BEFORE anything is overwritten.
+            let live = pool.get().map_err(|e| e.to_string())?;
+            let mut losses = Vec::new();
+            for t in ["cops_master", "cops_items", "br_master", "br_items", "dr_master", "dr_items"] {
+                let now: i64 = live
+                    .query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+                    .unwrap_or(0);
+                let incoming: i64 = src
+                    .query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+                    .unwrap_or(0);
+                if now > 0 && incoming < now {
+                    losses.push(serde_json::json!({
+                        "table": t, "current": now, "in_backup": incoming, "lost": now - incoming,
+                    }));
+                }
+            }
+            if !losses.is_empty() && !confirm {
+                return Err(format!(
+                    "This backup holds FEWER records than the database does now: {}. \
+                     Restoring would lose them. Confirm explicitly if that is intended.",
+                    losses.iter()
+                        .map(|l| format!("{} {} → {}", l["table"].as_str().unwrap_or(""),
+                                         l["current"], l["in_backup"]))
+                        .collect::<Vec<_>>().join(", ")
+                ));
+            }
+            drop(live);
+
+            // Rule: never overwrite the only copy. Archive what is about to be
+            // replaced, so a wrong file chosen at 5pm is recoverable at 6pm.
+            let safety = std::env::temp_dir()
+                .join(format!("cops_before_restore_{}.cops",
+                              chrono::Local::now().format("%Y-%m-%d_%H%M%S")));
+            let safety_note = match crate::backup_export::write_archive(&pool, &safety) {
+                Ok(_) => safety.to_string_lossy().to_string(),
+                // A database too damaged to export is exactly when a restore is
+                // needed most, so this cannot be fatal — but it must be said.
+                Err(e) => format!("COULD NOT BE TAKEN: {e}"),
+            };
+
+            drop(src);
+            let report = crate::backup_export::restore_into(&pool, &unpacked)
+                .map_err(|e| format!("The restore failed and was rolled back ({e}). \
+                                      The database is unchanged."))?;
+
+            let restored: i64 = pool
+                .get()
+                .map_err(|e| e.to_string())?
+                .query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0))
+                .unwrap_or(-1);
+            Ok(serde_json::json!({
+                "message": "Database restored. Restart the app to reload the data.",
+                "os_cases": restored,
+                "tables_restored": report.tables_restored,
+                "rows_restored": report.rows,
+                "tables_cleared": report.tables_cleared,
+                "previous_data_saved_to": safety_note,
+            }))
+        }
+    })
+    .await
+    .map_err(|e| e500(&e.to_string()))?;
+
+    let _ = tokio::fs::remove_file(&up).await;
+    let _ = tokio::fs::remove_file(&unpacked).await;
+
+    let body = result.map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "detail": e }))))?;
+    Ok(Json(body))
+}
