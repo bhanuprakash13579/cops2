@@ -23,7 +23,23 @@ pub fn create_pool(db_path: &Path) -> Result<DbPool> {
                  PRAGMA cache_size    = -32000;   -- 32 MB page cache
                  PRAGMA foreign_keys  = ON;
                  PRAGMA temp_store    = MEMORY;
-                 PRAGMA mmap_size     = 268435456; -- 256 MB memory-mapped I/O",
+                 PRAGMA mmap_size     = 268435456; -- 256 MB memory-mapped I/O
+
+                 -- Cap the write-ahead log. The default is -1, meaning the -wal
+                 -- file grows to its high-water mark and NEVER returns the space:
+                 -- one bulk import or CSV upload inflates it for the life of the
+                 -- database. Measured in the sibling project, a single bulk
+                 -- transaction grew the WAL to 210 MB and held it until this was
+                 -- added, after which a checkpoint returned all of it.
+                 -- Purely a space cap; checkpointing is routine and loses nothing.
+                 PRAGMA journal_size_limit = 8388608;   -- 8 MB ceiling
+
+                 -- Wait for a lock instead of failing instantly. The default is
+                 -- 0, so a second writer gets SQLITE_BUSY immediately. With one
+                 -- officer that is invisible; it stops being invisible as soon as
+                 -- anything else opens the database alongside normal work — a
+                 -- backup, a report, a second window.
+                 PRAGMA busy_timeout  = 5000;           -- wait up to 5 s",
             )
         });
 
@@ -87,6 +103,76 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
                  config_value TEXT NOT NULL DEFAULT ''
              );"
         )?;
+    }
+
+    // Seed DCR initial data (idempotent)
+    seed_dcr_defaults(&conn)?;
+
+    Ok(())
+}
+
+fn seed_dcr_defaults(conn: &rusqlite::Connection) -> Result<()> {
+    // Seed initial tariff (only if none exists)
+    let has_tariff: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dcr_tariffs", [], |r| r.get(0)
+    ).unwrap_or(0);
+    if has_tariff == 0 {
+        conn.execute(
+            "INSERT INTO dcr_tariffs (effective_from, label, baggage_rate, liquor_duty_rate,
+             aidc_liquor_rate, gold_bcd_rate, aidc_gold_rate, gold_cons_bcd_rate, aidc_gold_cons_rate,
+             silver_bcd_rate, aidc_silver_rate, silver_cons_rate, aidc_silver_cons_rate)
+             VALUES (date('now'), 'Initial Rates', 0.35, 0.15, 0.035, 0.125, 0.05, 0.125, 0.05,
+             0.35, 0.05, 0.35, 0.05)",
+            [],
+        )?;
+    }
+
+    // Seed initial settings (only if none exists)
+    conn.execute(
+        "INSERT OR IGNORE INTO dcr_settings (id, station_name) VALUES (1, 'CUSTOMS, CHENNAI AIRPORT')",
+        [],
+    )?;
+
+    // Seed system item types (only if none exist)
+    let has_items: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dcr_item_types", [], |r| r.get(0)
+    ).unwrap_or(0);
+    if has_items == 0 {
+        let system_items = [
+            "BAGGAGE", "GOLD", "SILVER", "GOLD(C)", "SILVER(C)", "LIQUOR",
+            "CIGARETTES", "ELECTRONIC ITEMS", "FOREIGN CURRENCY",
+        ];
+        for name in &system_items {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO dcr_item_types (name, is_system) VALUES (?, 1)",
+                rusqlite::params![name],
+            );
+        }
+    }
+
+    // Seed formula rules (only if none exist)
+    let has_rules: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dcr_formula_rules", [], |r| r.get(0)
+    ).unwrap_or(0);
+    if has_rules == 0 {
+        let rules: Vec<(i64, &str, &str, &str, &str, &str)> = vec![
+            (1,  "baggage_duty",     "except", "GOLD,SILVER,GOLD(C),SILVER(C)", "value * baggage_rate",          "Baggage Duty"),
+            (2,  "liquor_duty",      "only",   "LIQUOR",                         "value * liquor_duty_rate",      "Liquor Duty"),
+            (3,  "gold_duty_bcd",    "only",   "GOLD,SILVER",                    "value * gold_bcd_rate",         "Gold/Silver BCD"),
+            (4,  "aidc_gold_silver", "only",   "GOLD,SILVER",                    "value * aidc_gold_rate",        "AIDC on Gold/Silver"),
+            (5,  "gold_duty_cons",   "only",   "GOLD(C)",                        "value * gold_cons_bcd_rate",    "Gold(C) BCD"),
+            (6,  "aidc_gold_silver", "only",   "GOLD(C)",                        "value * aidc_gold_cons_rate",   "AIDC on Gold(C)"),
+            (7,  "silver_duty_cons", "only",   "SILVER(C)",                      "value * silver_cons_rate",      "Silver(C) Concessional"),
+            (8,  "aidc_gold_silver", "only",   "SILVER(C)",                      "value * aidc_silver_cons_rate", "AIDC on Silver(C)"),
+            (9,  "aidc_on_liquor",   "only",   "LIQUOR",                         "value * aidc_liquor_rate",      "AIDC on Liquor"),
+        ];
+        for (sort_order, target_column, condition_type, condition_items, expression, column_label) in rules {
+            let _ = conn.execute(
+                "INSERT INTO dcr_formula_rules (sort_order, target_column, column_label, condition_type, condition_items, expression, is_active)
+                 VALUES (?, ?, ?, ?, ?, ?, 1)",
+                rusqlite::params![sort_order, target_column, column_label, condition_type, condition_items, expression],
+            );
+        }
     }
 
     Ok(())
