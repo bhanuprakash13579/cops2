@@ -12,13 +12,19 @@
 //!     FREQUENCY costs seconds — how often one is taken
 //!
 //! So retention is small and fixed (two copies) while frequency is high (every
-//! 30 minutes). Two copies of a 240 MB database is under 500 MB per folder,
-//! permanently, and the exposure window is half an hour rather than a day.
+//! 30 minutes), and the exposure window is half an hour rather than a day.
+//!
+//! What gets written is NOT a copy of the database file. It is a compressed,
+//! encrypted export built by `backup_export` — on the real Chennai data, 44.4 MB
+//! against 242.6 MB for the same 827,140 rows. Two copies therefore cost about
+//! 88 MB per folder rather than 486 MB, which is what makes it reasonable to
+//! keep them on machines that are not this one.
 //!
 //! Rules
 //! -----
-//! 1. Verify before distributing — reopen the copy and row-count it. A snapshot
-//!    that cannot be reopened never reaches a destination.
+//! 1. Verify before distributing — row-count the export before it is compressed
+//!    (in `backup_export`), and prove the finished archive decrypts and matches
+//!    its CRC. Nothing unverified reaches a destination.
 //! 2. Two generations, always. Never destroy the last good copy for an
 //!    unverified new one.
 //! 3. `.partial` then atomic rename. No half-written file may look complete.
@@ -26,7 +32,8 @@
 //!    *inside* the OS call; in the sibling project this stalled application
 //!    startup until every folder walk was routed through the probe.
 //! 5. No destinations configured means do nothing, silently.
-//! 6. Bounded disk: copies × database size, never more.
+//! 6. Bounded disk: copies × archive size, never more. A destination folder
+//!    cannot grow without limit no matter how long the app runs.
 //! 7. One backup at a time.
 //! 8. Skip when the data has not changed — but still catch up a folder missing
 //!    the current copy. Without the second half, a machine switched off for a
@@ -37,7 +44,7 @@
 //!    by the very event it guards against, and not merely the newest file,
 //!    because a 1400-byte junk file defeated exactly that check.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -192,28 +199,12 @@ fn reachable(pool: &DbPool) -> Vec<String> {
 // Snapshot and verification
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn open_encrypted(path: &Path) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path)?;
-    conn.execute_batch(&crate::security::sqlcipher_pragma())?;
-    Ok(conn)
-}
-
-/// Consistent copy of the live database, encryption preserved.
-///
-/// Uses SQLite's online backup API rather than a file copy: copying a live
-/// database while officers are saving can produce a corrupt file, with pages
-/// caught mid-write and the WAL unapplied. This is safe with the app running.
-fn snapshot(pool: &DbPool, dest: &Path) -> Result<()> {
-    let src = pool.get()?;
-    let mut dst = open_encrypted(dest)?;
-    let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
-    backup.run_to_completion(1000, Duration::from_millis(ced_pause()), None)?;
-    Ok(())
-}
-
-/// Pause between backup steps, so a large snapshot yields to officers writing
-/// rather than holding the database for its whole duration.
-fn ced_pause() -> u64 { 5 }
+// A `snapshot()` using SQLite's online backup API lived here, copying the
+// encrypted database page by page. It was correct but produced a 242.6 MB file
+// where `backup_export` produces 44.4 MB of the same data, because encrypted
+// bytes cannot be compressed afterwards. Its verify step moved into
+// `write_archive`, which checks the export before it is compressed. Removed
+// rather than left unused, so nothing can wire it back in by accident.
 
 fn counts_from(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
     VERIFY_TABLES
@@ -232,34 +223,18 @@ pub fn live_counts(pool: &DbPool) -> Vec<(String, i64)> {
     pool.get().map(|c| counts_from(&c)).unwrap_or_default()
 }
 
-/// Rule 1 — reopen the written file and prove it is a usable database.
-fn verify(path: &Path, expected: &[(String, i64)]) -> Result<()> {
-    let conn = open_encrypted(path)?;
-    let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if check != "ok" {
-        return Err(anyhow!("integrity check failed"));
-    }
-    for (table, want) in expected {
-        let got: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| r.get(0))
-            .unwrap_or(-1);
-        // Counts can rise while the snapshot is taken; a copy must never hold
-        // FEWER rows than were present before it started.
-        if got < *want {
-            return Err(anyhow!("{table}: copy has {got}, live had {want}"));
-        }
-    }
-    Ok(())
-}
+// Rule 1's `verify()` moved into `backup_export::write_archive`, which checks
+// the export BEFORE compressing it — so a broken export costs nothing to throw
+// away and can never reach a folder looking like a good backup.
 
-/// Does this file actually open as a database with the expected tables?
+/// Extension of a backup archive. Not `.db` — the file is a compressed,
+/// encrypted archive, and naming it `.db` would invite someone to open it as a
+/// database, fail, and conclude the backup is corrupt.
+const ARCHIVE_EXT: &str = "cops";
+
+/// Does this file open, decrypt, and hold intact data?
 fn is_usable_backup(path: &Path) -> bool {
-    open_encrypted(path)
-        .and_then(|c| {
-            c.query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get::<_, i64>(0))
-                .map_err(Into::into)
-        })
-        .is_ok()
+    crate::backup_export::is_usable_archive(path)
 }
 
 fn all_backups_newest_first(pool: &DbPool) -> Vec<PathBuf> {
@@ -269,7 +244,7 @@ fn all_backups_newest_first(pool: &DbPool) -> Vec<PathBuf> {
         for e in entries.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with("cops_auto_") && name.ends_with(".db") {
+            if name.starts_with("cops_auto_") && name.ends_with(ARCHIVE_EXT) {
                 if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
                     found.push((m, p));
                 }
@@ -324,8 +299,10 @@ fn check_shrink(
         }
     }
 
-    let Ok(conn) = open_encrypted(&baseline) else { return Ok(()) };
-    for (table, was) in counts_from(&conn) {
+    // Counts come from the archive's manifest, so the baseline costs a few
+    // kilobytes to read rather than unpacking the whole database to count rows.
+    let Ok(previous) = crate::backup_export::read_counts(&baseline) else { return Ok(()) };
+    for (table, was) in previous {
         if was <= 0 {
             continue;
         }
@@ -518,19 +495,29 @@ pub fn run_once(pool: &DbPool, force: bool, allow_shrink: bool) -> BackupOutcome
     // Seconds included: without them two runs inside the same minute produce
     // the same filename and the second overwrites the first, leaving one
     // generation where two were intended.
-    let name = format!("cops_auto_{stamp}.db");
+    let name = format!("cops_auto_{stamp}.{ARCHIVE_EXT}");
 
-    let tmp = std::env::temp_dir().join(format!("cops_bk_{stamp}.db"));
+    let tmp = std::env::temp_dir().join(format!("cops_bk_{stamp}.{ARCHIVE_EXT}"));
     let _ = std::fs::remove_file(&tmp);
 
-    if let Err(e) = snapshot(pool, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return BackupOutcome { reason: format!("snapshot failed: {e}"), ..Default::default() };
-    }
-    if let Err(e) = verify(&tmp, &counts) {
-        let _ = std::fs::remove_file(&tmp);
-        return BackupOutcome { reason: format!("verification failed: {e}"), ..Default::default() };
-    }
+    // Export, compress, encrypt — in that order, and verified before it is
+    // allowed anywhere near a destination folder. Copying the encrypted
+    // database file instead would be six times larger for the same data: see
+    // the measurements in `backup_export`.
+    let report = match crate::backup_export::write_archive(pool, &tmp) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return BackupOutcome { reason: format!("export failed: {e}"), ..Default::default() };
+        }
+    };
+    tracing::info!(
+        "backup export: {} tables, {} rows, {:.1} MB compressed to {:.1} MB ({:.1}x)",
+        report.tables, report.rows,
+        report.plain_bytes as f64 / 1_048_576.0,
+        report.archive_bytes as f64 / 1_048_576.0,
+        report.ratio(),
+    );
 
     // Rule 9. The snapshot exists but nothing has been copied yet, so refusing
     // here costs one temp file and protects every existing backup. The danger
@@ -786,7 +773,22 @@ mod tests {
         assert!(run_once(&pool, true, false).ok);
 
         std::thread::sleep(Duration::from_millis(1100));
-        std::fs::write(dest.join("cops_auto_2099-12-31_235959.db"), b"not a database").unwrap();
+        // The junk must carry the CURRENT backup extension. Named anything else
+        // it is filtered out before the safety floor is reached, and the test
+        // passes without exercising the thing it claims to — which is exactly
+        // what happened when the extension changed from .db to .cops.
+        std::fs::write(
+            dest.join(format!("cops_auto_2099-12-31_235959.{ARCHIVE_EXT}")),
+            b"not an archive",
+        )
+        .unwrap();
+        // A well-formed but empty zip is the subtler case: it opens, so a check
+        // that only asked "is this a valid zip?" would accept it as a baseline.
+        std::fs::write(
+            dest.join(format!("cops_auto_2099-12-30_235959.{ARCHIVE_EXT}")),
+            b"PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
 
         pool.get().unwrap().execute("DELETE FROM cops_master", []).unwrap();
         std::thread::sleep(Duration::from_millis(1100));

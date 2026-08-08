@@ -61,6 +61,18 @@ use crate::db::DbPool;
 /// Name of the database inside the zip. Fixed, so a restore never has to guess.
 pub const ENTRY_NAME: &str = "cops_data.db";
 
+/// A small index of what the archive holds, stored alongside the database.
+///
+/// It exists so the safety floor can read row counts without extracting 177 MB
+/// on every run. Worth being explicit about why this is NOT the mistake made
+/// once before, where the floor kept its reference inside the database it was
+/// protecting and the reference died with the thing it guarded: this manifest
+/// lives inside the backup, so it survives exactly when the backup survives,
+/// and it is written only after the export has been verified. The archive is
+/// still proved openable separately — the manifest is trusted for counts, never
+/// for integrity.
+pub const MANIFEST_NAME: &str = "manifest.json";
+
 /// Tables that must never be skipped even if empty, because their emptiness is
 /// itself meaningful state rather than an absence of data.
 const ALWAYS_INCLUDE: &[&str] = &["app_settings"];
@@ -276,6 +288,18 @@ pub fn write_archive(pool: &DbPool, archive_path: &Path) -> Result<ExportReport>
                 }
                 zw.write_all(&buf[..n])?;
             }
+
+            // Written after the export passed verification, never before.
+            let manifest = serde_json::json!({
+                "created": chrono::Local::now().to_rfc3339(),
+                "rows": rows,
+                "plain_bytes": plain_bytes,
+                "tables": expected.iter()
+                    .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+            });
+            zw.start_file(MANIFEST_NAME, opts)?;
+            zw.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
             zw.finish()?.sync_all()?;
         }
 
@@ -328,20 +352,51 @@ pub fn extract(archive_path: &Path, dest_db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Does this archive open, decrypt, and contain a usable database?
+/// The row counts recorded when this archive was written.
+///
+/// Read from the manifest so the safety floor does not have to unpack 177 MB on
+/// every run just to count rows.
+pub fn read_counts(archive_path: &Path) -> Result<Vec<(String, i64)>> {
+    let f = fs::File::open(archive_path)?;
+    let mut za = zip::ZipArchive::new(f)?;
+    let mut entry = za
+        .by_name_decrypt(MANIFEST_NAME, crate::security::zip_password().as_bytes())
+        .map_err(|e| anyhow!("no manifest in archive: {e}"))?;
+    let mut s = String::new();
+    entry.read_to_string(&mut s)?;
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+    let map = v
+        .get("tables")
+        .and_then(|t| t.as_object())
+        .ok_or_else(|| anyhow!("manifest has no table counts"))?;
+    Ok(map
+        .iter()
+        .filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n)))
+        .collect())
+}
+
+/// Does this archive open, decrypt, and hold intact data?
 ///
 /// Used where a backup file has to be trusted before it is relied on — the
 /// safety floor picks its reference from files that pass this.
+///
+/// The database entry is streamed through the decryptor to a sink rather than
+/// written to disk. That still forces every byte through the AES and deflate
+/// layers and checks the CRC at the end, so a truncated or altered archive
+/// fails here, but it costs no disk and no 177 MB temp file. Writing the file
+/// out to open it with SQLite would prove slightly more and cost far more, on a
+/// path that runs every backup.
 pub fn is_usable_archive(archive_path: &Path) -> bool {
-    let probe = archive_path.with_extension("verify.tmp");
-    let ok = extract(archive_path, &probe).is_ok()
-        && rusqlite::Connection::open(&probe)
-            .and_then(|c| {
-                c.query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get::<_, i64>(0))
-            })
-            .is_ok();
-    let _ = fs::remove_file(&probe);
-    ok
+    let Ok(f) = fs::File::open(archive_path) else { return false };
+    let Ok(mut za) = zip::ZipArchive::new(f) else { return false };
+    let pw = crate::security::zip_password().as_bytes();
+
+    let entry_ok = match za.by_name_decrypt(ENTRY_NAME, pw) {
+        Ok(mut e) => std::io::copy(&mut e, &mut std::io::sink()).is_ok(),
+        Err(_) => false,
+    };
+    // A manifest claiming no rows is not a backup worth measuring against.
+    entry_ok && read_counts(archive_path).map(|c| !c.is_empty()).unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
