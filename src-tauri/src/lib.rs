@@ -15,10 +15,13 @@ use tauri::Manager;
 /// Resolve which SQLite file cops2 should open.
 ///
 /// Priority:
-///   1. `cops.db`  — cops2's own database (created on first run, or already exists)
+///   1. `cops.db` — cops2's own database, UNLESS a cops1 database beside it
+///      holds more case records, in which case that one wins and `cops.db` is
+///      renamed aside rather than deleted. See the comment on that branch: the
+///      failure it prevents is silent and severe.
 ///   2. `cops_br_database.db` — cops1's database in the same app-data directory.
 ///      If it exists, it is migrated into `cops.db` (handling both plain and
-///      encrypted cops1 formats).  After successful migration the old cops1
+///      encrypted cops1 formats).  After a VERIFIED migration the old cops1
 ///      database is securely wiped so sensitive data never sits unencrypted.
 ///   3. Fresh install — `cops.db` will be created empty by `create_pool`.
 fn resolve_db_path(app_data: &Path) -> PathBuf {
@@ -44,9 +47,48 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
     }
 
     // Already have a fully-migrated cops2 database — use it directly.
+    //
+    // Unless a cops1 database is sitting beside it holding more. That should not
+    // happen: a successful migration wipes the cops1 file. But it DOES happen —
+    // a migration that failed after creating cops.db, a test run on an officer's
+    // machine, a cops1 database restored afterwards — and the consequence is the
+    // worst kind. The app opens a nearly-empty database, reports no error, and
+    // the office finds their records missing while the file holding all of them
+    // sits untouched in the same folder. The sibling project hit exactly this,
+    // where a leftover holding one case was chosen over one holding 28,896.
+    //
+    // So when both exist, the one with more case records wins, loudly.
     if cops2_db.exists() {
-        tracing::info!("Using existing cops2 database: {:?}", cops2_db);
-        return cops2_db;
+        if cops1_db.exists() {
+            let mine = case_count(&cops2_db, false);
+            let theirs = case_count(&cops1_db, true);
+            if theirs > mine {
+                tracing::error!(
+                    "REFUSING TO USE THE SMALLER DATABASE. {:?} holds {} OS cases but the \
+                     cops1 database beside it holds {}. Using the cops1 database and \
+                     migrating it. The smaller file is left untouched.",
+                    cops2_db, mine, theirs
+                );
+                let stale = app_data.join(format!(
+                    "cops.db.ignored-{}",
+                    chrono::Local::now().format("%Y-%m-%d_%H%M%S")
+                ));
+                // Renamed, never deleted — it may hold cases booked since the
+                // cops1 file was last written, and that is not ours to discard.
+                let _ = std::fs::rename(&cops2_db, &stale);
+                for suffix in ["-wal", "-shm"] {
+                    let _ = std::fs::remove_file(
+                        app_data.join(format!("cops.db{suffix}")),
+                    );
+                }
+            } else {
+                tracing::info!("Using existing cops2 database: {:?} ({mine} OS cases)", cops2_db);
+                return cops2_db;
+            }
+        } else {
+            tracing::info!("Using existing cops2 database: {:?}", cops2_db);
+            return cops2_db;
+        }
     }
 
     // Check for cops1 database (handles both plain and encrypted).
@@ -91,6 +133,29 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
     }
 
     cops2_db
+}
+
+/// How many OS cases does this database hold? 0 if it cannot be read.
+///
+/// Used only to decide which of two databases is the real one, so a file that
+/// cannot be opened counts as empty — it is not a candidate either way.
+fn case_count(path: &Path, cops1: bool) -> i64 {
+    let open = || -> anyhow::Result<i64> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        // A plain database needs no key; try that before paying for PBKDF2.
+        if conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_err() {
+            conn.execute_batch(&if cops1 {
+                crate::security::cops1_sqlcipher_pragma()
+            } else {
+                crate::security::sqlcipher_pragma()
+            })?;
+        }
+        Ok(conn.query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0))?)
+    };
+    open().unwrap_or(0)
 }
 
 /// Securely wipe old cops1 database files after successful migration.
@@ -607,6 +672,52 @@ mod migration_tests {
         let e = verify_migration(&s, &t).expect_err("an incomplete copy must be refused");
         assert!(e.to_string().contains("NOT been touched"),
                 "the message must tell the officer the original is safe: {e}");
+    }
+
+    #[test]
+    fn a_leftover_cops2_database_never_hides_a_fuller_cops1_one() {
+        // The exact situation found on a real machine: a 315 KB cops.db sitting
+        // beside a 254 MB cops_br_database.db. Choosing the first that exists
+        // opens the near-empty one, reports no error, and the office finds their
+        // records gone while the file holding all of them sits in the same folder.
+        let d = tmp("shadow");
+        make_cops1(&d.join("cops_br_database.db"), 5000);
+
+        // A small cops2 database, as an abandoned migration or a test run leaves.
+        let leftover = d.join("cops.db");
+        {
+            let c = rusqlite::Connection::open(&leftover).unwrap();
+            c.execute_batch(&crate::security::sqlcipher_pragma()).unwrap();
+            c.execute_batch("CREATE TABLE cops_master(id INTEGER PRIMARY KEY, os_no TEXT);").unwrap();
+            c.execute("INSERT INTO cops_master(os_no) VALUES ('OS/1/2026')", []).unwrap();
+        }
+
+        let chosen = resolve_db_path(&d);
+        let n: i64 = {
+            let c = rusqlite::Connection::open(&chosen).unwrap();
+            c.execute_batch(&crate::security::sqlcipher_pragma()).unwrap();
+            c.query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(n, 5000, "the fuller database must win, not the one found first");
+
+        // And the one set aside must still exist — it may hold cases booked
+        // after the cops1 file was last written, which is not ours to discard.
+        let kept = std::fs::read_dir(&d).unwrap().flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("cops.db.ignored-"));
+        assert!(kept, "the smaller database must be kept, not deleted");
+    }
+
+    #[test]
+    fn an_ordinary_cops2_database_is_used_without_interference() {
+        // The common case must not pay for the rule above.
+        let d = tmp("normal");
+        let only = d.join("cops.db");
+        {
+            let c = rusqlite::Connection::open(&only).unwrap();
+            c.execute_batch(&crate::security::sqlcipher_pragma()).unwrap();
+            c.execute_batch("CREATE TABLE cops_master(id INTEGER PRIMARY KEY);").unwrap();
+        }
+        assert_eq!(resolve_db_path(&d), only);
     }
 
     /// The complete cycle on real data: upgrade from cops1, take a backup,
