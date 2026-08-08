@@ -316,6 +316,20 @@ pub fn write_archive(pool: &DbPool, archive_path: &Path) -> Result<ExportReport>
         {
             let out = fs::File::create(&tmp_archive)?;
             let mut zw = zip::ZipWriter::new(out);
+            // Deflate, chosen over zstd deliberately — measured on the real
+            // 177.5 MB export, zstd wins on both axes:
+            //
+            //     deflate -6  44.4 MB   9.6s     (this)
+            //     deflate -9  43.5 MB  21.7s     2% smaller for 2x the time
+            //     zstd -3     42.0 MB   1.6s
+            //     zstd -10    35.4 MB   7.9s     20% smaller, same time
+            //
+            // It is still deflate because a zstd-in-zip archive does not open in
+            // the 7-Zip or WinRAR already on an office machine. The 8 MB buys a
+            // recovery path that works when COPS2 itself is the thing that will
+            // not run, which is exactly the situation a backup is for. Decided
+            // explicitly, not by default — do not "optimise" this without the
+            // same decision being made again.
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password())
