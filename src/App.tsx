@@ -17,6 +17,7 @@ const SDOModule = lazy(() => import('./pages/sdo'));
 const AdjudicationModule = lazy(() => import('./pages/adjudication'));
 const QueryModule = lazy(() => import('./pages/query'));
 const ApisModule = lazy(() => import('./pages/apis'));
+const DcrModule = lazy(() => import('./pages/dcr'));
 const RestoreBackup = lazy(() => import('./pages/backup/RestoreBackup'));
 
 // Minimal fallback shown while a lazy module chunk is loading (first navigation only)
@@ -122,6 +123,21 @@ function QueryRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+// DCR guard — any authenticated user + dcr_enabled feature flag
+function DcrRoute({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated } = useAuth();
+  const { data, isLoading } = useQuery({
+    queryKey: queryKeys.features(),
+    queryFn: fetchers.features,
+    staleTime: Infinity,
+  });
+
+  if (isLoading) return <div className="min-h-screen bg-slate-900" />;
+  if (!data?.dcr_enabled) return <Navigate to="/modules" replace />;
+  if (!isAuthenticated) return <Navigate to="/login/dcr" replace />;
+  return <>{children}</>;
+}
+
 // APIS guard (SDO and Adjn roles + feature flag must be enabled)
 function ApisRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, canAccessApis } = useAuth();
@@ -185,6 +201,16 @@ function AppRoutes() {
           <ApisRoute>
             <ApisModule />
           </ApisRoute>
+        }
+      />
+
+      {/* Revenue Report (DCR) Module — any authenticated user, dcr_enabled feature flag */}
+      <Route
+        path="/dcr/*"
+        element={
+          <DcrRoute>
+            <DcrModule />
+          </DcrRoute>
         }
       />
 

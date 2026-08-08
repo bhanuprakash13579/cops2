@@ -53,6 +53,52 @@ const ITEMS_COLS: &[&str] = &[
     "unique_no","entry_deleted",
 ];
 
+// ── DCR column lists (id columns excluded — remapped by natural key on restore) ───
+
+const DCR_TARIFF_COLS: &[&str] = &[
+    "effective_from", "label",
+    "baggage_rate", "liquor_duty_rate", "aidc_liquor_rate",
+    "gold_bcd_rate", "aidc_gold_rate", "gold_cons_bcd_rate", "aidc_gold_cons_rate",
+    "silver_bcd_rate", "aidc_silver_rate", "silver_cons_rate", "aidc_silver_cons_rate",
+    "created_at",
+];
+
+// Sessions export includes _tariff_eff for FK remapping on restore
+const DCR_SESSION_COLS: &[&str] = &[
+    "report_date", "shift", "batch_name", "created_by", "created_at",
+    "submitted_at", "submitted_by", "_tariff_eff",
+];
+
+// Entry tables export include _sess_date/_sess_shift/_sess_batch for session FK remapping
+const DCR_ENTRY_COLS: &[&str] = &[
+    "sort_order", "sl_no", "br_no", "os_ref", "item_desc",
+    "dutiable_value", "gold_weight_gms", "baggage_duty", "liquor_duty",
+    "cigarette_duty", "sw_sc", "gold_duty_bcd", "gold_duty_cons", "silver_duty_cons",
+    "sws_on_gold", "aidc_gold_silver", "sws_on_silver", "aidc_on_liquor",
+    "redemption_fine", "reexport_fine", "personal_penalty", "other_charges",
+    "fuel_duty", "total_duty", "flight_no", "is_sbi_challan", "is_offline_br", "overrides",
+    "_sess_date", "_sess_shift", "_sess_batch",
+];
+
+const DCR_DR_ENTRY_COLS: &[&str] = &[
+    "sort_order", "dr_no", "amount", "item_desc", "remarks",
+    "_sess_date", "_sess_shift", "_sess_batch",
+];
+
+const DCR_OS_ENTRY_COLS: &[&str] = &[
+    "sort_order", "os_no", "amount", "item_desc", "remarks",
+    "_sess_date", "_sess_shift", "_sess_batch",
+];
+
+const DCR_ITEM_TYPE_COLS: &[&str] = &["name", "usage_count", "is_system"];
+
+const DCR_FORMULA_RULE_COLS: &[&str] = &[
+    "sort_order", "target_column", "column_label", "condition_type",
+    "condition_items", "expression", "is_active", "notes",
+];
+
+const DCR_SETTINGS_COLS: &[&str] = &["station_name", "officer_name", "designation"];
+
 // ── CSV helpers ───────────────────────────────────────────────────────────────
 
 fn val_to_str(v: rusqlite::types::ValueRef<'_>) -> String {
@@ -108,17 +154,18 @@ fn parse_float(s: &str) -> f64 {
     s.trim().parse::<f64>().unwrap_or(0.0)
 }
 
-fn parse_date(s: &str) -> String {
+fn parse_date(s: &str) -> Option<String> {
     let s = s.trim().trim_matches('"');
+    if s.is_empty() { return None; }
     // Try YYYY-MM-DD first
-    if s.len() == 10 && s.as_bytes()[4] == b'-' { return s.to_string(); }
+    if s.len() == 10 && s.as_bytes()[4] == b'-' { return Some(s.to_string()); }
     // Try M/D/YY and M/D/YYYY
     for fmt in &["%m/%d/%y", "%m/%d/%Y", "%d/%m/%Y"] {
         if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
-            return d.format("%Y-%m-%d").to_string();
+            return Some(d.format("%Y-%m-%d").to_string());
         }
     }
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+    None // never substitute today's date for invalid input
 }
 
 // ── Export CSV (full database → ZIP) ─────────────────────────────────────────
@@ -144,15 +191,124 @@ async fn inner_export_csv(pool: Arc<DbPool>) -> Result<impl IntoResponse, Err> {
             .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
         zip.start_file("cops_items.csv", opts).map_err(|e| e500(&e.to_string()))?;
         zip.write_all(&items_csv).map_err(|e| e500(&e.to_string()))?;
+
+        // ── DCR tables ────────────────────────────────────────────────────────
+        // dcr_tariffs — configuration reference table (no FK dependencies)
+        let dcr_tariff_sql = "SELECT effective_from,label,baggage_rate,liquor_duty_rate,\
+            aidc_liquor_rate,gold_bcd_rate,aidc_gold_rate,gold_cons_bcd_rate,aidc_gold_cons_rate,\
+            silver_bcd_rate,aidc_silver_rate,silver_cons_rate,aidc_silver_cons_rate,created_at \
+            FROM dcr_tariffs ORDER BY effective_from";
+        if let Ok(csv) = query_to_csv(&conn, dcr_tariff_sql, DCR_TARIFF_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_tariffs.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_item_types — user-defined item categories
+        let dcr_item_types_sql = "SELECT name,usage_count,is_system FROM dcr_item_types ORDER BY name";
+        if let Ok(csv) = query_to_csv(&conn, dcr_item_types_sql, DCR_ITEM_TYPE_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_item_types.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_formula_rules — auto-calc rules
+        let dcr_formula_sql = "SELECT sort_order,target_column,column_label,condition_type,\
+            condition_items,expression,is_active,notes FROM dcr_formula_rules ORDER BY sort_order";
+        if let Ok(csv) = query_to_csv(&conn, dcr_formula_sql, DCR_FORMULA_RULE_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_formula_rules.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_settings — station config (single row)
+        let dcr_settings_sql = "SELECT station_name,officer_name,designation FROM dcr_settings WHERE id=1";
+        if let Ok(csv) = query_to_csv(&conn, dcr_settings_sql, DCR_SETTINGS_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_settings.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_sessions — joins tariff for effective_from FK remapping
+        let dcr_session_sql = "SELECT s.report_date,s.shift,COALESCE(s.batch_name,''),\
+            s.created_by,s.created_at,s.submitted_at,s.submitted_by,\
+            COALESCE(t.effective_from,'') AS _tariff_eff \
+            FROM dcr_sessions s LEFT JOIN dcr_tariffs t ON t.id=s.tariff_id \
+            ORDER BY s.report_date,s.shift,s.batch_name";
+        if let Ok(csv) = query_to_csv(&conn, dcr_session_sql, DCR_SESSION_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_sessions.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_entries — joins session for natural key remapping
+        let dcr_entry_sql = "SELECT e.sort_order,e.sl_no,e.br_no,e.os_ref,e.item_desc,\
+            e.dutiable_value,e.gold_weight_gms,e.baggage_duty,e.liquor_duty,e.cigarette_duty,\
+            e.sw_sc,e.gold_duty_bcd,e.gold_duty_cons,e.silver_duty_cons,e.sws_on_gold,\
+            e.aidc_gold_silver,e.sws_on_silver,e.aidc_on_liquor,e.redemption_fine,\
+            e.reexport_fine,e.personal_penalty,e.other_charges,e.fuel_duty,e.total_duty,\
+            e.flight_no,e.is_sbi_challan,e.is_offline_br,e.overrides,\
+            s.report_date AS _sess_date,s.shift AS _sess_shift,\
+            COALESCE(s.batch_name,'') AS _sess_batch \
+            FROM dcr_entries e JOIN dcr_sessions s ON s.id=e.session_id \
+            ORDER BY s.report_date,s.shift,s.batch_name,e.sort_order";
+        if let Ok(csv) = query_to_csv(&conn, dcr_entry_sql, DCR_ENTRY_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_entries.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_dr_entries — DR (Detention Register) line items
+        let dcr_dr_sql = "SELECT e.sort_order,e.dr_no,e.amount,e.item_desc,e.remarks,\
+            s.report_date AS _sess_date,s.shift AS _sess_shift,\
+            COALESCE(s.batch_name,'') AS _sess_batch \
+            FROM dcr_dr_entries e JOIN dcr_sessions s ON s.id=e.session_id \
+            ORDER BY s.report_date,s.shift,s.batch_name,e.sort_order";
+        if let Ok(csv) = query_to_csv(&conn, dcr_dr_sql, DCR_DR_ENTRY_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_dr_entries.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
+        // dcr_os_entries — OS (Offence Sheet) line items
+        let dcr_os_sql = "SELECT e.sort_order,e.os_no,e.amount,e.item_desc,e.remarks,\
+            s.report_date AS _sess_date,s.shift AS _sess_shift,\
+            COALESCE(s.batch_name,'') AS _sess_batch \
+            FROM dcr_os_entries e JOIN dcr_sessions s ON s.id=e.session_id \
+            ORDER BY s.report_date,s.shift,s.batch_name,e.sort_order";
+        if let Ok(csv) = query_to_csv(&conn, dcr_os_sql, DCR_OS_ENTRY_COLS) {
+            let opts2 = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, crate::security::zip_password());
+            zip.start_file("dcr_os_entries.csv", opts2).map_err(|e| e500(&e.to_string()))?;
+            zip.write_all(&csv).map_err(|e| e500(&e.to_string()))?;
+        }
+
         zip.finish().map_err(|e| e500(&e.to_string()))?;
     }
 
     let today = chrono::Local::now().format("%Y-%m-%d");
     let filename = format!("cops_full_backup_{today}.zip");
+    let zip_len = zip_buf.len();
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_string()),
             (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+            (header::CONTENT_LENGTH, zip_len.to_string()),
         ],
         zip_buf,
     ))
@@ -178,9 +334,15 @@ async fn inner_export_db(pool: Arc<DbPool>) -> Result<impl IntoResponse, Err> {
     // rusqlite backup: src → tmp copy
     {
         let src = rusqlite::Connection::open(&src_path).map_err(|e| e500(&e.to_string()))?;
+        // Key must be set on BOTH connections: src to read the encrypted source,
+        // dst so the backup output is also encrypted with the same key.
+        // Without the key on dst the output is plain SQLite and restore will reject it.
+        src.execute_batch(&crate::security::sqlcipher_pragma()).map_err(|e| e500(&e.to_string()))?;
         let mut dst = rusqlite::Connection::open(&tmp_path).map_err(|e| e500(&e.to_string()))?;
+        dst.execute_batch(&crate::security::sqlcipher_pragma()).map_err(|e| e500(&e.to_string()))?;
         let backup = rusqlite::backup::Backup::new(&src, &mut dst).map_err(|e| e500(&e.to_string()))?;
-        backup.run_to_completion(5, Duration::from_millis(100), None).map_err(|e| e500(&e.to_string()))?;
+        // -1 copies all remaining pages in one step (no per-batch sleep) — fastest safe option.
+        backup.run_to_completion(-1, Duration::from_millis(0), None).map_err(|e| e500(&e.to_string()))?;
     }
 
     let bytes = tokio::fs::read(&tmp_path).await.map_err(|e| e500(&e.to_string()))?;
@@ -188,10 +350,12 @@ async fn inner_export_db(pool: Arc<DbPool>) -> Result<impl IntoResponse, Err> {
 
     let today = chrono::Local::now().format("%Y-%m-%d");
     let filename = format!("cops_fulldb_{today}.db");
+    let db_len = bytes.len();
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+            (header::CONTENT_LENGTH, db_len.to_string()),
         ],
         bytes,
     ))
@@ -239,7 +403,7 @@ pub async fn admin_restore_fulldb(
 
             let mut conn = pool.get().map_err(|e| e.to_string())?;
             let backup = rusqlite::backup::Backup::new(&src, &mut *conn).map_err(|e| e.to_string())?;
-            backup.run_to_completion(5, Duration::from_millis(100), None).map_err(|e| e.to_string())
+            backup.run_to_completion(-1, Duration::from_millis(0), None).map_err(|e| e.to_string())
         }
     }).await.map_err(|e| e500(&e.to_string()))?;
 
@@ -411,6 +575,14 @@ pub async fn admin_restore(
     let zip_pass = crate::security::zip_password();
     let mut master_csv: Option<Vec<u8>> = None;
     let mut items_csv:  Option<Vec<u8>> = None;
+    let mut dcr_tariffs_csv:      Option<Vec<u8>> = None;
+    let mut dcr_item_types_csv:   Option<Vec<u8>> = None;
+    let mut dcr_formula_csv:      Option<Vec<u8>> = None;
+    let mut dcr_settings_csv:     Option<Vec<u8>> = None;
+    let mut dcr_sessions_csv:     Option<Vec<u8>> = None;
+    let mut dcr_entries_csv:      Option<Vec<u8>> = None;
+    let mut dcr_dr_entries_csv:   Option<Vec<u8>> = None;
+    let mut dcr_os_entries_csv:   Option<Vec<u8>> = None;
 
     for i in 0..archive.len() {
         // Peek at the file to get name and encryption status, then release the borrow.
@@ -432,8 +604,24 @@ pub async fn admin_restore(
                 .read_to_end(&mut buf)
                 .map_err(|e| e500(&e.to_string()))?;
         }
-        if name.contains("cops_master") { master_csv = Some(buf); }
-        else if name.contains("cops_items") { items_csv = Some(buf); }
+        if name.contains("cops_master")        { master_csv = Some(buf); }
+        else if name.contains("cops_items")    { items_csv = Some(buf); }
+        else if name.contains("dcr_tariffs")   { dcr_tariffs_csv = Some(buf); }
+        else if name.contains("dcr_item_types"){ dcr_item_types_csv = Some(buf); }
+        else if name.contains("dcr_formula")   { dcr_formula_csv = Some(buf); }
+        else if name.contains("dcr_settings")  { dcr_settings_csv = Some(buf); }
+        else if name.contains("dcr_sessions")  { dcr_sessions_csv = Some(buf); }
+        else if name.contains("dcr_dr_entries"){ dcr_dr_entries_csv = Some(buf); }
+        else if name.contains("dcr_os_entries"){ dcr_os_entries_csv = Some(buf); }
+        else if name.contains("dcr_entries")   { dcr_entries_csv = Some(buf); }
+    }
+
+    // Return 400 if upload contains no recognized tables at all
+    let has_any = master_csv.is_some() || items_csv.is_some()
+        || dcr_tariffs_csv.is_some() || dcr_sessions_csv.is_some()
+        || dcr_entries_csv.is_some() || dcr_settings_csv.is_some();
+    if !has_any {
+        return Err(e400("ZIP does not contain any recognised COPS backup files"));
     }
 
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
@@ -490,15 +678,16 @@ pub async fn admin_restore(
                     detained_by, seal_no, nationality, seizure_date,
                     dr_no, dr_year, total_drs, previous_os_details, total_pkgs, closure_ind,
                     post_adj_br_entries, post_adj_dr_no, post_adj_dr_date,
-                    deleted_by, deleted_reason, deleted_on
+                    deleted_by, deleted_reason, deleted_on,
+                    pax_name_modified_by_vig, quashed, rejected
                 ) VALUES (
                     ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                     ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )",
                 rusqlite::params![
                     os_no, os_year,
-                    if get("os_date").is_empty() { None } else { Some(parse_date(get("os_date"))) },
+                    parse_date(get("os_date")),
                     if loc.is_empty() { None } else { Some(loc.clone()) },
                     opt(get("shift")), opt(get("booked_by")), opt(get("case_type")),
                     opt(get("pax_name")), opt(get("pax_nationality")), opt(get("passport_no")),
@@ -541,10 +730,11 @@ pub async fn admin_restore(
                     parse_i64(get("total_pkgs")), opt(get("closure_ind")),
                     opt(get("post_adj_br_entries")), opt(get("post_adj_dr_no")), opt(get("post_adj_dr_date")),
                     opt(get("deleted_by")), opt(get("deleted_reason")), opt(get("deleted_on")),
+                    opt(get("pax_name_modified_by_vig")), opt(get("quashed")), opt(get("rejected")),
                 ],
             ).map_err(|e| e500(&e.to_string()))?;
             existing.insert(key);
-            master_inserted += 1;
+            if conn.changes() > 0 { master_inserted += 1; } else { master_skipped += 1; }
         }
         conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?;
     }
@@ -566,15 +756,6 @@ pub async fn admin_restore(
             if os_no.is_empty() { continue; }
             let os_year = match get("os_year").trim().parse::<i64>() { Ok(y) => y, Err(_) => continue };
             let items_sno = match get("items_sno").trim().parse::<i64>() { Ok(s) => s, Err(_) => continue };
-
-            // Check if item already exists
-            let exists: bool = conn.query_row(
-                "SELECT 1 FROM cops_items WHERE os_no=? AND os_year=? AND items_sno=?",
-                rusqlite::params![os_no, os_year, items_sno],
-                |_| Ok(true),
-            ).optional().map_err(|e| e500(&e.to_string()))?.unwrap_or(false);
-
-            if exists { items_skipped += 1; continue; }
 
             conn.execute(
                 "INSERT OR IGNORE INTO cops_items (
@@ -598,8 +779,303 @@ pub async fn admin_restore(
                     or_n(get("entry_deleted")),
                 ],
             ).map_err(|e| e500(&e.to_string()))?;
-            items_inserted += 1;
+            // changes() == 0 means INSERT OR IGNORE skipped a duplicate — no pre-check needed.
+            if conn.changes() > 0 { items_inserted += 1; } else { items_skipped += 1; }
         }
+        conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?;
+    }
+
+    // ── Restore DCR (Duty Collection Register) tables ─────────────────────────
+    let mut dcr_tariffs_ins  = 0i64;
+    let mut dcr_sessions_ins = 0i64;
+    let mut dcr_entries_ins  = 0i64;
+
+    if dcr_tariffs_csv.is_some() || dcr_sessions_csv.is_some() || dcr_entries_csv.is_some()
+       || dcr_item_types_csv.is_some() || dcr_formula_csv.is_some()
+       || dcr_settings_csv.is_some() || dcr_dr_entries_csv.is_some() || dcr_os_entries_csv.is_some()
+    {
+        conn.execute_batch("BEGIN").map_err(|e| e500(&e.to_string()))?;
+
+        // 1. Tariffs — natural key: effective_from (UNIQUE in schema)
+        let mut tariff_eff_to_id: std::collections::HashMap<String, i64> = {
+            let mut st = conn.prepare("SELECT effective_from, id FROM dcr_tariffs")
+                .map_err(|e| e500(&e.to_string()))?;
+            let rows: Vec<(String, i64)> = st.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?)))
+                .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+            rows.into_iter().collect()
+        };
+        if let Some(bytes) = dcr_tariffs_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    macro_rules! g { ($n:expr) => { hdr.iter().position(|f| f.eq_ignore_ascii_case($n)).and_then(|i| rec.get(i)).unwrap_or("").trim() }; }
+                    let eff = g!("effective_from").to_string();
+                    if eff.is_empty() || tariff_eff_to_id.contains_key(&eff) { continue; }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dcr_tariffs
+                          (effective_from,label,baggage_rate,liquor_duty_rate,aidc_liquor_rate,
+                           gold_bcd_rate,aidc_gold_rate,gold_cons_bcd_rate,aidc_gold_cons_rate,
+                           silver_bcd_rate,aidc_silver_rate,silver_cons_rate,aidc_silver_cons_rate)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            eff, opt(g!("label")),
+                            parse_float(g!("baggage_rate")), parse_float(g!("liquor_duty_rate")),
+                            parse_float(g!("aidc_liquor_rate")), parse_float(g!("gold_bcd_rate")),
+                            parse_float(g!("aidc_gold_rate")), parse_float(g!("gold_cons_bcd_rate")),
+                            parse_float(g!("aidc_gold_cons_rate")), parse_float(g!("silver_bcd_rate")),
+                            parse_float(g!("aidc_silver_rate")), parse_float(g!("silver_cons_rate")),
+                            parse_float(g!("aidc_silver_cons_rate")),
+                        ],
+                    ).ok();
+                    if conn.changes() > 0 {
+                        tariff_eff_to_id.insert(eff, conn.last_insert_rowid());
+                        dcr_tariffs_ins += 1;
+                    }
+                }
+            }
+        }
+        // Sync map with anything already in DB (handles pre-existing rows)
+        {
+            let mut st = conn.prepare("SELECT effective_from, id FROM dcr_tariffs")
+                .map_err(|e| e500(&e.to_string()))?;
+            let rows: Vec<(String, i64)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+            for (eff, id) in rows { tariff_eff_to_id.entry(eff).or_insert(id); }
+        }
+
+        // 2. Item types — natural key: name
+        if let Some(bytes) = dcr_item_types_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    macro_rules! g { ($n:expr) => { hdr.iter().position(|f| f.eq_ignore_ascii_case($n)).and_then(|i| rec.get(i)).unwrap_or("").trim() }; }
+                    let name = g!("name");
+                    if name.is_empty() { continue; }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dcr_item_types (name,usage_count,is_system) VALUES (?,?,?)",
+                        rusqlite::params![name, parse_i64(g!("usage_count")), parse_i64(g!("is_system"))],
+                    ).ok();
+                }
+            }
+        }
+
+        // 3. Formula rules — natural key: (sort_order, target_column)
+        if let Some(bytes) = dcr_formula_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let existing_rules: std::collections::HashSet<(i64, String)> = {
+                    let mut st = conn.prepare("SELECT sort_order,target_column FROM dcr_formula_rules")
+                        .map_err(|e| e500(&e.to_string()))?;
+                    let rows: Vec<(i64, String)> = st.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?)))
+                        .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+                    rows.into_iter().collect()
+                };
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    macro_rules! g { ($n:expr) => { hdr.iter().position(|f| f.eq_ignore_ascii_case($n)).and_then(|i| rec.get(i)).unwrap_or("").trim() }; }
+                    let so = parse_i64(g!("sort_order")).unwrap_or(0);
+                    let tc = g!("target_column").to_string();
+                    if tc.is_empty() || existing_rules.contains(&(so, tc.clone())) { continue; }
+                    let ct = g!("condition_type");
+                    conn.execute(
+                        "INSERT INTO dcr_formula_rules
+                          (sort_order,target_column,column_label,condition_type,
+                           condition_items,expression,is_active,notes)
+                         VALUES (?,?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            so, tc, opt(g!("column_label")),
+                            if ct.is_empty() { "all" } else { ct },
+                            g!("condition_items"), g!("expression"),
+                            parse_i64(g!("is_active")).unwrap_or(1), opt(g!("notes")),
+                        ],
+                    ).ok();
+                }
+            }
+        }
+
+        // 4. Settings — single row, insert-only if absent (preserve existing config)
+        if let Some(bytes) = dcr_settings_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                if let Some(Ok(rec)) = rdr.records().next() {
+                    macro_rules! g { ($n:expr) => { hdr.iter().position(|f| f.eq_ignore_ascii_case($n)).and_then(|i| rec.get(i)).unwrap_or("").trim() }; }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dcr_settings (id,station_name,officer_name,designation)
+                         VALUES (1,?,?,?)",
+                        rusqlite::params![g!("station_name"), opt(g!("officer_name")), opt(g!("designation"))],
+                    ).ok();
+                }
+            }
+        }
+
+        // 5. Sessions — natural key: (report_date, shift, COALESCE(batch_name,''))
+        let mut sess_nk_to_id: std::collections::HashMap<(String,String,String), i64> = {
+            let mut st = conn.prepare(
+                "SELECT report_date,shift,COALESCE(batch_name,''),id FROM dcr_sessions"
+            ).map_err(|e| e500(&e.to_string()))?;
+            let rows: Vec<((String,String,String), i64)> = st.query_map([], |r| Ok(((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?), r.get::<_,i64>(3)?)))
+                .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+            rows.into_iter().collect()
+        };
+        if let Some(bytes) = dcr_sessions_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    macro_rules! g { ($n:expr) => { hdr.iter().position(|f| f.eq_ignore_ascii_case($n)).and_then(|i| rec.get(i)).unwrap_or("").trim() }; }
+                    let rd = g!("report_date").to_string();
+                    let sh = g!("shift").to_string();
+                    let bn = g!("batch_name").to_string();
+                    if rd.is_empty() || sh.is_empty() { continue; }
+                    let nk = (rd.clone(), sh.clone(), bn.clone());
+                    if sess_nk_to_id.contains_key(&nk) { continue; }
+                    let tariff_id = { let e = g!("_tariff_eff"); if e.is_empty() { None } else { tariff_eff_to_id.get(e).copied() } };
+                    conn.execute(
+                        "INSERT INTO dcr_sessions
+                          (report_date,shift,batch_name,tariff_id,created_by,
+                           created_at,submitted_at,submitted_by)
+                         VALUES (?,?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            rd, sh,
+                            if bn.is_empty() { None } else { Some(bn.clone()) },
+                            tariff_id, opt(g!("created_by")), opt(g!("created_at")),
+                            opt(g!("submitted_at")), opt(g!("submitted_by")),
+                        ],
+                    ).ok();
+                    if conn.changes() > 0 {
+                        sess_nk_to_id.insert(nk, conn.last_insert_rowid());
+                        dcr_sessions_ins += 1;
+                    }
+                }
+            }
+        }
+        // Sync map with all sessions now in DB
+        {
+            let mut st = conn.prepare(
+                "SELECT report_date,shift,COALESCE(batch_name,''),id FROM dcr_sessions"
+            ).map_err(|e| e500(&e.to_string()))?;
+            let rows: Vec<((String,String,String),i64)> = st.query_map([], |r| {
+                Ok(((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?), r.get::<_,i64>(3)?))
+            }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+            for (nk, id) in rows { sess_nk_to_id.entry(nk).or_insert(id); }
+        }
+
+        // 6. Main duty entries
+        if let Some(bytes) = dcr_entries_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                let existing_ent: std::collections::HashSet<(i64,i64)> = {
+                    let mut st = conn.prepare("SELECT session_id, sort_order FROM dcr_entries")
+                        .map_err(|e| e500(&e.to_string()))?;
+                    let rows: Vec<(i64,i64)> = st.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?)))
+                        .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+                    rows.into_iter().collect()
+                };
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    let f = |name: &str| -> &str { hdr.iter().position(|h| h.eq_ignore_ascii_case(name)).and_then(|i| rec.get(i)).unwrap_or("").trim() };
+                    let sd = f("_sess_date").to_string(); let ss = f("_sess_shift").to_string(); let sb = f("_sess_batch").to_string();
+                    let so = parse_i64(f("sort_order")).unwrap_or(0);
+                    let sid = match sess_nk_to_id.get(&(sd, ss, sb)) { Some(&id) => id, None => continue };
+                    if existing_ent.contains(&(sid, so)) { continue; }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dcr_entries
+                          (session_id,sort_order,sl_no,br_no,os_ref,item_desc,
+                           dutiable_value,gold_weight_gms,baggage_duty,liquor_duty,cigarette_duty,sw_sc,
+                           gold_duty_bcd,gold_duty_cons,silver_duty_cons,sws_on_gold,
+                           aidc_gold_silver,sws_on_silver,aidc_on_liquor,
+                           redemption_fine,reexport_fine,personal_penalty,other_charges,
+                           fuel_duty,total_duty,flight_no,is_sbi_challan,is_offline_br,overrides)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            sid, so, parse_i64(f("sl_no")),
+                            f("br_no"), f("os_ref"), f("item_desc"),
+                            parse_float(f("dutiable_value")), parse_float(f("gold_weight_gms")),
+                            parse_float(f("baggage_duty")), parse_float(f("liquor_duty")),
+                            parse_float(f("cigarette_duty")), parse_float(f("sw_sc")),
+                            parse_float(f("gold_duty_bcd")), parse_float(f("gold_duty_cons")),
+                            parse_float(f("silver_duty_cons")), parse_float(f("sws_on_gold")),
+                            parse_float(f("aidc_gold_silver")), parse_float(f("sws_on_silver")),
+                            parse_float(f("aidc_on_liquor")), parse_float(f("redemption_fine")),
+                            parse_float(f("reexport_fine")), parse_float(f("personal_penalty")),
+                            parse_float(f("other_charges")), parse_float(f("fuel_duty")),
+                            parse_float(f("total_duty")), f("flight_no"),
+                            parse_i64(f("is_sbi_challan")).unwrap_or(0),
+                            parse_i64(f("is_offline_br")).unwrap_or(0),
+                            opt(f("overrides")),
+                        ],
+                    ).ok();
+                    if conn.changes() > 0 { dcr_entries_ins += 1; }
+                }
+            }
+        }
+
+        // 7. DR sub-entries
+        if let Some(bytes) = dcr_dr_entries_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                let existing_dr: std::collections::HashSet<(i64,i64)> = {
+                    let mut st = conn.prepare("SELECT session_id, sort_order FROM dcr_dr_entries")
+                        .map_err(|e| e500(&e.to_string()))?;
+                    let rows: Vec<(i64,i64)> = st.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?)))
+                        .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+                    rows.into_iter().collect()
+                };
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    let f = |name: &str| -> &str { hdr.iter().position(|h| h.eq_ignore_ascii_case(name)).and_then(|i| rec.get(i)).unwrap_or("").trim() };
+                    let sd = f("_sess_date").to_string(); let ss = f("_sess_shift").to_string(); let sb = f("_sess_batch").to_string();
+                    let so = parse_i64(f("sort_order")).unwrap_or(0);
+                    let sid = match sess_nk_to_id.get(&(sd, ss, sb)) { Some(&id) => id, None => continue };
+                    if existing_dr.contains(&(sid, so)) { continue; }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dcr_dr_entries (session_id,sort_order,dr_no,amount,item_desc,remarks)
+                         VALUES (?,?,?,?,?,?)",
+                        rusqlite::params![sid, so, f("dr_no"), parse_float(f("amount")), f("item_desc"), f("remarks")],
+                    ).ok();
+                    if conn.changes() > 0 { dcr_entries_ins += 1; }
+                }
+            }
+        }
+
+        // 8. OS sub-entries
+        if let Some(bytes) = dcr_os_entries_csv {
+            if let Ok(raw) = decode_csv_bytes(&bytes) {
+                let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+                let hdr = rdr.headers().cloned().unwrap_or_default();
+                let existing_os: std::collections::HashSet<(i64,i64)> = {
+                    let mut st = conn.prepare("SELECT session_id, sort_order FROM dcr_os_entries")
+                        .map_err(|e| e500(&e.to_string()))?;
+                    let rows: Vec<(i64,i64)> = st.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?)))
+                        .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+                    rows.into_iter().collect()
+                };
+                for result in rdr.records() {
+                    let rec = match result { Ok(r) => r, Err(_) => continue };
+                    let f = |name: &str| -> &str { hdr.iter().position(|h| h.eq_ignore_ascii_case(name)).and_then(|i| rec.get(i)).unwrap_or("").trim() };
+                    let sd = f("_sess_date").to_string(); let ss = f("_sess_shift").to_string(); let sb = f("_sess_batch").to_string();
+                    let so = parse_i64(f("sort_order")).unwrap_or(0);
+                    let sid = match sess_nk_to_id.get(&(sd, ss, sb)) { Some(&id) => id, None => continue };
+                    if existing_os.contains(&(sid, so)) { continue; }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dcr_os_entries (session_id,sort_order,os_no,amount,item_desc,remarks)
+                         VALUES (?,?,?,?,?,?)",
+                        rusqlite::params![sid, so, f("os_no"), parse_float(f("amount")), f("item_desc"), f("remarks")],
+                    ).ok();
+                    if conn.changes() > 0 { dcr_entries_ins += 1; }
+                }
+            }
+        }
+
         conn.execute_batch("COMMIT").map_err(|e| e500(&e.to_string()))?;
     }
 
@@ -614,6 +1090,9 @@ pub async fn admin_restore(
         "master_skipped":  master_skipped,
         "items_inserted":  items_inserted,
         "items_skipped":   items_skipped,
+        "dcr_tariffs_inserted":  dcr_tariffs_ins,
+        "dcr_sessions_inserted": dcr_sessions_ins,
+        "dcr_entries_inserted":  dcr_entries_ins,
         "br_inserted": 0, "br_skipped": 0, "br_items_inserted": 0,
         "dr_inserted": 0, "dr_skipped": 0, "dr_items_inserted": 0,
         "users_inserted": 0,

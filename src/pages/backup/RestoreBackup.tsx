@@ -174,7 +174,7 @@ export default function RestoreBackup() {
     if (!adminToken) return;
     loadUsers();
     api.get('/admin/features', { headers: adminHeaders(adminToken) })
-      .then(r => setApisEnabled(r.data.apis_enabled === 'true')).catch(() => {});
+      .then(r => setApisEnabled(r.data.apis_enabled === true || r.data.apis_enabled === 'true')).catch(() => {});
     api.get('/admin/mode', { headers: adminHeaders(adminToken) })
       .then(r => { setProdMode(r.data.mode !== undefined && r.data.mode !== 'sdo'); })
       .catch(() => {});
@@ -601,6 +601,9 @@ export default function RestoreBackup() {
         parts.push(`DR: ${d.dr_inserted} inserted (${d.dr_skipped} skipped), ${d.dr_items_inserted ?? 0} items`);
       if ((d.users_inserted ?? 0) > 0)
         parts.push(`Users: ${d.users_inserted} added`);
+      const dcrCount = (d.dcr_tariffs_inserted ?? 0) + (d.dcr_sessions_inserted ?? 0) + (d.dcr_entries_inserted ?? 0);
+      if (dcrCount > 0)
+        parts.push(`DCR: ${d.dcr_sessions_inserted ?? 0} sessions, ${d.dcr_entries_inserted ?? 0} entries, ${d.dcr_tariffs_inserted ?? 0} tariffs`);
       setRestoreResult(parts.length ? `Restored — ${parts.join(' | ')}` : 'Restore complete (no new records found).');
       setRestoreFile(null);
       if (restoreRef.current) restoreRef.current.value = '';

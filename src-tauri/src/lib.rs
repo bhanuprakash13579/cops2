@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod backup_service;
 mod config;
 mod db;
 mod models;
@@ -359,6 +360,15 @@ pub fn run() {
             }
 
             let pool = Arc::new(pool);
+
+            // Automatic backups. Starts a timer and returns immediately — the
+            // first run is delayed so it does not compete with startup, and the
+            // orphan sweep happens on that first tick rather than here, because
+            // it walks the destination folders and a switched-off machine would
+            // otherwise delay the application appearing.
+            //
+            // Does nothing at all until a destination folder is configured.
+            backup_service::start(pool.clone());
 
             // ── Windows: fix WebView2 double-taskbar thumbnail ────────────────
             // After 800 ms (WebView2 init time), enumerate child windows and set

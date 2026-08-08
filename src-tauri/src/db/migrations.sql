@@ -687,3 +687,123 @@ CREATE INDEX IF NOT EXISTS ix_cops_master_os_date             ON cops_master (os
 -- narrows the candidate set before the linear scan.
 CREATE INDEX IF NOT EXISTS ix_cops_master_pax_name              ON cops_master (pax_name);
 CREATE INDEX IF NOT EXISTS ix_cops_master_country_of_departure  ON cops_master (country_of_departure);
+
+-- ── Duty Collection Report (DCR) Module ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dcr_tariffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    effective_from DATE NOT NULL UNIQUE,
+    label TEXT,
+    baggage_rate REAL NOT NULL DEFAULT 0.35,
+    liquor_duty_rate REAL NOT NULL DEFAULT 0.15,
+    aidc_liquor_rate REAL NOT NULL DEFAULT 0.035,
+    gold_bcd_rate REAL NOT NULL DEFAULT 0.125,
+    aidc_gold_rate REAL NOT NULL DEFAULT 0.05,
+    gold_cons_bcd_rate REAL NOT NULL DEFAULT 0.125,
+    aidc_gold_cons_rate REAL NOT NULL DEFAULT 0.05,
+    silver_bcd_rate REAL NOT NULL DEFAULT 0.35,
+    aidc_silver_rate REAL NOT NULL DEFAULT 0.05,
+    silver_cons_rate REAL NOT NULL DEFAULT 0.35,
+    aidc_silver_cons_rate REAL NOT NULL DEFAULT 0.05,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS dcr_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date DATE NOT NULL,
+    shift TEXT NOT NULL CHECK(shift IN ('DAY','NIGHT')),
+    batch_name TEXT,
+    tariff_id INTEGER REFERENCES dcr_tariffs(id),
+    created_by TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    submitted_at DATETIME,
+    submitted_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_dcr_sessions_date_shift
+    ON dcr_sessions (report_date, shift, COALESCE(batch_name,''));
+
+CREATE TABLE IF NOT EXISTS dcr_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES dcr_sessions(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    sl_no INTEGER,
+    br_no TEXT NOT NULL DEFAULT '',
+    os_ref TEXT NOT NULL DEFAULT '',
+    item_desc TEXT NOT NULL DEFAULT '',
+    dutiable_value REAL NOT NULL DEFAULT 0,
+    gold_weight_gms REAL NOT NULL DEFAULT 0,
+    baggage_duty REAL NOT NULL DEFAULT 0,
+    liquor_duty REAL NOT NULL DEFAULT 0,
+    cigarette_duty REAL NOT NULL DEFAULT 0,
+    sw_sc REAL NOT NULL DEFAULT 0,
+    gold_duty_bcd REAL NOT NULL DEFAULT 0,
+    gold_duty_cons REAL NOT NULL DEFAULT 0,
+    silver_duty_cons REAL NOT NULL DEFAULT 0,
+    sws_on_gold REAL NOT NULL DEFAULT 0,
+    aidc_gold_silver REAL NOT NULL DEFAULT 0,
+    sws_on_silver REAL NOT NULL DEFAULT 0,
+    aidc_on_liquor REAL NOT NULL DEFAULT 0,
+    redemption_fine REAL NOT NULL DEFAULT 0,
+    reexport_fine REAL NOT NULL DEFAULT 0,
+    personal_penalty REAL NOT NULL DEFAULT 0,
+    other_charges REAL NOT NULL DEFAULT 0,
+    fuel_duty REAL NOT NULL DEFAULT 0,
+    total_duty REAL NOT NULL DEFAULT 0,
+    flight_no TEXT NOT NULL DEFAULT '',
+    is_sbi_challan INTEGER NOT NULL DEFAULT 0,
+    is_offline_br INTEGER NOT NULL DEFAULT 0,
+    overrides TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dcr_dr_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES dcr_sessions(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    dr_no TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL DEFAULT 0,
+    item_desc TEXT NOT NULL DEFAULT '',
+    remarks TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS dcr_os_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES dcr_sessions(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    os_no TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL DEFAULT 0,
+    item_desc TEXT NOT NULL DEFAULT '',
+    remarks TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS dcr_item_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    usage_count INTEGER NOT NULL DEFAULT 0,
+    is_system INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS dcr_formula_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    target_column TEXT NOT NULL,
+    column_label TEXT,
+    condition_type TEXT NOT NULL DEFAULT 'all' CHECK(condition_type IN ('all','only','except')),
+    condition_items TEXT NOT NULL DEFAULT '',
+    expression TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dcr_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL CHECK(id = 1),
+    station_name TEXT NOT NULL DEFAULT 'CUSTOMS, CHENNAI AIRPORT',
+    officer_name TEXT,
+    designation TEXT
+);
+
+-- Admin-editable runtime settings (backup folders, interval, retention, and the
+-- backup service's own bookkeeping). Kept as key/value so adding a setting does
+-- not require a schema change.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);

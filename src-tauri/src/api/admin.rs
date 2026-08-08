@@ -50,7 +50,14 @@ pub async fn get_features(State(pool): Db) -> Result<Json<Value>, Err> {
     }).map_err(|e| e500(&e.to_string()))?;
 
     for row in rows.filter_map(|r| r.ok()) {
-        map.insert(row.0, json!(row.1));
+        // Store as JSON booleans so frontend `!!value` comparisons work correctly.
+        // The DB stores "true"/"false" strings; keep non-boolean values as strings.
+        let val = match row.1.to_lowercase().as_str() {
+            "true"  => json!(true),
+            "false" => json!(false),
+            _       => json!(row.1),
+        };
+        map.insert(row.0, val);
     }
     Ok(Json(Value::Object(map)))
 }

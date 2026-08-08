@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ClipboardEdit, Gavel, ArrowRight, Search, ScanLine, ExternalLink, Mail } from 'lucide-react';
+import { ClipboardEdit, Gavel, ArrowRight, Search, ScanLine, ExternalLink, Mail, ClipboardList } from 'lucide-react';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import api from '@/lib/api';
 
@@ -8,13 +8,17 @@ export default function ModuleSelection() {
   const navigate = useNavigate();
   const [secretClicks, setSecretClicks] = useState(0);
   const [apisEnabled, setApisEnabled] = useState(() => localStorage.getItem('cops_apis_enabled') === 'true');
+  const [dcrEnabled, setDcrEnabled] = useState(() => localStorage.getItem('cops_dcr_enabled') === 'true');
 
   useEffect(() => {
     api.get('/features')
       .then(r => {
-        const enabled = !!r.data.apis_enabled;
-        setApisEnabled(enabled);
-        localStorage.setItem('cops_apis_enabled', String(enabled));
+        const apis = !!r.data.apis_enabled;
+        const dcr  = !!r.data.dcr_enabled;
+        setApisEnabled(apis);
+        setDcrEnabled(dcr);
+        localStorage.setItem('cops_apis_enabled', String(apis));
+        localStorage.setItem('cops_dcr_enabled',  String(dcr));
       })
       .catch(() => {});
   }, []);
@@ -57,7 +61,7 @@ export default function ModuleSelection() {
         </div>
 
         {/* Module Cards */}
-        <div className={`grid grid-cols-1 md:grid-cols-2 ${apisEnabled ? 'lg:grid-cols-4' : 'lg:grid-cols-3'} gap-5 mb-10`}>
+        <div className={`grid grid-cols-1 md:grid-cols-2 ${(apisEnabled || dcrEnabled) ? 'lg:grid-cols-4' : 'lg:grid-cols-3'} gap-5 mb-10`}>
 
           {/* SDO Module Card */}
           <button
@@ -163,6 +167,33 @@ export default function ModuleSelection() {
             <div className="mt-6 pt-6 border-t border-white/10">
               <span className="text-xs text-violet-300/70 uppercase tracking-wider">
                 Access: SDO · DC · AC
+              </span>
+            </div>
+          </button>}
+
+          {/* DCR Module Card — only shown when enabled by admin */}
+          {dcrEnabled && <button
+            onClick={() => navigate('/login/dcr')}
+            className="group relative bg-white/10 border border-white/20 rounded-2xl p-6 text-left hover:bg-white/20 hover:border-teal-400/50 hover:shadow-2xl hover:shadow-teal-500/20 transition-[transform,box-shadow,background-color,border-color] duration-300 hover:-translate-y-1 focus:outline-none focus:ring-2 focus:ring-teal-400"
+            id="btn-dcr-module"
+          >
+            <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-transparent via-teal-400 to-transparent rounded-t-2xl opacity-0 group-hover:opacity-100 transition-opacity" />
+
+            <div className="flex items-start justify-between mb-6">
+              <div className="bg-teal-500/20 border border-teal-400/30 p-4 rounded-xl group-hover:bg-teal-500/30 transition-colors">
+                <ClipboardList className="w-8 h-8 text-teal-300" />
+              </div>
+              <ArrowRight className="text-white/30 group-hover:text-teal-300 group-hover:translate-x-1 transition-[transform,color] mt-2" size={24} />
+            </div>
+
+            <div className="space-y-2 mb-6">
+              <h2 className="text-2xl font-bold text-white">Revenue Report</h2>
+              <p className="text-teal-200 text-sm font-medium uppercase tracking-widest">Duty Collection Register</p>
+            </div>
+
+            <div className="mt-6 pt-6 border-t border-white/10">
+              <span className="text-xs text-teal-300/70 uppercase tracking-wider">
+                Access: All Authorized Officers
               </span>
             </div>
           </button>}

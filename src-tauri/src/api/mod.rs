@@ -27,6 +27,7 @@ mod dashboard;
 mod apis;
 mod queries;
 mod reports;
+mod dcr;
 
 use std::sync::Arc;
 use axum::{Router, routing::{get, post, put, delete, patch}};
@@ -181,6 +182,20 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         // ── App mode / feature flags (public — splash screen / route guard) ──
         .route("/mode",     get(admin::get_mode))
         .route("/features", get(admin::get_features))
+
+        // ── Duty Collection Report (DCR) ─────────────────────────────────────────
+        .route("/dcr/sessions",                          get(dcr::list_sessions).post(dcr::create_session))
+        .route("/dcr/sessions/{id}",                     get(dcr::get_session).put(dcr::update_session))
+        .route("/dcr/sessions/{id}/entries",             put(dcr::bulk_save_entries))
+        .route("/dcr/sessions/{id}/submit",              post(dcr::submit_session))
+        .route("/dcr/sessions/{id}/unsubmit",            post(dcr::unsubmit_session))
+        .route("/dcr/tariffs",                           get(dcr::list_tariffs).post(dcr::create_tariff))
+        .route("/dcr/formula-rules",                     get(dcr::list_rules).post(dcr::create_rule))
+        .route("/dcr/formula-rules/reorder",             post(dcr::reorder_rules))
+        .route("/dcr/formula-rules/{id}",                put(dcr::update_rule).delete(dcr::delete_rule))
+        .route("/dcr/item-types",                        get(dcr::list_item_types).post(dcr::create_item_type))
+        .route("/dcr/item-types/{id}/use",               patch(dcr::use_item_type))
+        .route("/dcr/settings",                          get(dcr::get_settings).put(dcr::update_settings))
 
         // ── Health ────────────────────────────────────────────────────────────
         .route("/health", get(|| async { "ok" }))
