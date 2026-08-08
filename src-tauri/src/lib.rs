@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod backup_export;
 mod backup_service;
 mod config;
 mod db;
