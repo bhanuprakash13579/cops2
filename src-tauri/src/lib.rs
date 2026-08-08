@@ -1,9 +1,9 @@
-mod api;
-mod auth;
+pub mod api;
+pub mod auth;
 mod backup_export;
 mod backup_service;
 mod config;
-mod db;
+pub mod db;
 mod models;
 mod pdf;
 mod security;

@@ -161,6 +161,19 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/backup/custom-report",             post(backup::custom_report))
         .route("/backup/adjudication-summary-pdf",  post(backup::adjudication_summary_pdf))
 
+        // ── Automatic backups ────────────────────────────────────────────────
+        // Status and the archive download are open to any signed-in officer:
+        // the archive is the copy that leaves the building, and requiring the
+        // administrator to be present to take one is how a month goes by
+        // without anybody taking one. Changing where backups go, and forcing a
+        // run, stay with the administrator.
+        .route("/backup/auto/status",               get(backup::auto_status))
+        .route("/backup/archive/status",            get(backup::archive_status))
+        .route("/backup/archive/download",          get(backup::archive_download))
+        .route("/admin/backup/auto/run",            post(backup::auto_run_now))
+        .route("/admin/backup/auto/settings",       post(backup::auto_settings))
+        .route("/admin/backup/auto/test-folder",    post(backup::auto_test_folder))
+
         // ── Admin Backup / Restore ─────────────────────────────────────────────
         .route("/admin/backup/export",              get(backup::admin_export_csv))
         .route("/admin/backup/export-fulldb",       get(backup::admin_export_db))

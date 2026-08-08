@@ -1672,3 +1672,205 @@ fn parse_float_opt(s: &str) -> Option<f64> {
     let s = s.trim();
     if s.is_empty() { None } else { s.parse::<f64>().ok() }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Automatic backups — status, manual run, settings, and downloading an archive.
+//
+// The handlers here are deliberately thin. Every rule that protects the data
+// lives in `backup_service` and `backup_export`, so a second entry point cannot
+// arrive later and quietly bypass the safety floor or the verification.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// How long a database may go without an off-machine archive before the officer
+/// is reminded, and before the reminder becomes hard to ignore.
+const ARCHIVE_DUE_DAYS: i64 = 30;
+const ARCHIVE_OVERDUE_DAYS: i64 = 45;
+
+fn get_setting(pool: &DbPool, key: &str) -> Option<String> {
+    pool.get().ok()?.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1", [key], |r| r.get::<_, String>(0)
+    ).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<(), Err> {
+    pool.get().map_err(|e| e500(&e.to_string()))?
+        .execute(
+            "INSERT INTO app_settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(|e| e500(&e.to_string()))?;
+    Ok(())
+}
+
+/// What the panel shows: where backups go, whether those folders answer, when
+/// one last succeeded, and whether the safety floor is currently refusing.
+pub async fn auto_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
+    let p = pool.clone();
+    // Probing folders touches the filesystem and a dead share costs seconds —
+    // never on the async runtime, or every other request waits behind it.
+    let dests = tokio::task::spawn_blocking(move || {
+        crate::backup_service::destinations(&p)
+            .into_iter()
+            .map(|d| {
+                let (ok, detail) = crate::backup_service::probe_destination(&d);
+                let remote = crate::backup_service::is_remote(&d);
+                serde_json::json!({
+                    "path": d, "reachable": ok, "detail": detail, "off_machine": remote,
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| e500(&e.to_string()))?;
+
+    // A backup that only ever lands on this machine does not survive this
+    // machine failing, which is the entire point of taking one. Worth saying
+    // plainly in the panel rather than leaving the officer to infer it.
+    let any_off_machine = dests.iter().any(|d| d["off_machine"] == true);
+
+    Ok(Json(serde_json::json!({
+        "destinations":     dests,
+        "any_off_machine":  any_off_machine,
+        "interval_minutes": crate::backup_service::interval_minutes(&pool),
+        "keep_copies":      crate::backup_service::keep_copies(&pool),
+        "last_success":     get_setting(&pool, "backup_last_success"),
+        "refusing":         get_setting(&pool, "backup_shrink_blocked"),
+    })))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct RunNow {
+    /// Override the safety floor. Only ever set from an explicit confirmation,
+    /// because it permits an emptied database to overwrite good backups.
+    #[serde(default)]
+    pub allow_shrink: bool,
+}
+
+pub async fn auto_run_now(
+    State(pool): Db,
+    _admin: AdminUser,
+    body: Option<Json<RunNow>>,
+) -> Result<Json<Value>, Err> {
+    let allow_shrink = body.map(|Json(b)| b.allow_shrink).unwrap_or(false);
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::backup_service::run_once(&pool, true, allow_shrink)
+    })
+    .await
+    .map_err(|e| e500(&e.to_string()))?;
+    Ok(Json(serde_json::to_value(outcome).map_err(|e| e500(&e.to_string()))?))
+}
+
+#[derive(serde::Deserialize)]
+pub struct AutoSettings {
+    pub dirs: Option<String>,
+    pub interval_minutes: Option<u64>,
+    pub keep: Option<usize>,
+}
+
+pub async fn auto_settings(
+    State(pool): Db,
+    _admin: AdminUser,
+    Json(s): Json<AutoSettings>,
+) -> Result<Json<Value>, Err> {
+    if let Some(d) = s.dirs {
+        set_setting(&pool, "backup_dirs", d.trim())?;
+    }
+    if let Some(m) = s.interval_minutes {
+        set_setting(&pool, "backup_interval_minutes", &m.max(5).to_string())?;
+    }
+    if let Some(k) = s.keep {
+        // Floored at two here as well as in the service. The second copy is the
+        // only thing between a corrupted database and having nothing to restore
+        // from, so it must not be settable to one from the panel.
+        set_setting(&pool, "backup_keep", &k.max(2).to_string())?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Try a folder before saving it, so a typo is caught while the officer is
+/// still looking at the field rather than silently failing every night.
+pub async fn auto_test_folder(
+    State(_pool): Db,
+    _admin: AdminUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, Err> {
+    let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if path.trim().is_empty() {
+        return Err(e400("no folder given"));
+    }
+    let remote = crate::backup_service::is_remote(&path);
+    let (ok, detail) = tokio::task::spawn_blocking(move || {
+        crate::backup_service::probe_destination(&path)
+    })
+    .await
+    .map_err(|e| e500(&e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "ok": ok, "detail": detail, "off_machine": remote,
+    })))
+}
+
+/// Whether the officer is overdue an archive they keep themselves.
+///
+/// Automatic backups go to folders that may all be on this site; this is the
+/// copy that leaves the building. Reported as a state, never enforced here —
+/// blocking the app on a failed backup would turn a backup problem into an
+/// outage, and the officers still have cases to book.
+pub async fn archive_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
+    let last = get_setting(&pool, "archive_last_downloaded");
+    let days = last
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| (chrono::Local::now() - t.with_timezone(&chrono::Local)).num_days());
+    let state = match days {
+        None => "never",
+        Some(d) if d >= ARCHIVE_OVERDUE_DAYS => "overdue",
+        Some(d) if d >= ARCHIVE_DUE_DAYS => "due",
+        _ => "ok",
+    };
+    Ok(Json(serde_json::json!({
+        "state": state, "days_since": days, "last": last,
+        "due_days": ARCHIVE_DUE_DAYS, "overdue_days": ARCHIVE_OVERDUE_DAYS,
+    })))
+}
+
+/// Build a compact archive and stream it to the browser.
+///
+/// Streamed from disk rather than read into a Vec first. The existing
+/// `inner_export_db` buffers the whole database in memory before sending, which
+/// is survivable at 44 MB and is not at 10 GB — and reading a file into memory
+/// to hand it straight to a socket is the failure mode that broke the download
+/// in the sibling project.
+pub async fn archive_download(State(pool): Db, _auth: AuthUser) -> Result<axum::response::Response, Err> {
+    let tmp = std::env::temp_dir()
+        .join(format!("cops_archive_{}.cops", uuid::Uuid::new_v4()));
+
+    let p = pool.clone();
+    let t = tmp.clone();
+    let report = tokio::task::spawn_blocking(move || crate::backup_export::write_archive(&p, &t))
+        .await
+        .map_err(|e| e500(&e.to_string()))?
+        .map_err(|e| e500(&format!("could not build the archive: {e}")))?;
+
+    let file = tokio::fs::File::open(&tmp).await.map_err(|e| e500(&e.to_string()))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let filename = format!("cops_backup_{today}.cops");
+
+    // Recorded now rather than when the stream finishes: the reminder exists to
+    // prompt the habit, and a browser that cancels a download half way is not
+    // worth pestering the officer about a second time the same day.
+    let _ = set_setting(&pool, "archive_last_downloaded", &chrono::Local::now().to_rfc3339());
+
+    // The temp file is removed by the periodic orphan sweep; deleting it here
+    // would pull it out from under the stream that is still reading it.
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+            (header::CONTENT_LENGTH, report.archive_bytes.to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}

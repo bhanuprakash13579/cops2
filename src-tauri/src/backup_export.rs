@@ -5,10 +5,12 @@
 //! The obvious backup is a copy of the database file. It was measured on the
 //! real Chennai database (827,140 rows) and it is the worst of the options:
 //!
+//! ```text
 //!     full encrypted .db copy .................... 242.6 MB
 //!     every CSV, uncompressed ................... 199.1 MB
 //!     tables that hold data, as a plain .db ..... 177.5 MB
 //!     THE SAME FILE, compressed + encrypted ...... 44.4 MB
+//! ```
 //!
 //! Two things were learned from those numbers, and both shaped this module.
 //!
@@ -21,7 +23,9 @@
 //! 242.7 MB — because encryption leaves no redundancy to squeeze. So the order
 //! of operations is forced, and it is the whole trick here:
 //!
+//! ```text
 //!     export plain  →  compress  →  encrypt
+//! ```
 //!
 //! Compressing after encrypting, which is what copying the .db file amounts to,
 //! cannot work no matter which algorithm is used.

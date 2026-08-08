@@ -8,8 +8,10 @@
 //! The two costs are deliberately separated, because conflating them makes a
 //! backup scheme either wasteful or useless:
 //!
+//! ```text
 //!     RETENTION costs disk    — how many copies are kept
 //!     FREQUENCY costs seconds — how often one is taken
+//! ```
 //!
 //! So retention is small and fixed (two copies) while frequency is high (every
 //! 30 minutes), and the exposure window is half an hour rather than a day.
