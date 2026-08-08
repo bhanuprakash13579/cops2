@@ -24,6 +24,22 @@ function formatProgress(loaded: number, total: number | undefined): string {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+interface AutoBackupDestination {
+  path: string;
+  reachable: boolean;
+  detail: string;
+  off_machine: boolean;
+}
+
+interface AutoBackupStatus {
+  destinations: AutoBackupDestination[];
+  any_off_machine: boolean;
+  interval_minutes: number;
+  keep_copies: number;
+  last_success: string | null;
+  refusing: string | null;
+}
+
 interface DeviceInfo {
   mac: string;
   hostname: string;
@@ -110,6 +126,13 @@ export default function RestoreBackup() {
   const [addDeviceErr, setAddDeviceErr] = useState('');
   const [addDeviceMsg, setAddDeviceMsg] = useState('');
   const [deviceMsg, setDeviceMsg] = useState('');
+
+  // Compact backup — the recommended one. Written straight to disk by the
+  // backend, so nothing is buffered in the page and size stops mattering.
+  const [compactLoading, setCompactLoading] = useState(false);
+  const [compactMsg, setCompactMsg] = useState('');
+  const [compactErr, setCompactErr] = useState(false);
+  const [autoStatus, setAutoStatus] = useState<AutoBackupStatus | null>(null);
 
   // Backup download
   const [backupLoading, setBackupLoading] = useState(false);
@@ -345,6 +368,61 @@ export default function RestoreBackup() {
       alert(err.response?.data?.detail || 'Failed to delete user.');
     }
   };
+
+  // ── Compact backup ────────────────────────────────────────────────────────
+  // The officer picks the file; the BACKEND writes it. Deliberately not an HTTP
+  // download: that route holds the whole archive in the page as a blob and then
+  // copies it again into an ArrayBuffer before writing, which is what broke the
+  // old full-database download once the database grew.
+  const saveCompactBackup = async () => {
+    setCompactLoading(true);
+    setCompactMsg('');
+    setCompactErr(false);
+    try {
+      const defaultName = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
+      let savePath: string | null = null;
+      try {
+        const { save } = await import('@tauri-apps/plugin-dialog');
+        savePath = await save({
+          title: 'Save COPS Backup',
+          defaultPath: defaultName,
+          filters: [{ name: 'COPS Backup', extensions: ['cops'] }],
+        });
+      } catch {
+        // Running in a plain browser rather than the desktop shell — fall back
+        // to the streaming download, which is correct there.
+        window.location.href = `${api.defaults.baseURL}/backup/archive/download`;
+        setCompactLoading(false);
+        return;
+      }
+      if (!savePath) { setCompactMsg('Save cancelled.'); setCompactLoading(false); return; }
+
+      setCompactMsg('Building the backup…');
+      // Must carry the ADMIN token explicitly. This page is reachable without an
+      // officer being signed in, so the interceptor's localStorage token may not
+      // exist — the call would 401 and the response interceptor would clear the
+      // session token as a side effect.
+      const res = await api.post('/backup/archive/save', { path: savePath },
+        { timeout: 0, headers: adminHeaders(adminToken) });
+      setCompactMsg(res.data.message || 'Backup saved.');
+      showDownloadToast(`Backup saved to ${savePath}`);
+      loadAutoStatus();
+    } catch (err: unknown) {
+      setCompactErr(true);
+      setCompactMsg((err as any)?.response?.data?.detail || (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setCompactLoading(false);
+    }
+  };
+
+  const loadAutoStatus = async () => {
+    try {
+      const r = await api.get('/backup/auto/status', { headers: adminHeaders(adminToken) });
+      setAutoStatus(r.data);
+    } catch { /* status is informational; never block the page on it */ }
+  };
+
+  useEffect(() => { if (activeTab === 'backup' && adminToken) loadAutoStatus(); }, [activeTab, adminToken]);
 
   // ── Backup download ───────────────────────────────────────────────────────
   const downloadBackup = async () => {
@@ -1136,12 +1214,99 @@ export default function RestoreBackup() {
       {activeTab === 'backup' && (
         <div className="space-y-5">
 
-          {/* ── Full SQLite DB backup (recommended) ── */}
+          {/* ── Compact backup — the one officers should use ── */}
           <section className="bg-white rounded-xl border border-emerald-200 shadow-sm p-5 space-y-3">
             <div className="flex items-center gap-2">
               <Database size={18} className="text-emerald-600" />
               <div>
-                <h2 className="text-sm font-semibold text-slate-700">Full Database Backup <span className="ml-1 text-xs font-normal text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">Recommended</span></h2>
+                <h2 className="text-sm font-semibold text-slate-700">
+                  Backup
+                  <span className="ml-1 text-xs font-normal text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">Recommended</span>
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Every record — OS cases, BR, detention, plus users, print templates, duty
+                  rates and all settings. Compressed and password-protected, so it is about
+                  six times smaller than a copy of the database and does not slow down as the
+                  data grows.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={saveCompactBackup} disabled={compactLoading}
+                className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60">
+                <Download size={13} />
+                {compactLoading ? 'Working…' : 'Save Backup'}
+              </button>
+              {autoStatus?.last_success && (
+                <span className="text-xs text-slate-500">
+                  Automatic backup last succeeded {new Date(autoStatus.last_success).toLocaleString()}
+                </span>
+              )}
+            </div>
+            {compactMsg && (
+              <p className={`text-xs ${compactErr ? 'text-red-600' : 'text-emerald-700'}`}>{compactMsg}</p>
+            )}
+          </section>
+
+          {/* ── Automatic backups ── */}
+          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <RefreshCw size={18} className="text-slate-500" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-700">Automatic Backups</h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {autoStatus
+                    ? `Every ${autoStatus.interval_minutes} minutes, keeping ${autoStatus.keep_copies} copies in each folder.`
+                    : 'Checking…'}
+                </p>
+              </div>
+            </div>
+
+            {autoStatus && autoStatus.destinations.length === 0 && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                No backup folder is set, so no automatic backups are being taken. Set one on
+                another machine on the network — a backup that only ever lands on this
+                computer does not survive this computer failing.
+              </p>
+            )}
+
+            {autoStatus && autoStatus.destinations.length > 0 && (
+              <>
+                <ul className="space-y-1.5">
+                  {autoStatus.destinations.map((d) => (
+                    <li key={d.path} className="flex items-start gap-2 text-xs">
+                      <span className={`mt-0.5 w-2 h-2 rounded-full shrink-0 ${d.reachable ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                      <span className="font-mono text-slate-700 break-all">{d.path}</span>
+                      <span className={d.reachable ? 'text-slate-500' : 'text-red-600'}>
+                        {d.reachable ? (d.off_machine ? 'another machine' : 'this machine') : d.detail}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {!autoStatus.any_off_machine && (
+                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    Every backup folder is on this computer. If this machine fails, the
+                    backups fail with it. Add a folder on another PC on the network.
+                  </p>
+                )}
+              </>
+            )}
+
+            {autoStatus?.refusing && (
+              <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                <strong>Automatic backups are being refused.</strong> {autoStatus.refusing} —
+                the existing backups have been left untouched deliberately. Check the
+                database before overriding this.
+              </p>
+            )}
+          </section>
+
+          {/* ── Full SQLite DB backup (advanced) ── */}
+          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <Database size={18} className="text-slate-500" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-700">Full Database File <span className="ml-1 text-xs font-normal text-slate-600 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">Advanced</span></h2>
                 <p className="text-xs text-slate-500 mt-0.5">Complete snapshot of every table — OS cases, BR register, detention, warehouse, users, settings, template history, statutes, all masters. One file restores everything exactly.</p>
               </div>
             </div>

@@ -2007,3 +2007,52 @@ pub async fn admin_restore_archive(
     let body = result.map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "detail": e }))))?;
     Ok(Json(body))
 }
+
+/// Write an archive directly to a path the officer chose.
+///
+/// This is the route the desktop app should use, and it exists because the
+/// browser-shaped alternative does not survive a large database. Downloading
+/// over HTTP means the whole archive is held as a blob, then copied AGAIN into
+/// an ArrayBuffer to be written to disk — roughly 2x the archive in memory
+/// before a single byte reaches the file. That is what broke the old full-database
+/// download, and it comes back at any size if the transfer goes through the page.
+///
+/// Here the server writes the file itself. Nothing is transferred, nothing is
+/// buffered, and a 10 GB database costs the same memory as a 10 MB one. It is
+/// only reasonable because the server is this same desktop application, running
+/// on localhost as the officer who picked the path.
+pub async fn archive_save_to(
+    State(pool): Db,
+    _auth: AuthUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, Err> {
+    let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if path.is_empty() {
+        return Err(e400("No destination chosen"));
+    }
+    let dest = std::path::PathBuf::from(&path);
+    if dest.is_dir() {
+        return Err(e400("That is a folder, not a file name"));
+    }
+
+    let p = pool.clone();
+    let d = dest.clone();
+    let report = tokio::task::spawn_blocking(move || crate::backup_export::write_archive(&p, &d))
+        .await
+        .map_err(|e| e500(&e.to_string()))?
+        .map_err(|e| e400(&format!("Could not write the backup: {e}")))?;
+
+    let _ = set_setting(&pool, "archive_last_downloaded", &chrono::Local::now().to_rfc3339());
+
+    Ok(Json(serde_json::json!({
+        "path":   path,
+        "tables": report.tables,
+        "rows":   report.rows,
+        "size_mb": (report.archive_bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0,
+        "compression": format!("{:.1}x", report.ratio()),
+        "message": format!(
+            "Backup saved — {} records from {} tables, {:.1} MB.",
+            report.rows, report.tables, report.archive_bytes as f64 / 1_048_576.0
+        ),
+    })))
+}

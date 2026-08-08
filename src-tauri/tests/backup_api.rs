@@ -275,3 +275,44 @@ async fn a_file_that_is_not_a_backup_changes_nothing() {
         .send().await.unwrap().json().await.unwrap();
     assert!(after.get("destinations").is_some());
 }
+
+#[tokio::test]
+async fn the_backend_writes_the_backup_straight_to_a_chosen_path() {
+    // The route the desktop app actually uses. Nothing crosses the HTTP body,
+    // so the archive is never held in the page — which is what broke the old
+    // full-database download once the data grew.
+    let (base, dir) = serve().await;
+    let target = dir.path().join("chosen").join("my_backup.cops");
+
+    let r = reqwest::Client::new()
+        .post(format!("{base}/backup/archive/save"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "path": target.to_str().unwrap() }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+
+    assert!(target.exists(), "the file must be written where the officer asked: {body}");
+    let bytes = std::fs::read(&target).unwrap();
+    assert_eq!(&bytes[..2], b"PK", "not a zip");
+    assert!(body["rows"].as_i64().unwrap_or(0) >= 200, "should report what it saved: {body}");
+    assert!(body["message"].as_str().unwrap_or("").contains("records"), "{body}");
+}
+
+#[tokio::test]
+async fn saving_to_a_folder_or_to_nowhere_is_refused_clearly() {
+    let (base, dir) = serve().await;
+    let c = reqwest::Client::new();
+
+    for (payload, what) in [
+        (serde_json::json!({ "path": "" }), "an empty path"),
+        (serde_json::json!({}), "no path at all"),
+        (serde_json::json!({ "path": dir.path().to_str().unwrap() }), "a folder"),
+    ] {
+        let r = c.post(format!("{base}/backup/archive/save"))
+            .bearer_auth(officer_token())
+            .json(&payload)
+            .send().await.unwrap();
+        assert_eq!(r.status(), 400, "{what} must be refused, not written");
+    }
+}

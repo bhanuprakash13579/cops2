@@ -170,6 +170,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/backup/auto/status",               get(backup::auto_status))
         .route("/backup/archive/status",            get(backup::archive_status))
         .route("/backup/archive/download",          get(backup::archive_download))
+        .route("/backup/archive/save",              post(backup::archive_save_to))
         .route("/admin/backup/auto/run",            post(backup::auto_run_now))
         .route("/admin/backup/auto/settings",       post(backup::auto_settings))
         .route("/admin/backup/auto/test-folder",    post(backup::auto_test_folder))
