@@ -571,6 +571,20 @@ pub fn run() {
             }
             let listener: std::net::TcpListener = socket.into();
 
+            // MUST be non-blocking before tokio adopts it.
+            //
+            // A socket2 socket is blocking by default, and tokio does not accept
+            // a blocking file descriptor — since 1.51 it PANICS rather than
+            // misbehaving: "Registering a blocking socket with the tokio runtime
+            // is unsupported." The panic happens on the runtime worker, so the
+            // careful error handling just below never runs and nothing is
+            // emitted to the window: the app starts, logs that the API is
+            // listening, and then answers nothing at all. Every request fails
+            // with no server-side trace of why.
+            if let Err(e) = listener.set_nonblocking(true) {
+                return Err(format!("Could not prepare the API socket: {e}").into());
+            }
+
             let app_handle_for_axum = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let tcp = match tokio::net::TcpListener::from_std(listener) {
