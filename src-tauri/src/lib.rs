@@ -190,15 +190,80 @@ fn migrate_cops1(src_path: &Path, dst_path: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to initialise cops2 DB key: {e}"))?;
 
     // Page-by-page copy via SQLCipher's backup API.
-    // steps=5 pages per iteration, 50 ms sleep between — keeps the source DB
-    // readable if anything else has it open during migration.
+    //
+    // 1000 pages per step with a 5 ms pause, NOT 5 pages per 50 ms. The pause is
+    // taken between every step, so the step size sets the total time: a 242 MB
+    // database is roughly 62,000 pages, which at 5 pages per 50 ms is about ten
+    // minutes of what looks to the officer like a hung first launch. At this
+    // rate the same copy is a few seconds. The pause still exists so the source
+    // stays readable if anything else has it open.
     let backup = Backup::new(&src, &mut dst)?;
-    backup.run_to_completion(5, Duration::from_millis(50), None)?;
+    backup.run_to_completion(1000, Duration::from_millis(5), None)?;
+    drop(backup);
+
+    // Prove the copy is complete BEFORE the caller is told it succeeded.
+    //
+    // This matters more here than anywhere else in the program: on success the
+    // caller securely wipes the cops1 database — zeroed and deleted, with no
+    // recovery. Returning Ok on the strength of "the copy did not error" would
+    // mean a subtly incomplete migration destroys the only original. The byte
+    // size that used to be logged here proves nothing at all about content.
+    verify_migration(&src, &dst)?;
 
     tracing::info!(
-        "cops1 → cops2 migration complete ({} bytes, re-encrypted with SHA-256-v2 key)",
+        "cops1 → cops2 migration complete and verified ({} bytes, re-encrypted with SHA-256-v2 key)",
         dst_path.metadata().map(|m| m.len()).unwrap_or(0)
     );
+    Ok(())
+}
+
+/// Compare every table in the source against the destination, row for row.
+///
+/// Deliberately driven from the SOURCE's table list rather than a list written
+/// here, so a table this code has never heard of still has to survive the
+/// migration. A hardcoded list would silently ignore exactly the tables a
+/// future version adds.
+fn verify_migration(src: &rusqlite::Connection, dst: &rusqlite::Connection) -> anyhow::Result<()> {
+    let mut stmt = src.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let tables: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if tables.is_empty() {
+        anyhow::bail!("source database has no tables — refusing to treat this as a migration");
+    }
+
+    let mut checked = 0usize;
+    let mut total = 0i64;
+    for t in &tables {
+        let want: i64 = src
+            .query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("cannot count {t} in the cops1 database: {e}"))?;
+        let got: i64 = dst
+            .query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!(
+                "table {t} is missing from the migrated database ({e}) — \
+                 the cops1 database has NOT been touched"
+            ))?;
+        if got != want {
+            anyhow::bail!(
+                "{t}: migrated database has {got} rows, cops1 has {want} — \
+                 migration incomplete, the cops1 database has NOT been touched"
+            );
+        }
+        checked += 1;
+        total += want;
+    }
+
+    let check: String = dst.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if check != "ok" {
+        anyhow::bail!("migrated database failed its integrity check: {check}");
+    }
+
+    tracing::info!("migration verified: {checked} tables, {total} rows, all counts match");
     Ok(())
 }
 use tower_http::cors::{Any, CorsLayer};
@@ -473,4 +538,101 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// Build a database in cops1's shape: encrypted with the PBKDF2-v1 key.
+    fn make_cops1(path: &Path, rows: i64) {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch(&crate::security::cops1_sqlcipher_pragma()).unwrap();
+        c.execute_batch(
+            "CREATE TABLE cops_master(id INTEGER PRIMARY KEY, os_no TEXT, amt REAL);
+             CREATE TABLE print_template_config(k TEXT PRIMARY KEY, body TEXT);",
+        ).unwrap();
+        for i in 1..=rows {
+            c.execute("INSERT INTO cops_master(os_no, amt) VALUES (?1, ?2)",
+                      rusqlite::params![format!("OS/{i}/2026"), i as f64]).unwrap();
+        }
+        c.execute("INSERT INTO print_template_config VALUES ('h','CHENNAI')", []).unwrap();
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("cops_mig_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn an_encrypted_cops1_database_migrates_with_every_row_intact() {
+        let d = tmp("ok");
+        let src = d.join("cops_br_database.db");
+        let dst = d.join("cops.db");
+        make_cops1(&src, 2000);
+
+        migrate_cops1(&src, &dst).expect("migration must succeed");
+
+        let c = rusqlite::Connection::open(&dst).unwrap();
+        c.execute_batch(&crate::security::sqlcipher_pragma()).unwrap();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2000);
+        let t: String = c.query_row(
+            "SELECT body FROM print_template_config WHERE k='h'", [], |r| r.get(0)).unwrap();
+        assert_eq!(t, "CHENNAI", "admin templates must survive the upgrade");
+    }
+
+    #[test]
+    fn a_truncated_migration_is_refused_so_the_original_is_never_wiped() {
+        // The caller securely wipes the cops1 database when this returns Ok.
+        // Verification is the only thing standing between an incomplete copy
+        // and the original being destroyed, so prove it actually rejects one.
+        let d = tmp("bad");
+        let src = d.join("cops_br_database.db");
+        make_cops1(&src, 500);
+        let s = rusqlite::Connection::open(&src).unwrap();
+        s.execute_batch(&crate::security::cops1_sqlcipher_pragma()).unwrap();
+
+        // A destination that is a plausible but incomplete copy.
+        let dst = d.join("cops.db");
+        let t = rusqlite::Connection::open(&dst).unwrap();
+        t.execute_batch(&crate::security::sqlcipher_pragma()).unwrap();
+        t.execute_batch(
+            "CREATE TABLE cops_master(id INTEGER PRIMARY KEY, os_no TEXT, amt REAL);
+             CREATE TABLE print_template_config(k TEXT PRIMARY KEY, body TEXT);").unwrap();
+        t.execute("INSERT INTO cops_master(os_no, amt) VALUES ('OS/1/2026', 1.0)", []).unwrap();
+
+        let e = verify_migration(&s, &t).expect_err("an incomplete copy must be refused");
+        assert!(e.to_string().contains("NOT been touched"),
+                "the message must tell the officer the original is safe: {e}");
+    }
+
+    /// Runs against a real cops1 database when COPS1_TEST_DB points at a copy.
+    /// Skipped otherwise, so this suite still passes on a machine without one.
+    #[test]
+    fn migrates_a_real_cops1_database_when_one_is_provided() {
+        let Ok(real) = std::env::var("COPS1_TEST_DB") else {
+            eprintln!("skipping: set COPS1_TEST_DB to a COPY of a real cops1 database");
+            return;
+        };
+        let d = tmp("real");
+        let src = d.join("cops_br_database.db");
+        std::fs::copy(&real, &src).expect("copy the source, never migrate the original");
+        let dst = d.join("cops.db");
+
+        let t0 = std::time::Instant::now();
+        migrate_cops1(&src, &dst).expect("real migration must succeed and verify");
+        let secs = t0.elapsed().as_secs_f64();
+
+        let c = rusqlite::Connection::open(&dst).unwrap();
+        c.execute_batch(&crate::security::sqlcipher_pragma()).unwrap();
+        let cases: i64 = c.query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0)).unwrap();
+        let br: i64 = c.query_row("SELECT COUNT(*) FROM br_master", [], |r| r.get(0)).unwrap();
+        eprintln!("REAL MIGRATION: {cases} OS cases, {br} BRs, {secs:.1}s, \
+                   {:.1} MB", std::fs::metadata(&dst).unwrap().len() as f64 / 1_048_576.0);
+        assert!(cases > 0 && br > 0);
+        assert!(secs < 120.0, "migration took {secs:.0}s — too slow for a first launch");
+    }
 }
