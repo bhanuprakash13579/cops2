@@ -86,6 +86,30 @@ fn is_internal(name: &str) -> bool {
     name.starts_with("sqlite_")
 }
 
+/// Move `from` onto `to`, replacing whatever is there — on Windows as well.
+///
+/// `fs::rename` silently replaces an existing destination on Unix and FAILS on
+/// Windows. Every atomic publish in this module is a rename onto a name that may
+/// already exist: an officer choosing an existing file in the save dialog and
+/// confirming the overwrite, or two runs landing in the same second. On Linux
+/// that works and on Windows it returns "Access is denied", which is the worst
+/// possible split — it passes every test here and fails in the office.
+///
+/// The remove-then-rename is not atomic, so the destination is briefly absent.
+/// That is acceptable precisely where it is used: the thing being replaced is a
+/// backup superseded by the file about to take its place, and the source is a
+/// complete, already-verified archive. It is never used on live data.
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) if to.exists() => {
+            fs::remove_file(to)?;
+            fs::rename(from, to)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Every table holding at least one row, plus the always-include set.
 ///
 /// Deliberately computed by asking the database, never by consulting a list
@@ -399,7 +423,7 @@ pub fn write_archive(pool: &DbPool, archive_path: &Path) -> Result<ExportReport>
 
         // Only now is it allowed to take the real name — no half-written file
         // may ever look like a finished backup.
-        fs::rename(&tmp_archive, archive_path)?;
+        replace_file(&tmp_archive, archive_path)?;
         let archive_bytes = fs::metadata(archive_path)?.len();
 
         Ok(ExportReport {

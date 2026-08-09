@@ -37,6 +37,8 @@ interface AutoBackupStatus {
   interval_minutes: number;
   keep_copies: number;
   last_success: string | null;
+  hours_since_success: number | null;
+  healthy: boolean;
   refusing: string | null;
 }
 
@@ -1290,6 +1292,17 @@ export default function RestoreBackup() {
                   </p>
                 )}
               </>
+            )}
+
+            {autoStatus && autoStatus.destinations.length > 0 && !autoStatus.healthy && (
+              <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                <strong>No backup has succeeded in the last 24 hours.</strong>{' '}
+                {autoStatus.last_success
+                  ? `The last one was ${new Date(autoStatus.last_success).toLocaleString()}.`
+                  : 'None has ever succeeded on this machine.'}{' '}
+                Check that the folders above are reachable — a backup that stops
+                working quietly is only discovered on the day it is needed.
+              </p>
             )}
 
             {autoStatus?.refusing && (

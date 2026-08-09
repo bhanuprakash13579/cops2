@@ -1729,12 +1729,35 @@ pub async fn auto_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>
     // plainly in the panel rather than leaving the officer to infer it.
     let any_off_machine = dests.iter().any(|d| d["off_machine"] == true);
 
+    // How long since a backup last worked, and is that too long?
+    //
+    // A backup scheme that stops working silently is worse than none, because it
+    // is trusted. Every folder going unreachable — a PC retired, a share renamed,
+    // a password changed — produces no error anyone sees: the app keeps running,
+    // officers keep booking cases, and it is discovered on the day of a restore.
+    // So staleness is reported as its own state rather than left for the reader
+    // to work out from a timestamp.
+    let last = get_setting(&pool, "backup_last_success");
+    let hours_since = last
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| (chrono::Local::now() - t.with_timezone(&chrono::Local)).num_hours());
+    let configured = !dests.is_empty();
+    // Generous against the interval: a laptop closed overnight is not a fault.
+    let healthy = match hours_since {
+        _ if !configured => false,
+        Some(h) => h < 24,
+        None => false,
+    };
+
     Ok(Json(serde_json::json!({
         "destinations":     dests,
         "any_off_machine":  any_off_machine,
         "interval_minutes": crate::backup_service::interval_minutes(&pool),
         "keep_copies":      crate::backup_service::keep_copies(&pool),
-        "last_success":     get_setting(&pool, "backup_last_success"),
+        "last_success":     last,
+        "hours_since_success": hours_since,
+        "healthy":          healthy,
         "refusing":         get_setting(&pool, "backup_shrink_blocked"),
     })))
 }
@@ -1968,9 +1991,26 @@ pub async fn admin_restore_archive(
 
             // Rule: never overwrite the only copy. Archive what is about to be
             // replaced, so a wrong file chosen at 5pm is recoverable at 6pm.
-            let safety = std::env::temp_dir()
-                .join(format!("cops_before_restore_{}.cops",
-                              chrono::Local::now().format("%Y-%m-%d_%H%M%S")));
+            //
+            // Beside the DATABASE, never in the temp directory. At this moment
+            // it is the only remaining copy of the office's current data, and
+            // temp is swept by Windows, by cleanup tools, and by this program's
+            // own orphan sweep. Putting the one irreplaceable file in the one
+            // place designed to be emptied would undo the whole point of taking
+            // it. It also has to survive a restart, since realising the wrong
+            // file was restored usually happens the next morning.
+            let safety_dir = pool
+                .get()
+                .ok()
+                .and_then(|c| db_path(&c).ok())
+                .and_then(|p| {
+                    std::path::PathBuf::from(p).parent().map(|d| d.to_path_buf())
+                })
+                .unwrap_or_else(std::env::temp_dir);
+            let safety = safety_dir.join(format!(
+                "cops_before_restore_{}.cops",
+                chrono::Local::now().format("%Y-%m-%d_%H%M%S")
+            ));
             let safety_note = match crate::backup_export::write_archive(&pool, &safety) {
                 Ok(_) => safety.to_string_lossy().to_string(),
                 // A database too damaged to export is exactly when a restore is

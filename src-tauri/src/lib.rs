@@ -75,7 +75,7 @@ fn resolve_db_path(app_data: &Path) -> PathBuf {
                 ));
                 // Renamed, never deleted — it may hold cases booked since the
                 // cops1 file was last written, and that is not ours to discard.
-                let _ = std::fs::rename(&cops2_db, &stale);
+                let _ = crate::backup_export::replace_file(&cops2_db, &stale);
                 for suffix in ["-wal", "-shm"] {
                     let _ = std::fs::remove_file(
                         app_data.join(format!("cops.db{suffix}")),

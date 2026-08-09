@@ -304,18 +304,43 @@ fn check_shrink(
     // Counts come from the archive's manifest, so the baseline costs a few
     // kilobytes to read rather than unpacking the whole database to count rows.
     let Ok(previous) = crate::backup_export::read_counts(&baseline) else { return Ok(()) };
+
+    // EVERY table the last backup recorded, not just the handful in
+    // VERIFY_TABLES. The manifest carries a count for all of them, so limiting
+    // the comparison to a fixed list means any other table — valuables,
+    // warehouse, appeals, anything added later — can lose every row and the
+    // backup proceeds happily, overwriting the copy that still held them. The
+    // list is fine for confirming a copy looks right; it is the wrong thing to
+    // decide whether the DATABASE has been damaged.
+    let live = pool.get().ok();
     for (table, was) in previous {
         if was <= 0 {
             continue;
         }
-        let Some((_, now)) = current.iter().find(|(t, _)| *t == table) else { continue };
-        if *now == 0 {
+        // Prefer the counts already gathered; fall back to asking, so tables
+        // outside VERIFY_TABLES are still checked.
+        let now = match current.iter().find(|(t, _)| *t == table) {
+            Some((_, n)) => *n,
+            None => {
+                let Some(conn) = live.as_ref() else { continue };
+                match conn.query_row(
+                    &format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| r.get::<_, i64>(0)
+                ) {
+                    Ok(n) => n,
+                    // The table is gone entirely. That is a schema change, not
+                    // rows being lost, and refusing every backup afterwards
+                    // would leave the office with no backups at all.
+                    Err(_) => continue,
+                }
+            }
+        };
+        if now == 0 {
             return Err(format!(
                 "{table} now has 0 rows but the last backup holds {was} — \
                  the database looks empty or replaced"
             ));
         }
-        if (*now as f64) < was as f64 * SHRINK_TOLERANCE {
+        if (now as f64) < was as f64 * SHRINK_TOLERANCE {
             return Err(format!(
                 "{table} has dropped from {was} to {now} ({} records missing)",
                 was - now
@@ -411,7 +436,9 @@ fn copy_into(src: &Path, dest_dir: &str, name: &str, keep: usize) -> Destination
 
     // Rule 3 — write beside the target then rename. An interrupted copy leaves
     // a .partial, never a truncated file that looks complete.
-    match std::fs::copy(src, &partial).and_then(|_| std::fs::rename(&partial, &final_path)) {
+    match std::fs::copy(src, &partial)
+        .and_then(|_| crate::backup_export::replace_file(&partial, &final_path))
+    {
         Ok(_) => {
             r.ok = true;
             r.size_mb = std::fs::metadata(&final_path)
@@ -794,6 +821,38 @@ mod tests {
     /// A truncated or unrelated file in a backup folder becomes the newest by
     /// timestamp. If the floor trusts it blindly, it measures against junk and
     /// lets an emptied database through — which is exactly what happened once.
+    #[test]
+    fn losing_a_table_outside_the_verify_list_is_still_refused() {
+        // The floor used to compare only VERIFY_TABLES, so any other table could
+        // be emptied and the backup would proceed, overwriting the copy that
+        // still held the rows. valuables_master is deliberately NOT in that list.
+        let dir = tmpdir("othertable");
+        let dest = dir.join("d1");
+        std::fs::create_dir_all(&dest).unwrap();
+        let pool = test_pool(&dir, 400);
+        pool.get().unwrap().execute_batch(
+            "CREATE TABLE IF NOT EXISTS valuables_master(id INTEGER PRIMARY KEY, item TEXT);"
+        ).unwrap();
+        {
+            let c = pool.get().unwrap();
+            for i in 0..300 {
+                c.execute("INSERT INTO valuables_master(item) VALUES (?1)",
+                          rusqlite::params![format!("gold {i}")]).unwrap();
+            }
+        }
+        put_setting(&pool, "backup_dirs", dest.to_str().unwrap());
+        assert!(run_once(&pool, true, false).ok, "seed backup should succeed");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        // Case records untouched; only the valuables register is wiped.
+        pool.get().unwrap().execute("DELETE FROM valuables_master", []).unwrap();
+
+        let r = run_once(&pool, true, false);
+        assert!(r.refused, "losing a whole register must be refused: {r:?}");
+        assert!(r.reason.contains("valuables_master"),
+                "the message must name the table that lost rows: {}", r.reason);
+    }
+
     #[test]
     fn a_junk_file_in_the_folder_cannot_defeat_the_safety_floor() {
         let dir = tmpdir("junk");
