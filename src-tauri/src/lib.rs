@@ -528,8 +528,46 @@ pub fn run() {
 
             // ── Axum HTTP server embedded in Tauri process ────────────────────
             let pool_clone = Arc::clone(&pool);
+            // ── CORS: the app's own windows, and nothing else ────────────────
+            //
+            // This was allow_origin(Any), which is the classic exposed-localhost
+            // hole. The server binds to 127.0.0.1 so it is not reachable from
+            // the network — but "not reachable from the network" is not the same
+            // as "not reachable". Any page an officer opens in their ordinary
+            // browser runs on this machine, and with Any it could call this API
+            // and READ the replies: enumerate what is here, and hammer the login
+            // endpoints from inside the office at full speed.
+            //
+            // The allowed origins are the ones Tauri actually serves the app
+            // from, which differ per platform, plus the Vite dev server. An
+            // unrecognised origin gets no CORS headers, so the browser refuses
+            // to hand the response back to the page.
+            //
+            // This is not a substitute for authentication — it is the layer that
+            // stops an unauthenticated attacker getting far enough to try.
+            // Matched on HOST rather than against a fixed list of full origins.
+            // Tauri serves the app from a different origin on each platform —
+            // tauri://localhost on Linux and macOS, https://tauri.localhost on
+            // Windows, plus http://localhost:5173 in development — and a list
+            // that misses one does not degrade, it breaks the whole application
+            // on that platform. Matching the host covers every variant.
+            //
+            // The trade-off, stated plainly: another server running on this
+            // machine's localhost would also be allowed. That is a far narrower
+            // exposure than "any website on the internet", which is what Any
+            // meant, and an office PC running the customs application is not
+            // also hosting a hostile local web server. Breaking the app on
+            // Windows to close that gap would be the wrong trade.
             let cors = CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(tower_http::cors::AllowOrigin::predicate(
+                    |origin: &axum::http::HeaderValue, _req: &_| {
+                        let Ok(o) = origin.to_str() else { return false };
+                        // Strip the scheme, then take the host without the port.
+                        let after_scheme = o.split("://").nth(1).unwrap_or("");
+                        let host = after_scheme.split(':').next().unwrap_or("");
+                        matches!(host, "localhost" | "127.0.0.1" | "tauri.localhost")
+                    },
+                ))
                 .allow_methods(Any)
                 .allow_headers(Any);
 

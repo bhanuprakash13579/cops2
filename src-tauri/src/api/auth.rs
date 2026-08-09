@@ -19,6 +19,16 @@ static LOGIN_ATTEMPTS: std::sync::OnceLock<
 const MAX_LOGIN_ATTEMPTS: u32 = 10;
 const LOGIN_WINDOW_SECS: u64 = 300;
 
+// The administrator credential is a single shared password that does not
+// rotate, and it can restore over the database. Tighter than an officer's, and
+// counted globally rather than per name — there is only one admin account, so
+// per-name counting would let an attacker reset the counter by varying the name.
+static ADMIN_ATTEMPTS: std::sync::OnceLock<
+    std::sync::Mutex<(u32, std::time::Instant)>
+> = std::sync::OnceLock::new();
+const MAX_ADMIN_ATTEMPTS: u32 = 5;
+const ADMIN_WINDOW_SECS: u64 = 900;   // 15 minutes
+
 type Db = State<Arc<DbPool>>;
 
 pub async fn login(State(pool): Db, Json(req): Json<LoginRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -117,9 +127,35 @@ pub async fn list_users(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>,
     Ok(Json(json!(users)))
 }
 
-pub async fn create_user(State(pool): Db, _auth: AuthUser, Json(req): Json<CreateUserRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn create_user(State(pool): Db, auth: AuthUser, Json(req): Json<CreateUserRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !["SDO", "DC", "AC"].contains(&req.user_role.as_str()) {
         return Err(err400("Invalid role. Must be SDO, DC, or AC."));
+    }
+
+    // ── Who may create WHICH role ────────────────────────────────────────────
+    //
+    // upgrade_role already refuses to promote anyone unless the caller is a DC,
+    // so the intent is clear: an SDO must not be able to make adjudicators. That
+    // guard was bypassable, because this endpoint accepted any role from any
+    // signed-in officer — an SDO could not promote themselves, but could create
+    // a brand-new DC account and sign in as it. Same escalation, one step round.
+    //
+    // These rules are what the screens already do: the SDO module only ever
+    // creates SDO accounts, adjudication creates ACs, and a DC promotes an AC.
+    // Enforcing them here changes no legitimate workflow — it stops the request
+    // that never comes from those screens.
+    let caller = auth.0.role.as_str();
+    let permitted = match req.user_role.as_str() {
+        "SDO" => true,                              // ordinary staff
+        "AC"  => caller == "DC" || caller == "AC",  // adjudication side only
+        "DC"  => caller == "DC",                    // same rule as upgrade_role
+        _ => false,
+    };
+    if !permitted {
+        return Err(err403(&format!(
+            "Your role ({caller}) is not permitted to create a {} account.",
+            req.user_role
+        )));
     }
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
 
@@ -289,6 +325,36 @@ pub async fn admin_login(Json(req): Json<serde_json::Value>) -> Result<Json<Valu
     let username = req.get("username").and_then(|v| v.as_str()).unwrap_or("");
     let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
 
+    // ── Rate limit ───────────────────────────────────────────────────────────
+    //
+    // Officer logins were throttled and this was not, which is backwards: this
+    // is ONE shared password that never rotates, and holding it means being able
+    // to restore over the database, read every case, and change every setting.
+    // It was the most valuable credential in the program and the only one an
+    // attacker could guess at unlimited speed.
+    //
+    // Stricter than the officer limit, and counted globally rather than per
+    // username: there is only one admin account, so per-name counting would let
+    // an attacker reset the counter by varying the name they send.
+    //
+    // Checked BEFORE the username comparison, so a wrong username costs an
+    // attempt too — otherwise the limit is trivially bypassed.
+    {
+        let limiter = ADMIN_ATTEMPTS.get_or_init(|| std::sync::Mutex::new((0u32, std::time::Instant::now())));
+        let mut guard = limiter.lock().unwrap();
+        if guard.1.elapsed().as_secs() >= ADMIN_WINDOW_SECS {
+            *guard = (0, std::time::Instant::now());
+        }
+        if guard.0 >= MAX_ADMIN_ATTEMPTS {
+            let wait = ADMIN_WINDOW_SECS.saturating_sub(guard.1.elapsed().as_secs());
+            return Err(err429(&format!(
+                "Too many administrator sign-in attempts. Try again in {} minutes.",
+                wait / 60 + 1
+            )));
+        }
+        guard.0 += 1;
+    }
+
     if username != ADMIN_USERNAME {
         return Err(err401("Invalid admin credentials"));
     }
@@ -299,6 +365,12 @@ pub async fn admin_login(Json(req): Json<serde_json::Value>) -> Result<Json<Valu
 
     if !verify(password, hash).unwrap_or(false) {
         return Err(err401("Invalid admin credentials"));
+    }
+
+    // A correct password clears the counter: an administrator who mistypes a
+    // few times then gets it right should not stay locked out.
+    if let Some(l) = ADMIN_ATTEMPTS.get() {
+        *l.lock().unwrap() = (0, std::time::Instant::now());
     }
 
     let token = create_admin_token().map_err(|e| err500(&e.to_string()))?;

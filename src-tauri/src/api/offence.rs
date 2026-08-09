@@ -166,7 +166,12 @@ pub async fn sidebar_counts(State(pool): Db, _auth: AdjnUser) -> Result<Json<Val
 static ITEM_DESC_CACHE: std::sync::OnceLock<std::sync::Mutex<(Vec<String>, std::time::Instant)>> = std::sync::OnceLock::new();
 const ITEM_DESC_TTL_SECS: u64 = 300;
 
-pub async fn item_descriptions(State(pool): Db) -> Result<Json<Value>, Err> {
+/// Requires a signed-in officer. It returns descriptions drawn from real cases —
+/// seized goods, in the words they were recorded in — which is case data even
+/// though no case number appears beside it. It was reachable without signing in,
+/// and it is only ever called from the OS form, which is behind a login already,
+/// so requiring one here changes nothing an officer does.
+pub async fn item_descriptions(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
     let cache = ITEM_DESC_CACHE.get_or_init(|| {
         std::sync::Mutex::new((Vec::new(), std::time::Instant::now() - std::time::Duration::from_secs(ITEM_DESC_TTL_SECS + 1)))
     });

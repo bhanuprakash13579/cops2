@@ -320,7 +320,25 @@ fn check_shrink(
     snapshot_path: &Path,
 ) -> std::result::Result<(), String> {
     let Some(baseline) = newest_usable_backup(pool) else {
-        return Ok(()); // nothing to compare against yet
+        // No baseline. There are two very different reasons for that, and
+        // treating them the same is how a serious problem stays quiet.
+        //
+        // No backup files at all is ordinary — a first run, or a folder just
+        // configured. Files that EXIST but none of which can be opened is not
+        // ordinary: every copy has been corrupted, replaced, or encrypted since
+        // it was written, which is exactly what ransomware leaves behind. In
+        // that state the floor has nothing to measure against and would wave
+        // through anything, so the one moment it matters most is the one moment
+        // it stops working. Say so.
+        let present = all_backups_newest_first(pool).len();
+        if present > 0 {
+            return Err(format!(
+                "{present} backup file(s) are present but NOT ONE of them can be \
+                 opened. They may have been corrupted, replaced, or encrypted by \
+                 ransomware. Refusing to overwrite them until someone has looked"
+            ));
+        }
+        return Ok(()); // genuinely nothing to compare against yet
     };
 
     if let (Ok(new_meta), Ok(old_meta)) =
@@ -859,6 +877,50 @@ mod tests {
     /// A truncated or unrelated file in a backup folder becomes the newest by
     /// timestamp. If the floor trusts it blindly, it measures against junk and
     /// lets an emptied database through — which is exactly what happened once.
+    #[test]
+    fn backups_that_have_all_become_unreadable_are_reported_not_ignored() {
+        // What ransomware leaves behind: the files are still there, none opens.
+        // The floor has nothing to measure against, so without this it would
+        // wave everything through — failing silently at the one moment it is
+        // most needed, and overwriting whatever might still be recoverable.
+        let dir = tmpdir("ransom");
+        let dest = dir.join("d1");
+        std::fs::create_dir_all(&dest).unwrap();
+        let pool = test_pool(&dir, 500);
+        put_setting(&pool, "backup_dirs", dest.to_str().unwrap());
+        assert!(run_once(&pool, true, false).ok, "seed backup");
+
+        // Every existing backup replaced with something that will not open,
+        // keeping the names so they still look like backups.
+        for e in std::fs::read_dir(&dest).unwrap().flatten() {
+            let p = e.path();
+            if is_ours(&e.file_name().to_string_lossy()) {
+                std::fs::write(&p, b"encrypted-by-someone-else").unwrap();
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(1100));
+        pool.get().unwrap()
+            .execute("INSERT INTO cops_master(pad) VALUES ('new')", []).unwrap();
+
+        let r = run_once(&pool, false, false);
+        assert!(r.refused, "unreadable backups must stop the run: {r:?}");
+        assert!(r.reason.contains("NOT ONE"), "must say what is wrong: {}", r.reason);
+    }
+
+    #[test]
+    fn an_empty_folder_is_not_mistaken_for_ransomware() {
+        // The ordinary first run must not be reported as an attack.
+        let dir = tmpdir("firstrun");
+        let dest = dir.join("d1");
+        std::fs::create_dir_all(&dest).unwrap();
+        let pool = test_pool(&dir, 100);
+        put_setting(&pool, "backup_dirs", dest.to_str().unwrap());
+
+        let r = run_once(&pool, true, false);
+        assert!(r.ok && !r.refused, "a first backup must simply work: {r:?}");
+    }
+
     #[test]
     fn one_machine_never_prunes_another_machines_backups() {
         // Three PCs will point at the same share. Retention keeps the newest few
