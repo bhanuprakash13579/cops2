@@ -512,6 +512,87 @@ pub async fn list_tariffs(
     Ok(Json(json!({ "items": rows })))
 }
 
+/// The tariff in force on a given date — `?as_of=YYYY-MM-DD`, today by default.
+///
+/// This route was MISSING while the screen that needs it was already calling it:
+/// FormulaRulesPage requests /dcr/tariffs/current on load, got a 404, and could
+/// not show which rates are actually in force. Found by checking every call the
+/// frontend makes against the routes that exist, rather than by reading either
+/// side on its own.
+///
+/// Point-in-time, not "the newest row". Duty rates change at a budget and the
+/// office still edits and reprints older sessions, which must be valued at the
+/// rates that applied THEN. Picking the latest row regardless of date would
+/// silently revalue historical collections — wrong in a way nobody notices until
+/// an audit.
+///
+/// Falls back to the EARLIEST tariff when none is yet effective, matching the
+/// original: a session dated before the first tariff row is better valued at the
+/// oldest known rates than refused outright.
+pub async fn current_tariff(
+    State(pool): Db,
+    _auth: AuthUser,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, Err> {
+    let as_of = q
+        .get("as_of")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    const COLS: &str = "id, effective_from, label,
+                        baggage_rate, liquor_duty_rate, aidc_liquor_rate,
+                        gold_bcd_rate, aidc_gold_rate,
+                        gold_cons_bcd_rate, aidc_gold_cons_rate,
+                        silver_bcd_rate, aidc_silver_rate,
+                        silver_cons_rate, aidc_silver_cons_rate,
+                        created_at";
+
+    let row = |r: &rusqlite::Row| -> rusqlite::Result<Value> {
+        Ok(json!({
+            "id":                    r.get::<_, i64>(0)?,
+            "effective_from":        r.get::<_, String>(1)?,
+            "label":                 r.get::<_, Option<String>>(2)?,
+            "baggage_rate":          r.get::<_, f64>(3)?,
+            "liquor_duty_rate":      r.get::<_, f64>(4)?,
+            "aidc_liquor_rate":      r.get::<_, f64>(5)?,
+            "gold_bcd_rate":         r.get::<_, f64>(6)?,
+            "aidc_gold_rate":        r.get::<_, f64>(7)?,
+            "gold_cons_bcd_rate":    r.get::<_, f64>(8)?,
+            "aidc_gold_cons_rate":   r.get::<_, f64>(9)?,
+            "silver_bcd_rate":       r.get::<_, f64>(10)?,
+            "aidc_silver_rate":      r.get::<_, f64>(11)?,
+            "silver_cons_rate":      r.get::<_, f64>(12)?,
+            "aidc_silver_cons_rate": r.get::<_, f64>(13)?,
+            "created_at":            r.get::<_, Option<String>>(14)?,
+        }))
+    };
+
+    let found = conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM dcr_tariffs
+                 WHERE effective_from <= ?1
+                 ORDER BY effective_from DESC LIMIT 1"
+            ),
+            [&as_of],
+            row,
+        )
+        .or_else(|_| {
+            conn.query_row(
+                &format!("SELECT {COLS} FROM dcr_tariffs ORDER BY effective_from ASC LIMIT 1"),
+                [],
+                row,
+            )
+        });
+
+    match found {
+        Ok(v) => Ok(Json(v)),
+        Err(_) => Err(e404("No duty rates have been set up yet. Add a tariff first.")),
+    }
+}
+
 pub async fn create_tariff(
     State(pool): Db,
     _auth: AuthUser,

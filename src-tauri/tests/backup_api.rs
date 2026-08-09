@@ -22,23 +22,33 @@ async fn serve_tiny() -> (String, tempfile::TempDir) { serve_with(1).await }
 async fn serve_with(rows: i64) -> (String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let pool = db::create_pool(&dir.path().join("live.db")).unwrap();
+    // The REAL schema, not three hand-written tables. Hand-written fixtures
+    // drift from the migrations and then tests pass against a database shape
+    // that does not exist in the office.
+    db::run_migrations(&pool).unwrap();
     {
         let c = pool.get().unwrap();
+        // app_settings only — everything else comes from the migrations above.
         c.execute_batch(
-            "CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT);
-             CREATE TABLE IF NOT EXISTS cops_master(id INTEGER PRIMARY KEY, os_no TEXT);
-             CREATE TABLE IF NOT EXISTS print_template_config(k TEXT PRIMARY KEY, body TEXT);",
+            "CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT);"
         )
         .unwrap();
+        // Migrations seed a starter tariff dated today. Tests that care about
+        // point-in-time selection supply their own rows, so clear it here.
+        let _ = c.execute("DELETE FROM dcr_tariffs", []);
         for i in 1..=rows {
             c.execute(
-                "INSERT INTO cops_master(os_no) VALUES (?1)",
-                rusqlite::params![format!("OS/{i}/2026")],
+                "INSERT INTO cops_master(os_no, os_date, os_year) VALUES (?1, ?2, ?3)",
+                rusqlite::params![format!("OS/{i}/2026"), "2026-08-09", 2026],
             )
             .unwrap();
         }
-        c.execute("INSERT INTO print_template_config VALUES ('h','CHENNAI')", [])
-            .unwrap();
+        c.execute(
+            "INSERT INTO print_template_config(field_key, field_value, effective_from)
+             VALUES ('os_heading', 'CHENNAI', '2020-01-01')",
+            [],
+        )
+        .unwrap();
     }
     let app = api::build_app(Arc::new(pool));
     let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
@@ -315,4 +325,70 @@ async fn saving_to_a_folder_or_to_nowhere_is_refused_clearly() {
             .send().await.unwrap();
         assert_eq!(r.status(), 400, "{what} must be refused, not written");
     }
+}
+
+// ── DCR tariffs ──────────────────────────────────────────────────────────────
+
+/// Seed tariff rows on a server and return its base URL.
+async fn serve_with_tariffs() -> (String, tempfile::TempDir) {
+    let (base, dir) = serve().await;
+    // The pool used by the router is separate, so seed over HTTP.
+    let c = reqwest::Client::new();
+    for (eff, label, rate) in [
+        ("2020-01-01", "old",     0.35_f64),
+        ("2024-07-01", "budget",  0.38),
+        ("2099-01-01", "future",  0.99),
+    ] {
+        let r = c.post(format!("{base}/dcr/tariffs"))
+            .bearer_auth(officer_token())
+            .json(&serde_json::json!({
+                "effective_from": eff, "label": label,
+                "baggage_rate": rate, "liquor_duty_rate": 0.15, "aidc_liquor_rate": 0.035,
+                "gold_bcd_rate": 0.125, "aidc_gold_rate": 0.05,
+                "gold_cons_bcd_rate": 0.125, "aidc_gold_cons_rate": 0.05,
+                "silver_bcd_rate": 0.35, "aidc_silver_rate": 0.05,
+                "silver_cons_rate": 0.35, "aidc_silver_cons_rate": 0.05
+            }))
+            .send().await.unwrap();
+        assert!(r.status().is_success(), "seeding tariff {label} failed: {}", r.status());
+    }
+    (base, dir)
+}
+
+#[tokio::test]
+async fn the_current_tariff_route_exists_and_is_point_in_time() {
+    // The screen was already calling this route; it did not exist and returned
+    // 404, so the formula page could not show which rates were in force.
+    let (base, _d) = serve_with_tariffs().await;
+    let c = reqwest::Client::new();
+
+    let r = c.get(format!("{base}/dcr/tariffs/current"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_eq!(r.status(), 200, "the route must exist");
+    let now: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(now["label"], "budget",
+               "today must use the newest tariff already in force, not the future one: {now}");
+
+    // The point of the whole thing: an older session is valued at the rates that
+    // applied THEN. Taking the newest row regardless of date would silently
+    // revalue historical collections — wrong in a way nobody notices until an
+    // audit asks why last year's figures moved.
+    let then: serde_json::Value = c
+        .get(format!("{base}/dcr/tariffs/current?as_of=2021-06-30"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(then["label"], "old", "a 2021 date must use the 2020 rates: {then}");
+    assert!((then["baggage_rate"].as_f64().unwrap() - 0.35).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_date_before_every_tariff_falls_back_rather_than_failing() {
+    // Matches the original: a session dated before the first tariff row is
+    // better valued at the oldest known rates than refused outright.
+    let (base, _d) = serve_with_tariffs().await;
+    let r = reqwest::Client::new()
+        .get(format!("{base}/dcr/tariffs/current?as_of=1999-01-01"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["label"], "old");
 }

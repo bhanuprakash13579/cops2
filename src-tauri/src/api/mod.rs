@@ -205,6 +205,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/dcr/sessions/{id}/submit",              post(dcr::submit_session))
         .route("/dcr/sessions/{id}/unsubmit",            post(dcr::unsubmit_session))
         .route("/dcr/tariffs",                           get(dcr::list_tariffs).post(dcr::create_tariff))
+        .route("/dcr/tariffs/current",                   get(dcr::current_tariff))
         .route("/dcr/formula-rules",                     get(dcr::list_rules).post(dcr::create_rule))
         .route("/dcr/formula-rules/reorder",             post(dcr::reorder_rules))
         .route("/dcr/formula-rules/{id}",                put(dcr::update_rule).delete(dcr::delete_rule))
