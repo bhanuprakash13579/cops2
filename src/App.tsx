@@ -7,6 +7,7 @@ import { queryKeys, fetchers } from './lib/queries';
 import api from './lib/api';
 import DevModeBanner from './components/DevModeBanner';
 import DownloadToast from './components/DownloadToast';
+import ArchiveReminder from './components/ArchiveReminder';
 import ErrorBoundary from './components/ErrorBoundary';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import Login from './pages/auth/Login';
@@ -335,6 +336,12 @@ export default function App() {
           <DownloadToast />
           <BrowserRouter>
             <AppRoutes />
+            {/* Inside the router — it hides itself on the backup page, and
+                needs the current location to know that. Rendered last so it
+                sits above page content, but at a lower z-index than
+                TrialBanner, whose overlay carries the administrator's only
+                way in once a licence expires. */}
+            <ArchiveReminder />
           </BrowserRouter>
         </BackendGate>
       </AuthProvider>
