@@ -135,6 +135,42 @@ pub fn keep_copies(pool: &DbPool) -> usize {
         .unwrap_or(DEFAULT_KEEP)
 }
 
+/// This computer's name, reduced to something safe in a filename.
+///
+/// Backups carry it because several machines will point at the SAME shared
+/// folder. Retention keeps the newest few and deletes the rest, so without a
+/// name in the file every machine prunes every other machine's copies: three PCs
+/// backing up to one share leave two backups between them instead of two each,
+/// and nobody sees it happen. Worse, the machine doing the pruning may be the
+/// one whose data is stale.
+///
+/// It also answers the question actually asked during a recovery — which PC did
+/// this come from — without opening the file.
+pub fn machine_name() -> String {
+    let raw = std::env::var("COMPUTERNAME")            // Windows
+        .or_else(|_| std::env::var("HOSTNAME"))         // some shells export it
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(24)
+        .collect::<String>()
+        .to_lowercase();
+    if cleaned.is_empty() { "pc".to_string() } else { cleaned }
+}
+
+/// Is this backup one of OURS, or another machine's copy in a shared folder?
+///
+/// Another machine's backups are never pruned and never used as the safety
+/// floor's baseline. Both would be wrong: its retention is its own business, and
+/// its row counts describe its database, not this one.
+fn is_ours(name: &str) -> bool {
+    name.starts_with(&format!("cops_auto_{}_", machine_name())) && name.ends_with(ARCHIVE_EXT)
+}
+
 /// Is this folder on another machine? A UNC path, or any drive letter that is
 /// not the system drive. A backup that only ever lands on this computer does
 /// not survive this computer failing, which is the entire point of taking one.
@@ -246,7 +282,7 @@ fn all_backups_newest_first(pool: &DbPool) -> Vec<PathBuf> {
         for e in entries.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with("cops_auto_") && name.ends_with(ARCHIVE_EXT) {
+            if is_ours(name) {
                 if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
                     found.push((m, p));
                 }
@@ -358,7 +394,9 @@ fn prune(folder: &str, keep: usize) -> usize {
         .filter_map(|e| {
             let p = e.path();
             let name = p.file_name()?.to_str()?.to_string();
-            if !p.is_file() || !name.starts_with("cops_auto_") {
+            // Ours only. Another machine sharing this folder keeps its own
+            // copies; deleting them would quietly halve the office's redundancy.
+            if !p.is_file() || !is_ours(&name) {
                 return None;
             }
             Some((e.metadata().ok()?.modified().ok()?, p))
@@ -529,7 +567,7 @@ pub fn run_once(pool: &DbPool, force: bool, allow_shrink: bool) -> BackupOutcome
     // Seconds included: without them two runs inside the same minute produce
     // the same filename and the second overwrites the first, leaving one
     // generation where two were intended.
-    let name = format!("cops_auto_{stamp}.{ARCHIVE_EXT}");
+    let name = format!("cops_auto_{}_{stamp}.{ARCHIVE_EXT}", machine_name());
 
     let tmp = std::env::temp_dir().join(format!("cops_bk_{stamp}.{ARCHIVE_EXT}"));
     let _ = std::fs::remove_file(&tmp);
@@ -821,6 +859,54 @@ mod tests {
     /// A truncated or unrelated file in a backup folder becomes the newest by
     /// timestamp. If the floor trusts it blindly, it measures against junk and
     /// lets an emptied database through — which is exactly what happened once.
+    #[test]
+    fn one_machine_never_prunes_another_machines_backups() {
+        // Three PCs will point at the same share. Retention keeps the newest few
+        // and deletes the rest, so without a machine name in the file each PC
+        // prunes the others: three machines leave two backups between them
+        // instead of two each, and nothing reports it.
+        let dir = tmpdir("shared");
+        let dest = dir.join("share");
+        std::fs::create_dir_all(&dest).unwrap();
+        let pool = test_pool(&dir, 300);
+        put_setting(&pool, "backup_dirs", dest.to_str().unwrap());
+
+        // Another PC's copies, already sitting in the shared folder.
+        let theirs: Vec<PathBuf> = (1..=3)
+            .map(|i| {
+                let p = dest.join(format!("cops_auto_otherpc_2026-01-0{i}_120000.{ARCHIVE_EXT}"));
+                std::fs::write(&p, vec![7u8; 2048]).unwrap();
+                p
+            })
+            .collect();
+
+        // Enough of our own runs to trigger pruning.
+        for i in 0..3 {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(1100));
+                pool.get().unwrap()
+                    .execute("INSERT INTO cops_master(pad) VALUES ('more')", []).unwrap();
+            }
+            assert!(run_once(&pool, true, false).ok);
+        }
+
+        for p in &theirs {
+            assert!(p.exists(), "another machine's backup was deleted: {p:?}");
+        }
+        let ours = std::fs::read_dir(&dest).unwrap().flatten()
+            .filter(|e| is_ours(&e.file_name().to_string_lossy()))
+            .count();
+        assert_eq!(ours, 2, "our own copies must still be capped at two");
+    }
+
+    #[test]
+    fn a_machine_name_is_always_usable_in_a_filename() {
+        let n = machine_name();
+        assert!(!n.is_empty());
+        assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "must be filename-safe on Windows and Linux alike, got {n:?}");
+    }
+
     #[test]
     fn losing_a_table_outside_the_verify_list_is_still_refused() {
         // The floor used to compare only VERIFY_TABLES, so any other table could

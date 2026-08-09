@@ -118,9 +118,13 @@ broken, because nothing looks wrong when it fails.
 - Closing the app **while a backup is running** (during the first 2 minutes),
   then reopening: no `.partial` file should be left behind after an hour, and
   the next backup must work normally
-- Two officers on PC-A and PC-B both backing up to the **same** shared folder —
-  worth knowing what happens, as retention is per-folder and they will prune
-  each other's copies. Tell me if you intend this; it needs a change
+- **PC-A and PC-B both backing up to the same shared folder.** This is now
+  supported and worth confirming: each machine's backups carry its computer name
+  (`cops_auto_pc-a_2026-08-09_143000.cops`), and each prunes only its own. After
+  both have run a few times the folder should hold **two files per machine**, not
+  two in total. If PC-A's copies disappear when PC-B runs, the machine name is
+  not being read correctly on Windows — tell me, because that silently halves
+  your redundancy
 
 ---
 
