@@ -278,7 +278,26 @@ pub fn write_archive(pool: &DbPool, archive_path: &Path) -> Result<ExportReport>
     if let Some(dir) = archive_path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let plain_path: PathBuf = archive_path.with_extension("plain.tmp");
+
+    // The plaintext intermediate goes in the SYSTEM temp directory, never beside
+    // the destination. The destination is wherever the officer pointed the save
+    // dialog — a USB stick, a share on another PC — and building there would
+    // write 177 MB of unencrypted case records onto that medium, then delete
+    // them. A crash or a pulled stick mid-write leaves them behind, on exactly
+    // the kind of removable media that goes missing.
+    //
+    // The name is unique per run: two backups at once would otherwise share the
+    // file and corrupt each other. That cannot happen through the scheduler,
+    // which holds a lock, but an officer saving a copy while it runs is not
+    // going through the scheduler.
+    let plain_path: PathBuf = std::env::temp_dir().join(format!(
+        "cops_plain_{}_{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let _ = fs::remove_file(&plain_path);
 
     // `finish` runs on every exit path below — see the guard drop at the end.

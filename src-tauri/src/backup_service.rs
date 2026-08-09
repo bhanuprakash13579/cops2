@@ -577,11 +577,24 @@ pub fn sweep_orphans(pool: &DbPool) -> usize {
     let older_than = |p: &Path| {
         std::fs::metadata(p).and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false)
     };
+    // Every temp name this program creates, matched by PREFIX rather than by
+    // prefix-and-extension. The previous version matched "cops_bk_*.db", which
+    // stopped matching anything the day backups became .cops — so nothing was
+    // ever swept, and each archive an officer saved left ~44 MB in the temp
+    // directory permanently. Listing prefixes only means a future change to an
+    // extension cannot silently switch the sweep off again.
+    const TEMP_PREFIXES: &[&str] = &[
+        "cops_bk_",             // scheduler's working copy
+        "cops_archive_",        // an archive built for download
+        "cops_plain_",          // the plaintext intermediate
+        "cops_up_",             // an upload being restored
+    ];
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for e in entries.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with("cops_bk_") && name.ends_with(".db") && older_than(&p)
+            if TEMP_PREFIXES.iter().any(|pre| name.starts_with(pre))
+                && older_than(&p)
                 && std::fs::remove_file(&p).is_ok() { removed += 1; }
         }
     }
@@ -606,11 +619,16 @@ pub fn sweep_orphans(pool: &DbPool) -> usize {
 pub fn start(pool: std::sync::Arc<DbPool>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(120)).await;
-        {
+        loop {
+            // Swept every cycle, not once at startup. Sweeping only at startup
+            // meant an archive saved at midday left its working file in the temp
+            // directory until the app was next restarted — on a machine left
+            // running for weeks, every download accumulating. The sweep only
+            // touches this program's own temp files, and only ones older than an
+            // hour, so it cannot disturb a backup in progress.
             let p = pool.clone();
             let _ = tokio::task::spawn_blocking(move || sweep_orphans(&p)).await;
-        }
-        loop {
+
             let p = pool.clone();
             // Blocking filesystem and SQLite work must not run on the async
             // runtime's threads, or it stalls every request while a 240 MB
@@ -670,6 +688,12 @@ mod tests {
         for _ in 0..rows { st.execute(params!["x".repeat(300)]).unwrap(); }
         drop(st); drop(conn);
         pool
+    }
+
+    /// Backdate a file so the sweep's one-hour cutoff applies to it.
+    fn filetime_set(path: &Path, when: std::time::SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let _ = f.set_modified(when);
     }
 
     fn count_backups(dir: &Path) -> usize {
@@ -797,6 +821,52 @@ mod tests {
 
         let r = run_once(&pool, true, false);
         assert!(r.refused, "junk must be ignored and the floor still hold: {r:?}");
+    }
+
+    #[test]
+    fn every_kind_of_temp_file_this_program_leaves_is_swept() {
+        // The sweep matched "cops_bk_*.db", which stopped matching anything the
+        // day backups became .cops — so nothing was swept and every archive an
+        // officer saved left ~44 MB behind for good. Named for the leak, and
+        // covers each prefix, so adding a new temp file without adding it here
+        // is the only way to reintroduce it.
+        let dir = tmpdir("sweep");
+        let pool = test_pool(&dir, 10);
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+
+        let names = [
+            "cops_bk_2026-01-01_000000.cops",
+            "cops_archive_deadbeef.cops",
+            "cops_plain_1234_5678.tmp",
+            "cops_up_abcd.cops",
+        ];
+        let made: Vec<PathBuf> = names.iter()
+            .map(|n| {
+                let p = std::env::temp_dir().join(n);
+                std::fs::write(&p, vec![0u8; 1024]).unwrap();
+                filetime_set(&p, old);
+                p
+            })
+            .collect();
+
+        // Something recent must survive — sweeping a backup mid-run would be
+        // worse than leaving a stale file.
+        let fresh = std::env::temp_dir().join("cops_archive_inflight.cops");
+        std::fs::write(&fresh, b"still being written").unwrap();
+
+        // And a file that is not ours is never touched.
+        let theirs = std::env::temp_dir().join("someone_elses_file.cops");
+        std::fs::write(&theirs, b"not ours").unwrap();
+
+        sweep_orphans(&pool);
+
+        for p in &made {
+            assert!(!p.exists(), "{p:?} should have been swept");
+        }
+        assert!(fresh.exists(), "a file younger than an hour must be left alone");
+        assert!(theirs.exists(), "files this program did not create must be left alone");
+        let _ = std::fs::remove_file(&fresh);
+        let _ = std::fs::remove_file(&theirs);
     }
 
     #[test]
