@@ -597,23 +597,34 @@ pub fn read_counts(archive_path: &Path) -> Result<Vec<(String, i64)>> {
 /// Used where a backup file has to be trusted before it is relied on — the
 /// safety floor picks its reference from files that pass this.
 ///
-/// The database entry is streamed through the decryptor to a sink rather than
-/// written to disk. That still forces every byte through the AES and deflate
-/// layers and checks the CRC at the end, so a truncated or altered archive
-/// fails here, but it costs no disk and no 177 MB temp file. Writing the file
-/// out to open it with SQLite would prove slightly more and cost far more, on a
-/// path that runs every backup.
+/// WHAT THIS PROVES, AND WHAT IT DELIBERATELY DOES NOT
+///
+/// It proves the file is a well-formed zip, that the password opens it, that the
+/// database entry is present, and that a manifest inside it decrypts, parses and
+/// records rows. That is enough to choose a baseline: a junk file, a truncated
+/// file, a foreign zip and an empty archive all fail it — and a junk file
+/// defeating exactly this check is why the validation exists at all.
+///
+/// It does NOT decompress the database entry. Doing so would additionally verify
+/// its CRC, but costs a full pass over 177 MB through AES and deflate on a path
+/// that runs every interval, including when there is nothing to do. The CRC IS
+/// checked where it matters: when the archive is written (in `write_archive`,
+/// before it may reach any destination) and when one is restored (`quick_check`
+/// on the extracted database, before the live data is touched). Verifying it a
+/// third time to decide which file to measure against buys nothing.
+///
+/// Truncation still fails here: a zip's directory lives at the END of the file,
+/// so a cut-off archive cannot even be opened.
 pub fn is_usable_archive(archive_path: &Path) -> bool {
     let Ok(f) = fs::File::open(archive_path) else { return false };
     let Ok(mut za) = zip::ZipArchive::new(f) else { return false };
     let pw = crate::security::zip_password().as_bytes();
 
-    let entry_ok = match za.by_name_decrypt(ENTRY_NAME, pw) {
-        Ok(mut e) => std::io::copy(&mut e, &mut std::io::sink()).is_ok(),
-        Err(_) => false,
-    };
+    if za.by_name_decrypt(ENTRY_NAME, pw).is_err() {
+        return false;
+    }
     // A manifest claiming no rows is not a backup worth measuring against.
-    entry_ok && read_counts(archive_path).map(|c| !c.is_empty()).unwrap_or(false)
+    read_counts(archive_path).map(|c| !c.is_empty()).unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

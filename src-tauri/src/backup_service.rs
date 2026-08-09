@@ -463,13 +463,18 @@ pub fn run_once(pool: &DbPool, force: bool, allow_shrink: bool) -> BackupOutcome
 
     if !force && unchanged {
         // Nothing new to snapshot — but a folder may still be behind.
-        if let Some(latest) = newest_usable_backup(pool)
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        {
+        //
+        // Found ONCE. This used to call newest_usable_backup twice, for the name
+        // and then again for the path, and validating a candidate decompresses
+        // the whole archive through AES to prove it opens. That is a few seconds
+        // of work done twice, every interval, on the path that runs when there
+        // is nothing to do — which is most of the time.
+        if let Some(src) = newest_usable_backup(pool) {
+            let latest = src.file_name().map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             let behind = folders_missing_latest(pool, &latest);
             if !behind.is_empty() {
                 let keep = keep_copies(pool);
-                let src = newest_usable_backup(pool).unwrap();
                 let results: Vec<DestinationResult> = behind
                     .iter()
                     .map(|d| copy_into(&src, d, &latest, keep))
