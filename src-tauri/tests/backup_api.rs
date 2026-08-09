@@ -65,6 +65,12 @@ fn officer_token() -> String {
     auth::create_token("1", "SDO", "Test Officer", Some("Supdt"), "ACTIVE").unwrap()
 }
 
+/// An adjudicating officer. Booking and adjudicating are deliberately different
+/// roles — the officer who seizes goods must not also decide the penalty.
+fn dc_token() -> String {
+    auth::create_token("2", "DC", "Test DC", Some("Deputy Commissioner"), "ACTIVE").unwrap()
+}
+
 #[tokio::test]
 async fn an_officer_can_read_status_and_an_anonymous_caller_cannot() {
     let (base, _d) = serve().await;
@@ -463,4 +469,138 @@ async fn path_parameter_routes_actually_match() {
         .bearer_auth(officer_token()).send().await.unwrap();
     assert_ne!(lit.status(), 200,
                "the literal text {{id}} matched — {{}} is not being read as a parameter");
+}
+
+// ── The OS case lifecycle ────────────────────────────────────────────────────
+//
+// These routes were unreachable until the path-parameter fix, so nothing here
+// had ever run. Booking a case, opening it, editing it and adjudicating it is
+// what the program is FOR — worth proving over HTTP rather than assuming the
+// handlers are right because they compile.
+
+#[tokio::test]
+async fn a_case_can_be_booked_opened_edited_and_adjudicated() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    // Book it.
+    let created = c.post(format!("{base}/os"))
+        .bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "9001", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "TEST PASSENGER", "passport_no": "Z9999999",
+            "flight_no": "AI-101", "booked_by": "Test Officer",
+            // A real case carries seized items. A case with none never reaches
+            // the pending list at all — that list requires an item still Under
+            // OS or Under Duty, which is the whole definition of pending.
+            "items": [{
+                "items_sno": 1, "items_desc": "GOLD CHAIN 24K",
+                "items_qty": 1.0, "items_uqc": "PCS",
+                "items_value": 250000.0, "items_duty": 96250.0,
+                "items_release_category": "Under OS"
+            }]
+        }))
+        .send().await.unwrap();
+    assert!(created.status().is_success(),
+            "booking a case failed: HTTP {}", created.status());
+
+    // Open it — the route that used to 404.
+    let got = c.get(format!("{base}/os/9001/2026")).bearer_auth(&t).send().await.unwrap();
+    assert_eq!(got.status(), 200, "opening the case returned {}", got.status());
+    let case: serde_json::Value = got.json().await.unwrap();
+    assert_eq!(case["pax_name"], "TEST PASSENGER", "wrong case came back: {case}");
+
+    // Edit it.
+    let edited = c.put(format!("{base}/os/9001/2026"))
+        .bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "9001", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "CORRECTED NAME", "passport_no": "Z9999999",
+            "items": [{
+                "items_sno": 1, "items_desc": "GOLD CHAIN 24K",
+                "items_qty": 1.0, "items_value": 250000.0,
+                "items_release_category": "Under OS"
+            }]
+        }))
+        .send().await.unwrap();
+    assert!(edited.status().is_success(), "editing failed: HTTP {}", edited.status());
+
+    let after: serde_json::Value = c.get(format!("{base}/os/9001/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["pax_name"], "CORRECTED NAME", "the edit did not persist: {after}");
+
+    // And it appears in the list the officers actually look at.
+    let list: serde_json::Value = c.get(format!("{base}/os?status=pending"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let items = list["items"].as_array().expect("items array");
+    assert!(items.iter().any(|i| i["os_no"] == "9001"),
+            "the booked case is missing from the pending list");
+
+    // An SDO must NOT be able to adjudicate their own seizure. Asserted rather
+    // than assumed — it is the separation the whole process rests on.
+    let refused = c.post(format!("{base}/os/9001/2026/adjudicate"))
+        .bearer_auth(&t)
+        .json(&serde_json::json!({
+            "adj_offr_name": "SDO TRYING IT", "adj_offr_designation": "Supdt"
+        }))
+        .send().await.unwrap();
+    assert_eq!(refused.status(), 403,
+               "an SDO must not be able to adjudicate, got {}", refused.status());
+
+    // Adjudicate it properly — the adjudicating officer's decision, and the
+    // step the whole case exists to reach.
+    let adj = c.post(format!("{base}/os/9001/2026/adjudicate"))
+        .bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "adj_offr_name": "TEST DC",
+            "adj_offr_designation": "Deputy Commissioner",
+            "adjudication_date": "2026-08-09",
+            "adjn_offr_remarks": "Redeemed on payment of fine.",
+            "rf_amount": 50000.0, "pp_amount": 10000.0
+        }))
+        .send().await.unwrap();
+    assert!(adj.status().is_success(), "adjudication failed: HTTP {}", adj.status());
+
+    let done: serde_json::Value = c.get(format!("{base}/os/9001/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(done["adj_offr_name"], "TEST DC", "the decision did not persist: {done}");
+
+    // It must move OUT of pending and INTO adjudicated. A case that stays in
+    // pending after adjudication is booked twice by the next officer.
+    let pending: serde_json::Value = c.get(format!("{base}/os?status=pending"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert!(!pending["items"].as_array().unwrap().iter().any(|i| i["os_no"] == "9001"),
+            "an adjudicated case is still showing as pending");
+    let adjudicated: serde_json::Value = c.get(format!("{base}/os?status=adjudicated"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert!(adjudicated["items"].as_array().unwrap().iter().any(|i| i["os_no"] == "9001"),
+            "the adjudicated case is missing from the adjudicated list");
+}
+
+#[tokio::test]
+async fn a_booked_case_can_be_printed() {
+    // Printing is the point of booking. It was unreachable too.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    c.post(format!("{base}/os")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "9002", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "PRINT TEST", "passport_no": "Z8888888",
+            "items": [{
+                "items_sno": 1, "items_desc": "LAPTOP",
+                "items_qty": 1.0, "items_value": 90000.0,
+                "items_release_category": "Under Duty"
+            }]
+        }))
+        .send().await.unwrap();
+
+    let pdf = c.get(format!("{base}/os/9002/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap();
+    assert_eq!(pdf.status(), 200, "print returned {}", pdf.status());
+    let bytes = pdf.bytes().await.unwrap();
+    assert!(bytes.len() > 500, "PDF is suspiciously small: {} bytes", bytes.len());
+    assert_eq!(&bytes[..4], b"%PDF", "not a PDF");
 }
