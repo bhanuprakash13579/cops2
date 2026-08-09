@@ -20,7 +20,8 @@ fn load_session_row(conn: &rusqlite::Connection, id: i64) -> Result<Option<Value
                 t.aidc_liquor_rate, t.gold_bcd_rate, t.aidc_gold_rate,
                 t.gold_cons_bcd_rate, t.aidc_gold_cons_rate,
                 t.silver_bcd_rate, t.aidc_silver_rate,
-                t.silver_cons_rate, t.aidc_silver_cons_rate
+                t.silver_cons_rate, t.aidc_silver_cons_rate,
+                s.challan_no
          FROM dcr_sessions s
          LEFT JOIN dcr_tariffs t ON t.id = s.tariff_id
          WHERE s.id = ?",
@@ -55,6 +56,7 @@ fn load_session_row(conn: &rusqlite::Connection, id: i64) -> Result<Option<Value
                 "created_at":   r.get::<_, Option<String>>(6)?,
                 "submitted_at": r.get::<_, Option<String>>(7)?,
                 "submitted_by": r.get::<_, Option<String>>(8)?,
+                "challan_no":   r.get::<_, Option<String>>(22)?,
                 "tariff":       tariff,
             }))
         },
@@ -192,7 +194,8 @@ pub async fn list_sessions(
                 t.aidc_liquor_rate, t.gold_bcd_rate, t.aidc_gold_rate,
                 t.gold_cons_bcd_rate, t.aidc_gold_cons_rate,
                 t.silver_bcd_rate, t.aidc_silver_rate,
-                t.silver_cons_rate, t.aidc_silver_cons_rate
+                t.silver_cons_rate, t.aidc_silver_cons_rate,
+                s.challan_no
          FROM dcr_sessions s
          LEFT JOIN dcr_tariffs t ON t.id = s.tariff_id
          {where_sql}
@@ -233,6 +236,7 @@ pub async fn list_sessions(
                 "created_at":   r.get::<_, Option<String>>(6)?,
                 "submitted_at": r.get::<_, Option<String>>(7)?,
                 "submitted_by": r.get::<_, Option<String>>(8)?,
+                "challan_no":   r.get::<_, Option<String>>(22)?,
                 "tariff":       tariff,
             }))
         },
@@ -430,6 +434,52 @@ pub async fn bulk_save_entries(
         .ok_or_else(|| e500("Failed to reload session after save"))?;
 
     Ok(Json(session))
+}
+
+/// Record the bank deposit challan number against a session.
+///
+/// One deposit covers a shift's offline BR collections, so it belongs on the
+/// SESSION rather than an entry. It is the reference an auditor follows from the
+/// register to the bank, and COPS2 had nowhere to put it: the column did not
+/// exist and neither did this route, so a figure the office is accountable for
+/// simply had no home.
+///
+/// Editable after the fact on purpose. The number arrives from the bank after
+/// the shift is written up, and a mistyped challan has to be correctable without
+/// unpicking the session — refusing to change it would only push officers into
+/// keeping the real number somewhere outside the system.
+pub async fn set_challan(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, Err> {
+    let challan = req
+        .get("challan_no")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if challan.is_empty() {
+        return Err(e400("Enter the challan number, or skip if there were no offline BRs."));
+    }
+    if challan.chars().count() > 50 {
+        return Err(e400("Challan number is too long (50 characters maximum)."));
+    }
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let affected = conn
+        .execute(
+            "UPDATE dcr_sessions SET challan_no = ?1 WHERE id = ?2",
+            rusqlite::params![challan, id],
+        )
+        .map_err(|e| e500(&e.to_string()))?;
+    if affected == 0 {
+        return Err(e404("Session not found"));
+    }
+
+    let row = load_session_row(&conn, id)?.ok_or_else(|| e404("Session not found"))?;
+    Ok(Json(row))
 }
 
 pub async fn submit_session(

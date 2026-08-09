@@ -66,6 +66,9 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         // dr_items: columns added in cops2 that were missing from the original cops1 schema
         ("dr_items",  "dr_year",         "INTEGER"),
         ("dr_items",  "items_category",  "VARCHAR(50)"),
+        // Bank deposit challan number — added after the first COPS2 builds
+        // shipped, so existing databases need it too.
+        ("dcr_sessions", "challan_no",     "VARCHAR(50)"),
     ];
     for (table, col, col_type) in &col_migrations {
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type);

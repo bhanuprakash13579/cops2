@@ -57,17 +57,17 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         // ── Auth (regular users) ──────────────────────────────────────────────
         .route("/auth/login",                    post(auth::login))
         .route("/auth/users",                    get(auth::list_users).post(auth::create_user))
-        .route("/auth/users/{id}",               put(auth::update_user).delete(auth::delete_user))
-        .route("/auth/users/{user_id}/role",     patch(auth::upgrade_role))
+        .route("/auth/users/:id",               put(auth::update_user).delete(auth::delete_user))
+        .route("/auth/users/:user_id/role",     patch(auth::upgrade_role))
         .route("/auth/change-password",          post(auth::change_password))
-        .route("/auth/bootstrap/{module_type}",  get(auth::bootstrap))
+        .route("/auth/bootstrap/:module_type",  get(auth::bootstrap))
         .route("/auth/me",                       get(auth::me))
 
         // ── Admin auth + user management ──────────────────────────────────────
         .route("/admin/login",                   post(auth::admin_login))
         .route("/admin/users",                   get(auth::admin_list_users).post(auth::admin_create_user))
-        .route("/admin/users/{id}",              patch(auth::admin_update_user).delete(auth::admin_soft_delete_user))
-        .route("/admin/users/{id}/hard",         delete(auth::admin_hard_delete_user))
+        .route("/admin/users/:id",              patch(auth::admin_update_user).delete(auth::admin_soft_delete_user))
+        .route("/admin/users/:id/hard",         delete(auth::admin_hard_delete_user))
 
         // ── OS Cases ──────────────────────────────────────────────────────────
         .route("/os",                                  get(offence::list_os).post(offence::create_os))
@@ -77,17 +77,17 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/os/check-os-no",                      get(offence::check_os_no))
         .route("/os/offline",                          post(offence::create_offline))
         .route("/os/offline/bulk-import",              post(offence::bulk_import_offline))
-        .route("/os/{os_no}/{os_year}",
+        .route("/os/:os_no/:os_year",
                get(offence::get_os)
                .put(offence::update_os)
                .delete(offence::delete_os))
-        .route("/os/{os_no}/{os_year}/adjudicate",             post(offence::adjudicate))
-        .route("/os/{os_no}/{os_year}/complete-offline-adj",   patch(offence::complete_offline))
-        .route("/os/{os_no}/{os_year}/outcome",                patch(offence::outcome_update))
-        .route("/os/{os_no}/{os_year}/quash",                  post(offence::quash_os))
-        .route("/os/{os_no}/{os_year}/post-adj",               patch(offence::post_adj))
-        .route("/os/{os_no}/{os_year}/print-pdf",              get(offence::print_pdf))
-        .route("/os/{os_no}/{os_year}/mark-printed",           post(offence::mark_printed))
+        .route("/os/:os_no/:os_year/adjudicate",             post(offence::adjudicate))
+        .route("/os/:os_no/:os_year/complete-offline-adj",   patch(offence::complete_offline))
+        .route("/os/:os_no/:os_year/outcome",                patch(offence::outcome_update))
+        .route("/os/:os_no/:os_year/quash",                  post(offence::quash_os))
+        .route("/os/:os_no/:os_year/post-adj",               patch(offence::post_adj))
+        .route("/os/:os_no/:os_year/print-pdf",              get(offence::print_pdf))
+        .route("/os/:os_no/:os_year/mark-printed",           post(offence::mark_printed))
 
         // ── Passport search ───────────────────────────────────────────────────
         .route("/passports/search",     post(offence::passport_search))
@@ -100,28 +100,28 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/masters/airports",         get(masters::airports))
         .route("/masters/airports/close-all", post(masters::close_all_airports))
         .route("/masters/item-categories",  get(masters::item_categories).post(masters::create_item_category))
-        .route("/masters/item-categories/{id}", put(masters::deactivate_item_category))
+        .route("/masters/item-categories/:id", put(masters::deactivate_item_category))
         .route("/masters/duty-rates",       get(masters::duty_rates).post(masters::create_duty_rate))
-        .route("/masters/duty-rates/{id}",  put(masters::deactivate_duty_rate))
+        .route("/masters/duty-rates/:id",  put(masters::deactivate_duty_rate))
         .route("/masters/dc-list",          get(masters::dc_list).post(masters::create_dc))
         .route("/masters/br-limits",        get(masters::br_limits).post(masters::create_br_limit))
 
         // ── Baggage Register (BR) ─────────────────────────────────────────────
         .route("/br",                               get(baggage::list_brs).post(baggage::create_br))
-        .route("/br/passport/{passport_no}",        get(baggage::get_brs_by_passport))
-        .route("/br/{br_no}/{br_year}",             get(baggage::get_br))
-        .route("/br/{br_no}/{br_year}/mark-printed",post(baggage::mark_br_printed))
-        .route("/br/{br_no}/{br_year}/print-pdf",   get(baggage::print_br_pdf))
+        .route("/br/passport/:passport_no",        get(baggage::get_brs_by_passport))
+        .route("/br/:br_no/:br_year",             get(baggage::get_br))
+        .route("/br/:br_no/:br_year/mark-printed",post(baggage::mark_br_printed))
+        .route("/br/:br_no/:br_year/print-pdf",   get(baggage::print_br_pdf))
 
         // ── Detention Register (DR) ───────────────────────────────────────────
         .route("/dr",                               get(detention::list_drs).post(detention::create_dr))
-        .route("/dr/{dr_no}/{dr_year}",             get(detention::get_dr))
-        .route("/dr/{dr_no}/{dr_year}/mark-printed",post(detention::mark_dr_printed))
-        .route("/dr/{dr_no}/{dr_year}/print-pdf",   get(detention::print_dr_pdf))
+        .route("/dr/:dr_no/:dr_year",             get(detention::get_dr))
+        .route("/dr/:dr_no/:dr_year/mark-printed",post(detention::mark_dr_printed))
+        .route("/dr/:dr_no/:dr_year/print-pdf",   get(detention::print_dr_pdf))
 
         // ── Legal Statutes ────────────────────────────────────────────────────
         .route("/statutes",       get(statutes::list_statutes).post(statutes::create_statute))
-        .route("/statutes/{id}",  put(statutes::update_statute).delete(statutes::delete_statute))
+        .route("/statutes/:id",  put(statutes::update_statute).delete(statutes::delete_statute))
 
         // ── Cross-reference search ────────────────────────────────────────────
         .route("/queries/search",  get(queries::cross_reference))
@@ -140,17 +140,17 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/admin/mode",                       get(admin::get_mode).put(admin::set_mode))
         .route("/admin/features",                   get(admin::get_features).put(admin::set_features))
         .route("/admin/config/print-template",      get(admin::get_print_template).post(admin::upsert_print_template))
-        .route("/admin/config/print-template/{id}", put(admin::update_print_template_row).delete(admin::delete_print_template_row))
+        .route("/admin/config/print-template/:id", put(admin::update_print_template_row).delete(admin::delete_print_template_row))
         .route("/admin/config/baggage-rules",       get(admin::get_baggage_rules).post(admin::upsert_baggage_rules))
-        .route("/admin/config/baggage-rules/{id}",  put(admin::update_baggage_rules_row).delete(admin::delete_baggage_rules_row))
+        .route("/admin/config/baggage-rules/:id",  put(admin::update_baggage_rules_row).delete(admin::delete_baggage_rules_row))
         .route("/admin/config/special-allowances",  get(admin::get_special_allowances).post(admin::create_special_allowance))
-        .route("/admin/config/special-allowances/{id}", put(admin::update_special_allowance).delete(admin::delete_special_allowance))
+        .route("/admin/config/special-allowances/:id", put(admin::update_special_allowance).delete(admin::delete_special_allowance))
         .route("/admin/config/pit",                 get(admin::get_pit_config))
         .route("/admin/config/os",                  get(admin::get_os_config))
         .route("/admin/config/remarks-templates",       get(admin::get_remarks_templates))
-        .route("/admin/config/remarks-templates/{key}", put(admin::upsert_remarks_template))
+        .route("/admin/config/remarks-templates/:key", put(admin::upsert_remarks_template))
         .route("/admin/devices",                    get(admin::list_devices).post(admin::create_device))
-        .route("/admin/devices/{id}",               put(admin::update_device).delete(admin::delete_device))
+        .route("/admin/devices/:id",               put(admin::update_device).delete(admin::delete_device))
         .route("/admin/purge-os",                   post(admin::purge_os))
 
         // ── Backup / Restore ─────────────────────────────────────────────────
@@ -190,9 +190,9 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/os-query/search",          post(offence::query_search))
         .route("/os-query/monthly-report",  get(offence::monthly_report))
         .route("/os-query/br/search",       get(baggage::list_brs))
-        .route("/os-query/br/{br_no}/{br_year}", get(baggage::get_br))
+        .route("/os-query/br/:br_no/:br_year", get(baggage::get_br))
         .route("/os-query/dr/search",       get(detention::list_drs))
-        .route("/os-query/dr/{dr_no}/{dr_year}", get(detention::get_dr))
+        .route("/os-query/dr/:dr_no/:dr_year", get(detention::get_dr))
 
         // ── App mode / feature flags (public — splash screen / route guard) ──
         .route("/mode",     get(admin::get_mode))
@@ -200,17 +200,18 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
 
         // ── Duty Collection Report (DCR) ─────────────────────────────────────────
         .route("/dcr/sessions",                          get(dcr::list_sessions).post(dcr::create_session))
-        .route("/dcr/sessions/{id}",                     get(dcr::get_session).put(dcr::update_session))
-        .route("/dcr/sessions/{id}/entries",             put(dcr::bulk_save_entries))
-        .route("/dcr/sessions/{id}/submit",              post(dcr::submit_session))
-        .route("/dcr/sessions/{id}/unsubmit",            post(dcr::unsubmit_session))
+        .route("/dcr/sessions/:id",                     get(dcr::get_session).put(dcr::update_session))
+        .route("/dcr/sessions/:id/entries",             put(dcr::bulk_save_entries))
+        .route("/dcr/sessions/:id/challan",             patch(dcr::set_challan))
+        .route("/dcr/sessions/:id/submit",              post(dcr::submit_session))
+        .route("/dcr/sessions/:id/unsubmit",            post(dcr::unsubmit_session))
         .route("/dcr/tariffs",                           get(dcr::list_tariffs).post(dcr::create_tariff))
         .route("/dcr/tariffs/current",                   get(dcr::current_tariff))
         .route("/dcr/formula-rules",                     get(dcr::list_rules).post(dcr::create_rule))
         .route("/dcr/formula-rules/reorder",             post(dcr::reorder_rules))
-        .route("/dcr/formula-rules/{id}",                put(dcr::update_rule).delete(dcr::delete_rule))
+        .route("/dcr/formula-rules/:id",                put(dcr::update_rule).delete(dcr::delete_rule))
         .route("/dcr/item-types",                        get(dcr::list_item_types).post(dcr::create_item_type))
-        .route("/dcr/item-types/{id}/use",               patch(dcr::use_item_type))
+        .route("/dcr/item-types/:id/use",               patch(dcr::use_item_type))
         .route("/dcr/settings",                          get(dcr::get_settings).put(dcr::update_settings))
 
         // ── Health ────────────────────────────────────────────────────────────

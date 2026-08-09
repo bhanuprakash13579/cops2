@@ -392,3 +392,75 @@ async fn a_date_before_every_tariff_falls_back_rather_than_failing() {
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["label"], "old");
 }
+
+#[tokio::test]
+async fn the_bank_challan_number_can_be_recorded_corrected_and_survives_a_backup() {
+    // COPS2 had nowhere to put this: no column and no route, so a figure the
+    // office is accountable for had no home at all.
+    let (base, _d) = serve_with_tariffs().await;
+    let c = reqwest::Client::new();
+
+    let s: serde_json::Value = c.post(format!("{base}/dcr/sessions"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "report_date": "2026-08-09", "shift": "DAY" }))
+        .send().await.unwrap().json().await.unwrap();
+    let id = s["id"].as_i64().expect("session id");
+    assert!(s["challan_no"].is_null(), "a new session has no challan yet: {s}");
+
+    let set: serde_json::Value = c.patch(format!("{base}/dcr/sessions/{id}/challan"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "challan_no": "SBI/2026/00417" }))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(set["challan_no"], "SBI/2026/00417", "{set}");
+
+    // The number arrives from the bank after the shift is written up, so a
+    // mistyped challan must be correctable.
+    let fixed: serde_json::Value = c.patch(format!("{base}/dcr/sessions/{id}/challan"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "challan_no": "SBI/2026/00418" }))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(fixed["challan_no"], "SBI/2026/00418");
+
+    // Blank is refused rather than silently wiping an audit reference.
+    let blank = c.patch(format!("{base}/dcr/sessions/{id}/challan"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "challan_no": "   " }))
+        .send().await.unwrap();
+    assert_eq!(blank.status(), 400);
+
+    // And it must come back after a restore — an audit trail that does not
+    // survive a restore is not an audit trail.
+    let archive = take_archive(&base).await;
+    let (status, body) = restore(&base, archive, true).await;
+    assert_eq!(status, 200, "{body}");
+    let after: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["challan_no"], "SBI/2026/00418",
+               "the challan must survive backup and restore: {after}");
+}
+
+#[tokio::test]
+async fn path_parameter_routes_actually_match() {
+    // axum 0.7 uses :id for path parameters; {id} is a LITERAL segment. If the
+    // codebase uses {id} against axum 0.7, every detail route in the program
+    // 404s and only the parameterless ones work.
+    let (base, _d) = serve_with_tariffs().await;
+    let c = reqwest::Client::new();
+
+    let s: serde_json::Value = c.post(format!("{base}/dcr/sessions"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "report_date": "2026-08-09", "shift": "DAY" }))
+        .send().await.unwrap().json().await.unwrap();
+    let id = s["id"].as_i64().unwrap();
+
+    let r = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_eq!(r.status(), 200,
+               "GET /dcr/sessions/{id} returned {} — path parameters are not matching",
+               r.status());
+
+    let lit = c.get(format!("{base}/dcr/sessions/%7Bid%7D"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_ne!(lit.status(), 200,
+               "the literal text {{id}} matched — {{}} is not being read as a parameter");
+}
