@@ -322,52 +322,13 @@ pub async fn admin_export_csv(State(pool): Db, _admin: AdminUser) -> Result<impl
     inner_export_csv(pool).await
 }
 
-// ── Export DB (SQLite binary backup) ─────────────────────────────────────────
-
-async fn inner_export_db(pool: Arc<DbPool>) -> Result<impl IntoResponse, Err> {
-    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
-    let src_path = db_path(&conn).map_err(|e| e500(&e.to_string()))?;
-    drop(conn); // release before backup
-
-    let tmp_path = std::env::temp_dir().join(format!("cops2_backup_{}.db", uuid::Uuid::new_v4()));
-
-    // rusqlite backup: src → tmp copy
-    {
-        let src = rusqlite::Connection::open(&src_path).map_err(|e| e500(&e.to_string()))?;
-        // Key must be set on BOTH connections: src to read the encrypted source,
-        // dst so the backup output is also encrypted with the same key.
-        // Without the key on dst the output is plain SQLite and restore will reject it.
-        src.execute_batch(&crate::security::sqlcipher_pragma()).map_err(|e| e500(&e.to_string()))?;
-        let mut dst = rusqlite::Connection::open(&tmp_path).map_err(|e| e500(&e.to_string()))?;
-        dst.execute_batch(&crate::security::sqlcipher_pragma()).map_err(|e| e500(&e.to_string()))?;
-        let backup = rusqlite::backup::Backup::new(&src, &mut dst).map_err(|e| e500(&e.to_string()))?;
-        // -1 copies all remaining pages in one step (no per-batch sleep) — fastest safe option.
-        backup.run_to_completion(-1, Duration::from_millis(0), None).map_err(|e| e500(&e.to_string()))?;
-    }
-
-    let bytes = tokio::fs::read(&tmp_path).await.map_err(|e| e500(&e.to_string()))?;
-    let _ = tokio::fs::remove_file(&tmp_path).await;
-
-    let today = chrono::Local::now().format("%Y-%m-%d");
-    let filename = format!("cops_fulldb_{today}.db");
-    let db_len = bytes.len();
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
-            (header::CONTENT_LENGTH, db_len.to_string()),
-        ],
-        bytes,
-    ))
-}
-
-pub async fn export_db(State(pool): Db, _auth: AuthUser) -> Result<impl IntoResponse, Err> {
-    inner_export_db(pool).await
-}
-
-pub async fn admin_export_db(State(pool): Db, _admin: AdminUser) -> Result<impl IntoResponse, Err> {
-    inner_export_db(pool).await
-}
+// The full-database export lived here. It wrote a 261 MB file for data the
+// .cops archive carries in 43.7 MB — six times the size, most of it indexes
+// that SQLite rebuilds from the rows anyway. Removed rather than left unused, so
+// nothing can wire it back by accident.
+//
+// The RESTORE below stays: it costs nothing while unused and is the only way
+// back for anyone still holding a .db file.
 
 // ── Restore full DB from uploaded .db file ────────────────────────────────────
 

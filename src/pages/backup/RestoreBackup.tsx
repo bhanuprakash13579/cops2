@@ -21,7 +21,6 @@ function formatProgress(loaded: number, total: number | undefined): string {
   return `Downloading… ${mb} MB`;
 }
 
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface AutoBackupDestination {
@@ -79,7 +78,6 @@ const ALL_ROLES = ['SDO', 'DC', 'AC'];
 function adminHeaders(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
-
 
 // ── Main component ────────────────────────────────────────────────────────────
 
@@ -172,10 +170,6 @@ export default function RestoreBackup() {
   const [restoreErr, setRestoreErr] = useState('');
 
   // Full SQLite DB backup / restore
-  const [fullDbLoading, setFullDbLoading] = useState(false);
-  const [fullDbMsg, setFullDbMsg] = useState('');
-  const [fullDbProgress, setFullDbProgress] = useState('');
-  const fullDbAbort = useRef<AbortController | null>(null);
   const fullDbRestoreRef = useRef<HTMLInputElement>(null);
   const [fullDbRestoreFile, setFullDbRestoreFile] = useState<File | null>(null);
   const [fullDbRestoreLoading, setFullDbRestoreLoading] = useState(false);
@@ -194,7 +188,6 @@ export default function RestoreBackup() {
   const [purgeLoading, setPurgeLoading] = useState(false);
   const [purgeResult, setPurgeResult] = useState<{ message: string; total_rows_deleted: number; breakdown: Record<string, number> } | null>(null);
   const [purgeErr, setPurgeErr] = useState('');
-
 
   // ── Load on login ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -492,67 +485,6 @@ export default function RestoreBackup() {
   };
 
   // ── Full DB export ────────────────────────────────────────────────────────
-  const downloadFullDb = async () => {
-    setFullDbLoading(true);
-    setFullDbMsg('');
-    setFullDbProgress('Preparing…');
-    fullDbAbort.current = new AbortController();
-    try {
-      const res = await api.get('/admin/backup/export-fulldb', {
-        headers: adminHeaders(adminToken),
-        responseType: 'blob',
-        timeout: 0,
-        signal: fullDbAbort.current.signal,
-        onDownloadProgress: (evt) => {
-          setFullDbProgress(formatProgress(evt.loaded, evt.total));
-        },
-      });
-      setFullDbProgress('');
-      const defaultName = `cops_fulldb_${new Date().toISOString().slice(0, 10)}.db`;
-      try {
-        const { save } = await import('@tauri-apps/plugin-dialog');
-        const { writeFile } = await import('@tauri-apps/plugin-fs');
-        const savePath = await save({ 
-          title: 'Save Database (Includes all modules e.g. BR/DR)', 
-          defaultPath: defaultName, 
-          filters: [{ name: 'Database', extensions: ['db'] }] 
-        });
-        if (savePath) {
-          setFullDbProgress('Writing to disk…');
-          const arrayBuf = await (res.data as Blob).arrayBuffer();
-          await writeFile(savePath, new Uint8Array(arrayBuf));
-          setFullDbProgress('');
-          setFullDbMsg('Full database backup saved.');
-          showDownloadToast(`Database saved to ${savePath}`);
-        } else {
-          setFullDbMsg('Save cancelled.');
-        }
-      } catch (fsErr) {
-        if (String(fsErr).includes('plugin-dialog') || String(fsErr).includes('__TAURI_IPC__')) {
-          const url = URL.createObjectURL(res.data);
-          const a = document.createElement('a');
-          a.href = url; a.download = defaultName; a.click();
-          URL.revokeObjectURL(url);
-          setFullDbMsg('Full database backup downloaded.');
-          showDownloadToast(`Database downloaded as ${defaultName}`);
-        } else {
-          throw new Error(`Disk write failed: ${fsErr}`);
-        }
-      }
-    } catch (err: unknown) {
-      if ((err as any)?.name === 'CanceledError' || (err as any)?.code === 'ERR_CANCELED') {
-        setFullDbMsg('Download cancelled.');
-        setFullDbProgress('');
-        return;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      setFullDbMsg(`Download failed: ${msg}`);
-      setFullDbProgress('');
-    } finally {
-      setFullDbLoading(false);
-      fullDbAbort.current = null;
-    }
-  };
 
   // ── Full DB restore ───────────────────────────────────────────────────────
   const uploadFullDbRestore = async (e: React.FormEvent) => {
@@ -1341,37 +1273,6 @@ export default function RestoreBackup() {
                 database before overriding this.
               </p>
             )}
-          </section>
-
-          {/* ── Full SQLite DB backup (advanced) ── */}
-          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
-            <div className="flex items-center gap-2">
-              <Database size={18} className="text-slate-500" />
-              <div>
-                <h2 className="text-sm font-semibold text-slate-700">Full Database File <span className="ml-1 text-xs font-normal text-slate-600 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">Advanced</span></h2>
-                <p className="text-xs text-slate-500 mt-0.5">Complete snapshot of every table — OS cases, BR register, detention, warehouse, users, settings, template history, statutes, all masters. One file restores everything exactly.</p>
-              </div>
-            </div>
-            <div className="flex items-center gap-3">
-              <button onClick={downloadFullDb} disabled={fullDbLoading}
-                className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60">
-                <Download size={13} />
-                {fullDbLoading ? (fullDbProgress || 'Preparing…') : 'Download Full DB Backup (.db)'}
-              </button>
-              {fullDbLoading && (
-                <button onClick={() => fullDbAbort.current?.abort()}
-                  className="px-3 py-2 text-xs rounded-lg border border-red-300 text-red-600 hover:bg-red-50">
-                  Cancel
-                </button>
-              )}
-            </div>
-            {fullDbLoading && fullDbProgress && fullDbProgress.includes('%') && (
-              <div className="w-full max-w-sm bg-slate-200 rounded-full h-1.5 overflow-hidden mt-1">
-                <div className="bg-emerald-500 h-1.5 rounded-full transition-all duration-300"
-                     style={{ width: fullDbProgress.match(/(\d+)%/)?.[1] + '%' }} />
-              </div>
-            )}
-            {fullDbMsg && <p className={`text-xs ${fullDbMsg.includes('failed') ? 'text-red-600' : 'text-emerald-700'}`}>{fullDbMsg}</p>}
           </section>
 
           {/* ── Restore full SQLite DB ── */}

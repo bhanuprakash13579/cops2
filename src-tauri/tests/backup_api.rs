@@ -1148,3 +1148,40 @@ async fn the_brdr_report_returns_rows_and_refuses_columns_that_do_not_exist() {
         .query_row("SELECT COUNT(*) FROM br_master", [], |r| r.get(0)).unwrap();
     assert_eq!(still, 1, "br_master must be intact");
 }
+
+#[tokio::test]
+async fn indexes_are_present_after_a_restore_even_though_the_archive_omits_them() {
+    // The archive drops indexes on purpose — they are derived data and were 24%
+    // of its size. The question that matters is whether the RESTORED database
+    // still has them, because a restore that leaves the registers unindexed
+    // would be quietly slower for ever afterwards.
+    let (base, _d, pool) = serve_with_pool(200).await;
+
+    let count_indexes = |pool: &std::sync::Arc<db::DbPool>| -> i64 {
+        pool.get().unwrap().query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index' AND name NOT LIKE 'sqlite_autoindex%'",
+            [], |r| r.get(0)).unwrap()
+    };
+    let before = count_indexes(&pool);
+    assert!(before > 0, "the live database should be indexed to begin with");
+
+    let archive = take_archive(&base).await;
+    // Prove the archive itself carries none of them.
+    let tmp = _d.path().join("peek.db");
+    std::fs::write(_d.path().join("a.cops"), &archive).unwrap();
+    let (status, body) = restore(&base, archive, true).await;
+    assert_eq!(status, 200, "{body}");
+    let _ = tmp;
+
+    let after = count_indexes(&pool);
+    assert_eq!(after, before,
+               "every index must still exist after a restore: {before} before, {after} after");
+
+    // And they must actually be usable, not merely present.
+    let plan: String = pool.get().unwrap().query_row(
+        "EXPLAIN QUERY PLAN SELECT * FROM cops_master WHERE os_no = '5' AND os_year = 2026",
+        [], |r| r.get(3)).unwrap();
+    assert!(plan.to_lowercase().contains("index"),
+            "the query planner should use an index, got: {plan}");
+}

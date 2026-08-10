@@ -160,7 +160,6 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
 
         // ── Backup / Restore ─────────────────────────────────────────────────
         .route("/backup/export/csv",                get(backup::export_csv))
-        .route("/backup/export/db",                 get(backup::export_db))
         .route("/backup/upload/new",                post(backup::upload_new))
         .route("/backup/upload/legacy",             post(backup::upload_legacy))
         .route("/backup/custom-report",             post(backup::custom_report))
@@ -184,7 +183,15 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
 
         // ── Admin Backup / Restore ─────────────────────────────────────────────
         .route("/admin/backup/export",              get(backup::admin_export_csv))
-        .route("/admin/backup/export-fulldb",       get(backup::admin_export_db))
+        // The full-database EXPORT is gone. It wrote a 261 MB file for data the
+        // .cops archive carries in 43.7 MB — six times the size, most of it
+        // indexes that are rebuilt from the rows anyway, and a second format to
+        // keep correct. Measured on the real Chennai database.
+        //
+        // The RESTORE stays. It costs nothing while unused and is the only way
+        // back for anyone still holding a .db file, or one recovered from a
+        // failed disk. Removing a recovery path to save space nobody was
+        // spending would be the wrong trade.
         .route("/admin/backup/restore-fulldb",      post(backup::admin_restore_fulldb))
         .route("/admin/backup/upload-legacy",       post(backup::admin_upload_legacy))
         .route("/admin/backup/upload-legacy-items", post(backup::admin_upload_legacy_items))
