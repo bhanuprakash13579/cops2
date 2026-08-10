@@ -930,3 +930,44 @@ async fn cess_on_cigarettes_is_recorded_and_survives() {
     assert_eq!(after["entries"][0]["cess_on_cig"], 1500.0,
                "the cess must survive a restore: {after}");
 }
+
+// ── Excluding tables from the backup ─────────────────────────────────────────
+
+#[tokio::test]
+async fn revenue_tables_can_be_left_out_but_case_records_never_can() {
+    // The office exports and emails each shift's revenue report, so a copy
+    // exists outside the system and they may choose not to back the sessions up.
+    // Case records have no such copy, so no setting may drop them — including a
+    // setting typed by someone who has misunderstood what it does.
+    let (base, _d, pool) = serve_with_pool(50).await;
+    let c = reqwest::Client::new();
+
+    // Someone excludes the revenue tables AND, mistakenly, the OS register.
+    pool.get().unwrap().execute(
+        "INSERT OR REPLACE INTO app_settings(key, value) VALUES
+         ('backup_exclude_tables', 'dcr_sessions,dcr_entries,cops_master')",
+        [],
+    ).unwrap();
+
+    let target = _d.path().join("excluded.cops");
+    let r = c.post(format!("{base}/backup/archive/save"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "path": target.to_str().unwrap() }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+
+    // Restore it into a second, empty installation and see what actually arrived.
+    let (base2, _d2) = serve_with_tariffs().await;
+    let bytes = std::fs::read(&target).unwrap();
+    let (status, out) = restore(&base2, bytes, true).await;
+    assert_eq!(status, 200, "{out}");
+
+    // The OS register survived despite being listed — it is protected.
+    let cases: serde_json::Value = c.get(format!("{base2}/os?status=pending"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert!(cases["total"].as_i64().unwrap_or(0) > 0 || cases.get("items").is_some(),
+            "case records must be backed up even when listed for exclusion: {cases}");
+    assert!(body["rows"].as_i64().unwrap_or(0) >= 50,
+            "the archive should still hold the case rows: {body}");
+}

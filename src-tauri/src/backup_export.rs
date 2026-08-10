@@ -81,6 +81,59 @@ pub const MANIFEST_NAME: &str = "manifest.json";
 /// itself meaningful state rather than an absence of data.
 const ALWAYS_INCLUDE: &[&str] = &["app_settings"];
 
+/// Tables the office may choose to leave OUT of the backup, set in
+/// `app_settings` under `backup_exclude_tables` as a comma-separated list.
+///
+/// Empty by default: everything is backed up unless somebody deliberately says
+/// otherwise. The case for excluding the duty-collection tables is that each
+/// shift's report is exported and emailed, so a copy exists outside the system.
+/// Measured on the real data, that saves about 2.7 MB a year at full airport
+/// volume — roughly 6% of the backup — which is why this is a setting and not
+/// a separate database. Splitting the database to save it would double the
+/// files, backups, restores and migrations, and create two things that can
+/// drift apart.
+///
+/// What it costs, stated plainly for whoever turns it on: an emailed spreadsheet
+/// is a REPORT, not restorable data. After a disk failure those shifts can only
+/// be re-keyed by hand, and the monthly register cannot be regenerated without
+/// them. Case records — OS, BR, DR — can never be excluded, whatever this is
+/// set to; see `NEVER_EXCLUDE`.
+const SUGGESTED_EXCLUDE: &str = "dcr_sessions,dcr_entries,dcr_dr_entries,dcr_os_entries";
+
+/// Tables no setting may ever drop. The office cannot re-create these from
+/// anything, so a typo in a settings field must not be able to leave them out.
+const NEVER_EXCLUDE: &[&str] = &[
+    "cops_master", "cops_items", "cops_master_deleted", "cops_items_deleted",
+    "br_master", "br_items", "dr_master", "dr_items",
+    "users", "app_settings",
+    "print_template_config", "baggage_rules_config", "special_item_allowances",
+    "legal_statutes", "dcr_tariffs", "dcr_formula_rules", "feature_flags",
+];
+
+/// Tables the operator has chosen to leave out, minus anything protected.
+fn excluded_tables(conn: &rusqlite::Connection) -> Vec<String> {
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'backup_exclude_tables'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    raw.split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            let protected = NEVER_EXCLUDE.iter().any(|p| p.eq_ignore_ascii_case(s));
+            if protected {
+                tracing::warn!(
+                    "backup_exclude_tables lists {s}, which holds case records —                      ignoring it and backing the table up anyway"
+                );
+            }
+            !protected
+        })
+        .collect()
+}
+
 /// Objects SQLite maintains itself; copying them corrupts the target.
 fn is_internal(name: &str) -> bool {
     name.starts_with("sqlite_")
@@ -124,8 +177,16 @@ fn tables_worth_copying(conn: &rusqlite::Connection) -> Result<Vec<String>> {
         .filter(|n| !is_internal(n))
         .collect();
 
+    let skip = excluded_tables(conn);
+    if !skip.is_empty() {
+        tracing::info!("backup excludes {} table(s) by configuration: {}", skip.len(), skip.join(", "));
+    }
+
     let mut keep = Vec::new();
     for t in all {
+        if skip.iter().any(|s| s.eq_ignore_ascii_case(&t)) {
+            continue;
+        }
         if ALWAYS_INCLUDE.contains(&t.as_str()) {
             keep.push(t);
             continue;
