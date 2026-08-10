@@ -31,7 +31,7 @@ mod dcr;
 mod config_backup;
 
 use std::sync::Arc;
-use axum::{Router, routing::{get, post, put, delete, patch}};
+use axum::{Router, extract::DefaultBodyLimit, routing::{get, post, put, delete, patch}};
 use crate::db::DbPool;
 
 /// The URL prefix for all API routes.  The frontend's `api.ts` must use the
@@ -48,7 +48,17 @@ pub const SERVER_PORT: u16 = 8000;
 /// This is the entry point called from `lib.rs`.  It wraps all routes under
 /// [`API_PREFIX`] so callers don't need to remember to nest manually.
 pub fn build_app(pool: Arc<DbPool>) -> Router {
-    Router::new().nest(API_PREFIX, build_routes(pool))
+    // NO upload limit. Axum refuses a body over 2 MB by default, and a restore
+    // uploads a whole backup — the office's own file is 44 MB, and the failure
+    // it produced was "Error parsing multipart/form-data request", which says
+    // nothing about size and sends you looking at the file instead of the limit.
+    //
+    // Disabled rather than raised to some number, because any number is a
+    // guess about how large the office's data will get and the failure it
+    // produces is unreadable. The ceiling is the disk.
+    Router::new()
+        .nest(API_PREFIX, build_routes(pool))
+        .layer(DefaultBodyLimit::disable())
 }
 
 /// Internal: all API routes WITHOUT the `/api` prefix.

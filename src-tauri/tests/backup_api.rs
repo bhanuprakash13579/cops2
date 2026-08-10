@@ -1185,3 +1185,52 @@ async fn indexes_are_present_after_a_restore_even_though_the_archive_omits_them(
     assert!(plan.to_lowercase().contains("index"),
             "the query planner should use an index, got: {plan}");
 }
+
+#[tokio::test]
+async fn the_office_csv_backup_restores_completely_into_cops2() {
+    // The upgrade path the office will actually use: the backup file from the
+    // Python version, uploaded straight into COPS2. It has to bring EVERYTHING —
+    // the registers included. Restoring the cases and quietly leaving 334,546
+    // baggage receipts behind would be discovered only when someone went looking
+    // for one.
+    let path = "/home/bhanu/Downloads/cops_backup_2026-08-06.zip";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("skipping: {path} not present");
+        return;
+    };
+
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(bytes).file_name("backup.zip"));
+    let r = reqwest::Client::new()
+        .post(format!("{base}/admin/backup/restore"))
+        .bearer_auth(admin_token())
+        .multipart(form)
+        .send().await.unwrap();
+    let st = r.status();
+    let txt = r.text().await.unwrap();
+    assert_eq!(st, 200, "the office backup must restore — server said: {txt}");
+    let body: serde_json::Value = serde_json::from_str(&txt).unwrap();
+
+    let count = |t: &str| -> i64 {
+        pool.get().unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap()
+    };
+    let got = [
+        ("cops_master", count("cops_master")),
+        ("cops_items",  count("cops_items")),
+        ("br_master",   count("br_master")),
+        ("br_items",    count("br_items")),
+        ("dr_master",   count("dr_master")),
+        ("dr_items",    count("dr_items")),
+    ];
+    eprintln!("RESTORED INTO COPS2: {got:?}");
+    eprintln!("  reported: {}", serde_json::to_string(&body).unwrap_or_default());
+
+    for (t, n) in got {
+        assert!(n > 0, "{t} came back empty — the register was not restored");
+    }
+    assert!(got[0].1 >= 29_000, "expected the office's OS cases, got {}", got[0].1);
+    assert!(got[2].1 >= 300_000, "expected the baggage register, got {}", got[2].1);
+    assert!(got[4].1 >= 14_000, "expected the detention register, got {}", got[4].1);
+}

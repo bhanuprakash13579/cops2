@@ -523,6 +523,102 @@ pub async fn admin_upload_legacy_items(
 
 // ── Restore from backup ZIP ───────────────────────────────────────────────────
 
+/// Import a CSV into a table, matching columns by name against the real schema.
+///
+/// Written generically rather than one hand-rolled importer per register. The
+/// baggage and detention tables have some sixty columns between them, and a
+/// hand-written list is a thing that goes stale the moment a field is added —
+/// silently, since a missing column just means data quietly not restored.
+///
+/// Only columns that exist on BOTH sides are written, so a backup from a newer
+/// or older build imports what it can rather than failing outright. Rows whose
+/// natural key is already present are skipped, which makes a second import of
+/// the same file a no-op.
+fn import_csv_table(
+    conn: &rusqlite::Connection,
+    table: &str,
+    csv_bytes: &[u8],
+    key_cols: &[&str],
+) -> Result<(i64, i64), String> {
+    let real: Vec<String> = {
+        let mut st = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .map_err(|e| e.to_string())?;
+        let v = st.query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter(|c| c != "id")
+            .collect();
+        v
+    };
+    if real.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let raw = String::from_utf8_lossy(csv_bytes);
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(raw.as_bytes());
+    let headers: Vec<String> = rdr.headers()
+        .map_err(|e| e.to_string())?
+        .iter().map(|h| h.trim().to_string()).collect();
+
+    // CSV column -> destination column, for the ones both sides have.
+    let mapped: Vec<(usize, String)> = headers.iter().enumerate()
+        .filter_map(|(i, h)| real.iter().find(|c| c.eq_ignore_ascii_case(h)).map(|c| (i, c.clone())))
+        .collect();
+    if mapped.is_empty() {
+        return Ok((0, 0));
+    }
+    let key_idx: Vec<usize> = key_cols.iter()
+        .filter_map(|k| headers.iter().position(|h| h.eq_ignore_ascii_case(k)))
+        .collect();
+    if key_idx.len() != key_cols.len() {
+        return Err(format!("{table}: the backup is missing {key_cols:?}"));
+    }
+
+    // Keys already present, so re-importing the same file changes nothing.
+    let mut seen: std::collections::HashSet<String> = {
+        let sel = key_cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+        let mut st = conn.prepare(&format!("SELECT {sel} FROM \"{table}\""))
+            .map_err(|e| e.to_string())?;
+        let n = key_cols.len();
+        let v = st.query_map([], move |r| {
+            let mut parts = Vec::with_capacity(n);
+            for i in 0..n {
+                parts.push(r.get::<_, Option<String>>(i).unwrap_or_default().unwrap_or_default().trim().to_string());
+            }
+            Ok(parts.join("\u{1}"))
+        }).map_err(|e| e.to_string())?.filter_map(|r| r.ok()).collect();
+        v
+    };
+
+    let cols_sql = mapped.iter().map(|(_, c)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let placeholders = vec!["?"; mapped.len()].join(", ");
+    let sql = format!("INSERT INTO \"{table}\" ({cols_sql}) VALUES ({placeholders})");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+    let (mut ins, mut skipped) = (0i64, 0i64);
+    for rec in rdr.records() {
+        let Ok(rec) = rec else { skipped += 1; continue };
+        let key = key_idx.iter()
+            .map(|i| rec.get(*i).unwrap_or("").trim().to_string())
+            .collect::<Vec<_>>().join("\u{1}");
+        if key_idx.iter().any(|i| rec.get(*i).unwrap_or("").trim().is_empty()) || seen.contains(&key) {
+            skipped += 1;
+            continue;
+        }
+        let vals: Vec<rusqlite::types::Value> = mapped.iter().map(|(i, _)| {
+            let v = rec.get(*i).unwrap_or("").trim();
+            if v.is_empty() { rusqlite::types::Value::Null }
+            else { rusqlite::types::Value::Text(v.to_string()) }
+        }).collect();
+        match stmt.execute(rusqlite::params_from_iter(vals.iter())) {
+            Ok(_) => { seen.insert(key); ins += 1; }
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((ins, skipped))
+}
+
 pub async fn admin_restore(
     State(pool): Db,
     _admin: AdminUser,
@@ -544,26 +640,44 @@ pub async fn admin_restore(
     let mut dcr_entries_csv:      Option<Vec<u8>> = None;
     let mut dcr_dr_entries_csv:   Option<Vec<u8>> = None;
     let mut dcr_os_entries_csv:   Option<Vec<u8>> = None;
+    // The baggage and detention registers, which a backup from the earlier
+    // version carries. Restoring the OS cases and quietly leaving these behind
+    // would lose 334,546 receipts and 14,138 detentions without saying so.
+    let mut br_master_csv: Option<Vec<u8>> = None;
+    let mut br_items_csv:  Option<Vec<u8>> = None;
+    let mut dr_master_csv: Option<Vec<u8>> = None;
+    let mut dr_items_csv:  Option<Vec<u8>> = None;
 
-    for i in 0..archive.len() {
-        // Peek at the file to get name and encryption status, then release the borrow.
-        let (name, is_encrypted) = {
-            let f = archive.by_index(i).map_err(|e| e500(&e.to_string()))?;
-            (f.name().to_lowercase(), f.encrypted())
-        };
+    // Names come from the central directory, NOT by opening each entry.
+    //
+    // The previous version peeked with by_index() to read the name and the
+    // encrypted flag — and by_index() on an AES entry fails outright with
+    // "Password required to decrypt file". So every encrypted backup was
+    // rejected before the decrypting branch below could ever run, and the
+    // message pointed at a password rather than at how it was being opened.
+    let entry_names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+
+    for entry in entry_names {
+        let name = entry.to_lowercase();
         let mut buf = Vec::new();
-        if is_encrypted {
-            // New-style AES-256 encrypted backup
-            archive.by_index_decrypt(i, zip_pass.as_bytes())
-                .map_err(|e| e500(&e.to_string()))?
-                .read_to_end(&mut buf)
-                .map_err(|e| e500(&e.to_string()))?;
-        } else {
-            // Legacy unencrypted backup
-            archive.by_index(i)
-                .map_err(|e| e500(&e.to_string()))?
-                .read_to_end(&mut buf)
-                .map_err(|e| e500(&e.to_string()))?;
+        // Try with the password first, then as a plain entry. Which one applies
+        // is a property of the entry, and asking is cheaper than predicting.
+        let decrypted = archive
+            .by_name_decrypt(&entry, zip_pass.as_bytes())
+            .ok()
+            .map(|mut f| { let _ = f.read_to_end(&mut buf); });
+        if decrypted.is_none() {
+            buf.clear();
+            if let Ok(mut f) = archive.by_name(&entry) {
+                f.read_to_end(&mut buf).map_err(|e| e500(&e.to_string()))?;
+            } else {
+                // Neither worked: a backup from an installation with a different
+                // password, which is worth saying plainly.
+                return Err(e400(&format!(
+                    "Could not read {entry} from this backup. It was created by an \
+                     installation with a different password."
+                )));
+            }
         }
         if name.contains("cops_master")        { master_csv = Some(buf); }
         else if name.contains("cops_items")    { items_csv = Some(buf); }
@@ -575,10 +689,15 @@ pub async fn admin_restore(
         else if name.contains("dcr_dr_entries"){ dcr_dr_entries_csv = Some(buf); }
         else if name.contains("dcr_os_entries"){ dcr_os_entries_csv = Some(buf); }
         else if name.contains("dcr_entries")   { dcr_entries_csv = Some(buf); }
+        else if name.contains("br_master")     { br_master_csv = Some(buf); }
+        else if name.contains("br_items")      { br_items_csv = Some(buf); }
+        else if name.contains("dr_master")     { dr_master_csv = Some(buf); }
+        else if name.contains("dr_items")      { dr_items_csv = Some(buf); }
     }
 
     // Return 400 if upload contains no recognized tables at all
     let has_any = master_csv.is_some() || items_csv.is_some()
+        || br_master_csv.is_some() || dr_master_csv.is_some()
         || dcr_tariffs_csv.is_some() || dcr_sessions_csv.is_some()
         || dcr_entries_csv.is_some() || dcr_settings_csv.is_some();
     if !has_any {
@@ -1045,6 +1164,28 @@ pub async fn admin_restore(
         "PRAGMA synchronous = NORMAL; PRAGMA journal_mode = WAL;"
     ).ok();
 
+    // ── The baggage and detention registers ─────────────────────────────────
+    //
+    // Keys chosen to match what a backup from the earlier version actually
+    // carries: br_items and dr_items hold br_date/dr_date rather than a year,
+    // so the item keys use the date. Checked against the office's own file
+    // rather than assumed — a key column the CSV lacks would refuse the whole
+    // register.
+    let mut reg: std::collections::BTreeMap<&str, (i64, i64)> = Default::default();
+    for (name, csv_opt, table, keys) in [
+        ("br_master", &br_master_csv, "br_master", &["br_no", "br_year"][..]),
+        ("br_items",  &br_items_csv,  "br_items",  &["br_no", "br_date", "items_sno"][..]),
+        ("dr_master", &dr_master_csv, "dr_master", &["dr_no", "dr_year"][..]),
+        ("dr_items",  &dr_items_csv,  "dr_items",  &["dr_no", "dr_date", "items_sno"][..]),
+    ] {
+        if let Some(bytes) = csv_opt {
+            match import_csv_table(&conn, table, bytes, keys) {
+                Ok(counts) => { reg.insert(name, counts); }
+                Err(e) => return Err(e500(&format!("restoring {name} failed: {e}"))),
+            }
+        }
+    }
+
     post_import_optimise(&conn);
     Ok(Json(json!({
         "master_inserted": master_inserted,
@@ -1054,8 +1195,16 @@ pub async fn admin_restore(
         "dcr_tariffs_inserted":  dcr_tariffs_ins,
         "dcr_sessions_inserted": dcr_sessions_ins,
         "dcr_entries_inserted":  dcr_entries_ins,
-        "br_inserted": 0, "br_skipped": 0, "br_items_inserted": 0,
-        "dr_inserted": 0, "dr_skipped": 0, "dr_items_inserted": 0,
+        // Real counts. These were hardcoded zeros while the registers were not
+        // restored at all, so the response reported figures it had never produced.
+        "br_inserted":       reg.get("br_master").map(|c| c.0).unwrap_or(0),
+        "br_skipped":        reg.get("br_master").map(|c| c.1).unwrap_or(0),
+        "br_items_inserted": reg.get("br_items").map(|c| c.0).unwrap_or(0),
+        "br_items_skipped":  reg.get("br_items").map(|c| c.1).unwrap_or(0),
+        "dr_inserted":       reg.get("dr_master").map(|c| c.0).unwrap_or(0),
+        "dr_skipped":        reg.get("dr_master").map(|c| c.1).unwrap_or(0),
+        "dr_items_inserted": reg.get("dr_items").map(|c| c.0).unwrap_or(0),
+        "dr_items_skipped":  reg.get("dr_items").map(|c| c.1).unwrap_or(0),
         "users_inserted": 0,
     })))
 }
