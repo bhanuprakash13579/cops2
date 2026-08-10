@@ -19,7 +19,19 @@ async fn serve() -> (String, tempfile::TempDir) { serve_with(200).await }
 /// A database with almost nothing in it, for testing the shrink guard.
 async fn serve_tiny() -> (String, tempfile::TempDir) { serve_with(1).await }
 
+/// Like `serve_with`, but also hands back the pool so a test can age a record.
+/// Time-based rules cannot be tested by waiting a day.
+async fn serve_with_pool(rows: i64) -> (String, tempfile::TempDir, Arc<db::DbPool>) {
+    let (base, dir, pool) = serve_inner(rows).await;
+    (base, dir, pool)
+}
+
 async fn serve_with(rows: i64) -> (String, tempfile::TempDir) {
+    let (base, dir, _pool) = serve_inner(rows).await;
+    (base, dir)
+}
+
+async fn serve_inner(rows: i64) -> (String, tempfile::TempDir, Arc<db::DbPool>) {
     let dir = tempfile::tempdir().unwrap();
     let pool = db::create_pool(&dir.path().join("live.db")).unwrap();
     // The REAL schema, not three hand-written tables. Hand-written fixtures
@@ -50,7 +62,8 @@ async fn serve_with(rows: i64) -> (String, tempfile::TempDir) {
         )
         .unwrap();
     }
-    let app = api::build_app(Arc::new(pool));
+    let pool = Arc::new(pool);
+    let app = api::build_app(pool.clone());
     let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -58,7 +71,7 @@ async fn serve_with(rows: i64) -> (String, tempfile::TempDir) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{addr}{}", api::API_PREFIX), dir)
+    (format!("http://{addr}{}", api::API_PREFIX), dir, pool)
 }
 
 fn officer_token() -> String {
@@ -603,4 +616,166 @@ async fn a_booked_case_can_be_printed() {
     let bytes = pdf.bytes().await.unwrap();
     assert!(bytes.len() > 500, "PDF is suspiciously small: {} bytes", bytes.len());
     assert_eq!(&bytes[..4], b"%PDF", "not a PDF");
+
+    // TWO pages, always. The OS form is the booking on page 1 and the
+    // adjudication order on page 2; a one-page output means the second half was
+    // dropped, which nobody notices until the printed copy is filed and the
+    // order is missing from it.
+    let pages = count_pdf_pages(&bytes);
+    assert_eq!(pages, 2, "the OS print must be exactly two pages, got {pages}");
+
+    // Legal size — 8.5in x 14in = 612 x 1008 points. The forms are pre-printed
+    // stationery; A4 output does not line up with them.
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("1008") || text.contains("1008.0"),
+            "expected legal-size pages (612 x 1008 pt); MediaBox looks wrong");
+}
+
+/// Count pages by counting page objects. `/Type /Pages` is the tree root, so it
+/// must not be counted as a page.
+fn count_pdf_pages(bytes: &[u8]) -> usize {
+    let t = String::from_utf8_lossy(bytes);
+    t.matches("/Type /Page").count() + t.matches("/Type/Page").count()
+        - t.matches("/Type /Pages").count() - t.matches("/Type/Pages").count()
+}
+
+// ── The edit / delete window ─────────────────────────────────────────────────
+//
+// A case may be corrected for 24 hours after adjudication and not afterwards.
+// That is a legal control, not a convenience: after the window the record is
+// what was decided. cops-web carries a note about getting this wrong once —
+// adjudication_time was left NULL, the check saw None and returned true, and
+// the window never closed at all.
+
+/// Book, then adjudicate, a case. Returns nothing; the case is OS 7001/2026.
+async fn book_and_adjudicate(base: &str) {
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "7001", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "WINDOW TEST", "passport_no": "Z7777777",
+            "items": [{ "items_sno": 1, "items_desc": "WATCH",
+                        "items_value": 120000.0, "items_release_category": "Under OS" }]
+        }))
+        .send().await.unwrap();
+    let a = c.post(format!("{base}/os/7001/2026/adjudicate")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "adj_offr_name": "TEST DC", "adj_offr_designation": "Deputy Commissioner",
+            "adjudication_date": "2026-08-09", "rf_amount": 25000.0
+        }))
+        .send().await.unwrap();
+    assert!(a.status().is_success(), "adjudication failed: {}", a.status());
+}
+
+/// Push a case's adjudication_time into the past so the window has closed.
+fn age_adjudication(pool: &db::DbPool, hours: i64) {
+    let c = pool.get().unwrap();
+    let when = (chrono::Local::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%d %H:%M:%S").to_string();
+    let n = c.execute(
+        "UPDATE cops_master SET adjudication_time = ?1 WHERE os_no='7001' AND os_year=2026",
+        rusqlite::params![when],
+    ).unwrap();
+    assert_eq!(n, 1, "the test case should exist");
+}
+
+#[tokio::test]
+async fn an_adjudicated_case_can_be_corrected_inside_the_window() {
+    let (base, _d, pool) = serve_with_pool(5).await;
+    book_and_adjudicate(&base).await;
+    age_adjudication(&pool, 2); // two hours ago — still open
+
+    let r = reqwest::Client::new()
+        .put(format!("{base}/os/7001/2026")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "os_no": "7001", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "CORRECTED INSIDE WINDOW", "passport_no": "Z7777777"
+        }))
+        .send().await.unwrap();
+    assert!(r.status().is_success(),
+            "a correction two hours after adjudication must be allowed, got {}", r.status());
+}
+
+#[tokio::test]
+async fn the_window_actually_closes_for_both_edit_and_delete() {
+    // The failure this guards against is silent: if adjudication_time is never
+    // stamped, or the comparison is wrong, the window never closes and an
+    // adjudicated case stays editable for ever.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    book_and_adjudicate(&base).await;
+    age_adjudication(&pool, 25); // just past 24 hours
+
+    let c = reqwest::Client::new();
+    let edit = c.put(format!("{base}/os/7001/2026")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "os_no": "7001", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "TOO LATE", "passport_no": "Z7777777"
+        }))
+        .send().await.unwrap();
+    assert_eq!(edit.status(), 400,
+               "editing 25 hours after adjudication must be refused, got {}", edit.status());
+
+    let del = c.delete(format!("{base}/os/7001/2026")).bearer_auth(dc_token())
+        .send().await.unwrap();
+    assert_eq!(del.status(), 400,
+               "deleting 25 hours after adjudication must be refused, got {}", del.status());
+
+    // And the record still says what was decided.
+    let still: serde_json::Value = c.get(format!("{base}/os/7001/2026"))
+        .bearer_auth(dc_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(still["pax_name"], "WINDOW TEST",
+               "the refused edit must not have been applied anyway: {still}");
+}
+
+// ── Querying ─────────────────────────────────────────────────────────────────
+//
+// The query module is how an officer answers "has this passenger been caught
+// before?" — a search that silently misses a case is worse than one that
+// errors, because the answer looks authoritative.
+
+#[tokio::test]
+async fn a_booked_case_is_findable_by_passport_name_and_number() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    c.post(format!("{base}/os")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "6001", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "RAMESH KUMAR", "passport_no": "M1234567",
+            "flight_no": "EK-544",
+            "items": [{ "items_sno": 1, "items_desc": "GOLD BAR",
+                        "items_value": 500000.0, "items_release_category": "Under OS" }]
+        }))
+        .send().await.unwrap();
+
+    // Cross-reference search — by passport.
+    let by_pp: serde_json::Value = c
+        .get(format!("{base}/queries/search?passport=M1234567"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let found = serde_json::to_string(&by_pp).unwrap();
+    assert!(found.contains("6001"), "passport search did not find the case: {found}");
+
+    // By name, and case-insensitively — officers do not type in capitals.
+    let by_name: serde_json::Value = c
+        .get(format!("{base}/queries/search?name=ramesh"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert!(serde_json::to_string(&by_name).unwrap().contains("6001"),
+            "lowercase name search must still match: {by_name}");
+
+    // A passport that was never booked must return nothing — a search that
+    // matches everything is as useless as one that matches nothing.
+    let none: serde_json::Value = c
+        .get(format!("{base}/queries/search?passport=ZZ0000000"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert!(!serde_json::to_string(&none).unwrap().contains("6001"),
+            "an unrelated passport must not match: {none}");
+
+    // The OS query module's own search.
+    let osq: serde_json::Value = c.post(format!("{base}/os-query/search"))
+        .bearer_auth(&t)
+        .json(&serde_json::json!({ "passport_no": "M1234567" }))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(serde_json::to_string(&osq).unwrap().contains("6001"),
+            "the OS query search did not find the case: {osq}");
 }
