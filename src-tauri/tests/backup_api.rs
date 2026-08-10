@@ -779,3 +779,73 @@ async fn a_booked_case_is_findable_by_passport_name_and_number() {
     assert!(serde_json::to_string(&osq).unwrap().contains("6001"),
             "the OS query search did not find the case: {osq}");
 }
+
+// ── Admin config backup / restore ────────────────────────────────────────────
+//
+// Settings without case data — how a new office machine is seeded so it prints
+// and calculates exactly like the one already in service.
+
+#[tokio::test]
+async fn config_backup_round_trips_and_never_overwrites_local_settings() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    let exported: serde_json::Value = c.get(format!("{base}/admin/config/backup"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(exported["format_version"], 1);
+    assert_eq!(exported["kind"], "admin_config_only");
+    assert!(exported["tables"]["print_template_config"].as_array().unwrap().len() >= 1,
+            "the seeded template should be exported: {exported}");
+
+    // It must carry settings and NOT case data — this file is meant to be
+    // carried between machines and emailed.
+    let text = serde_json::to_string(&exported).unwrap();
+    assert!(!text.contains("cops_master"), "case data must never be in a config file");
+
+    // Restoring into a machine that already has these settings must change
+    // nothing — an import that replaced a live print template with an older one
+    // would be discovered at the counter.
+    let again: serde_json::Value = c.post(format!("{base}/admin/config/restore"))
+        .bearer_auth(admin_token()).json(&exported).send().await.unwrap()
+        .json().await.unwrap();
+    let added: i64 = again["added"].as_object().unwrap()
+        .values().filter_map(|v| v.as_i64()).sum();
+    assert_eq!(added, 0, "re-importing the same file must add nothing: {again}");
+}
+
+#[tokio::test]
+async fn a_config_file_from_the_python_version_restores() {
+    // The actual file exported from the office, if it is present. This is the
+    // whole point of matching the format: the settings already in service are
+    // the ones worth keeping.
+    let path = "/home/bhanu/Downloads/cops_config_backup_2026-08-06.json";
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        eprintln!("skipping: {path} not present");
+        return;
+    };
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let r = c.post(format!("{base}/admin/config/restore"))
+        .bearer_auth(admin_token()).json(&payload).send().await.unwrap();
+    assert_eq!(r.status(), 200, "a real cops-web config file must restore");
+    let body: serde_json::Value = r.json().await.unwrap();
+
+    let templates: i64 = body["added"]["print_template_config"].as_i64().unwrap_or(0);
+    let users: i64 = body["added"]["users"].as_i64().unwrap_or(0);
+    assert!(templates >= 30, "expected the office's print templates: {body}");
+    assert!(users >= 1, "expected the office's user accounts: {body}");
+
+    // feature_flags is the schema that diverged — cops-web keeps one wide row,
+    // COPS2 keeps key/value pairs. It must be translated, not dropped.
+    let flags: i64 = body["added"]["feature_flags"].as_i64().unwrap_or(0);
+    assert!(flags >= 1, "feature flags must be translated across the schemas: {body}");
+
+    // And the settings must actually be queryable afterwards.
+    let back: serde_json::Value = c.get(format!("{base}/admin/config/backup"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    assert!(back["tables"]["print_template_config"].as_array().unwrap().len() >= 30,
+            "restored templates must be readable back out");
+    eprintln!("RESTORED FROM THE OFFICE FILE: {templates} templates, {users} users, {flags} flags");
+}

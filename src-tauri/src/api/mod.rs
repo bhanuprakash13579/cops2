@@ -28,6 +28,7 @@ mod apis;
 mod queries;
 mod reports;
 mod dcr;
+mod config_backup;
 
 use std::sync::Arc;
 use axum::{Router, routing::{get, post, put, delete, patch}};
@@ -145,6 +146,8 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/admin/config/baggage-rules/:id",  put(admin::update_baggage_rules_row).delete(admin::delete_baggage_rules_row))
         .route("/admin/config/special-allowances",  get(admin::get_special_allowances).post(admin::create_special_allowance))
         .route("/admin/config/special-allowances/:id", put(admin::update_special_allowance).delete(admin::delete_special_allowance))
+        .route("/admin/config/backup",              get(config_backup::config_backup))
+        .route("/admin/config/restore",             post(config_backup::config_restore))
         .route("/admin/config/pit",                 get(admin::get_pit_config))
         .route("/admin/config/os",                  get(admin::get_os_config))
         .route("/admin/config/remarks-templates",       get(admin::get_remarks_templates))
