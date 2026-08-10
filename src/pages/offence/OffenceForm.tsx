@@ -1486,7 +1486,6 @@ export default function OffenceForm() {
                     <PassportScanner
                         onScan={handleScan}
                         label="Scan Passport"
-                        description={<>Scan the <b>Machine Readable Zone (MRZ)</b> — the two lines of encoded text at the bottom of the biographical data page. Auto-fills name, nationality, passport number, date of birth and expiry.</>}
                     />
                 </div>
 
@@ -1605,7 +1604,6 @@ export default function OffenceForm() {
                 <PassportScanner
                     onScan={handleScan}
                     label="Scan Boarding Pass"
-                    description={<>Scan the <b>IATA BCBP barcode</b> on the physical or mobile boarding pass. Auto-fills passenger name, PNR, flight number, origin, destination and date.</>}
                 />
             </div>
             <div className="grid grid-cols-4 gap-4">

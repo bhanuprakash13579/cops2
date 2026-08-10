@@ -6,21 +6,18 @@ interface PassportScannerProps {
     onScan: (scannedData: any) => void;
     /** Button label. Defaults to "Scan Document". */
     label?: string;
-    /** Modal header title. Auto-derived from label if omitted. */
-    modalTitle?: string;
-    /** Instruction paragraph inside the modal. Accepts a string or JSX. */
-    description?: React.ReactNode;
 }
 
-export default function PassportScanner({ onScan, label, modalTitle, description }: PassportScannerProps) {
+export default function PassportScanner({ onScan, label }: PassportScannerProps) {
     const btnLabel   = label ?? 'Scan Document';
-    const dlgTitle   = modalTitle ?? (
-        label === 'Scan Passport'      ? 'Passport Reader'      :
-        label === 'Scan Boarding Pass' ? 'Boarding Pass Reader' :
-        'Document Reader'
-    );
-    const dlgDesc    = description ?? (
-        <>Place the cursor in the field below and use your barcode scanner to read the <b>Passport MRZ</b> or <b>Boarding Pass</b> standard barcode.</>
+    // The dialog says one thing and nothing else. An officer opens it with the
+    // document already in hand and the scanner already in the other — every
+    // extra sentence explaining what an MRZ is, is read once and skipped
+    // forever after.
+    const prompt     = (
+        label === 'Scan Passport'      ? 'Scan your passport'      :
+        label === 'Scan Boarding Pass' ? 'Scan your boarding pass' :
+        'Scan the document'
     );
     const [isOpen, setIsOpen] = useState(false);
     const [scanBuffer, setScanBuffer] = useState('');
@@ -167,33 +164,26 @@ export default function PassportScanner({ onScan, label, modalTitle, description
             {isOpen && (
                 <div className="fixed inset-0 bg-slate-900/75 z-50 flex items-center justify-center p-4">
                     <div className="bg-white rounded-xl shadow-xl w-full max-w-lg border border-slate-200 overflow-hidden">
-                        <div className="flex justify-between items-center p-4 border-b border-slate-100 bg-slate-50">
-                            <h3 className="font-bold text-slate-800 flex items-center">
-                                <Scan size={20} className="mr-2 text-indigo-600" /> {dlgTitle}
-                            </h3>
-                            <button onClick={() => setIsOpen(false)} className="text-slate-400 hover:text-slate-600">
+                        <div className="flex justify-end items-center p-2">
+                            <button onClick={() => setIsOpen(false)} className="text-slate-400 hover:text-slate-600" aria-label="Close">
                                 <X size={20} />
                             </button>
                         </div>
-                        
-                        <div className="p-8 flex flex-col items-center justify-center text-center">
+
+                        <div className="px-8 pb-8 flex flex-col items-center justify-center text-center">
                             <div className="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center mb-6 border-4 border-indigo-100 animate-pulse">
                                 <Scan size={40} className="text-indigo-600" />
                             </div>
-                            
-                            <h4 className="text-xl font-bold text-slate-800 mb-2">Ready to Scan</h4>
-                            <p className="text-slate-500 max-w-sm mb-6">
-                                {dlgDesc}
-                            </p>
 
-                            <input 
+                            <h4 className="text-xl font-bold text-slate-800 mb-6">{prompt}</h4>
+
+                            <input
                                 ref={inputRef}
                                 type="text"
                                 value={scanBuffer}
                                 onChange={handleInput}
                                 onKeyDown={handleKeyDown}
-                                className="w-full px-4 py-3 bg-slate-50 border-2 border-dashed border-indigo-300 rounded-lg focus:ring-4 focus:ring-indigo-500/20 focus:border-indigo-500 transition-colors font-mono text-center text-slate-700 placeholder:text-slate-300"
-                                placeholder="Waiting for scanner input..."
+                                className="w-full px-4 py-3 bg-slate-50 border-2 border-dashed border-indigo-300 rounded-lg focus:ring-4 focus:ring-indigo-500/20 focus:border-indigo-500 transition-colors font-mono text-center text-slate-700"
                                 autoFocus
                             />
 
