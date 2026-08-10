@@ -108,6 +108,8 @@ export interface DrSession {
   created_at: string | null;
   submitted_at: string | null;
   submitted_by: string | null;
+  /** Bank deposit challan for the shift's offline collections. */
+  challan_no: string | null;
   tariff: DrTariff | null;
   entries: DrEntry[];
   dr_entries: DrDrEntry[];

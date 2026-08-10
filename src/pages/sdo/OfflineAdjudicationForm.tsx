@@ -4,7 +4,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Plus, Trash2, FileText, User, Plane, AlertCircle, CheckCircle, Info, Upload, Table2, PenLine } from 'lucide-react';
 import DatePicker from '@/components/DatePicker';
 import api from '@/lib/api';
-import * as XLSX from 'xlsx';
+import * as XLSX from 'xlsx-js-style';
 
 // ── Excel import helpers ──────────────────────────────────────────────────────
 

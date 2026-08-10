@@ -140,7 +140,7 @@ interface ParsedOsRow {
 async function parseExcelOsList(file: File): Promise<{
   rows: ParsedOsRow[]; errors: string[]; hasName: boolean; originalKeys: string[];
 }> {
-  const XLSX = await import('xlsx');
+  const XLSX = await import('xlsx-js-style');
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: 'array' });
   const ws = wb.Sheets[wb.SheetNames[0]];
@@ -209,7 +209,7 @@ async function exportXlsxMerged(
   },
   colLabels: Record<string, string>,
 ) {
-  const XLSX = await import('xlsx');
+  const XLSX = await import('xlsx-js-style');
 
   // Lookup: "os_no||os_year_str" → db row
   const dbMap = new Map<string, Record<string, string>>();
