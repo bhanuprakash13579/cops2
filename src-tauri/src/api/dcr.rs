@@ -448,6 +448,37 @@ pub async fn bulk_save_entries(
 /// the shift is written up, and a mistyped challan has to be correctable without
 /// unpicking the session — refusing to change it would only push officers into
 /// keeping the real number somewhere outside the system.
+/// Find a session by the date and shift it covers, rather than by id.
+///
+/// An officer opening the duty register thinks in "the night shift on the 9th",
+/// not in row numbers. Without this the screen has to list every session and
+/// filter client-side, which works until a year of sessions has accumulated.
+///
+/// Shift is upper-cased before matching: the column is constrained to DAY or
+/// NIGHT, and a link carrying `night` would otherwise find nothing and look
+/// like the session was missing.
+pub async fn session_by_date(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path((report_date, shift)): Path<(String, String)>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM dcr_sessions
+             WHERE report_date = ?1 AND UPPER(shift) = UPPER(?2)
+             ORDER BY id LIMIT 1",
+            rusqlite::params![report_date.trim(), shift.trim()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e500(&e.to_string()))?;
+
+    let id = id.ok_or_else(|| e404("No duty session for that date and shift."))?;
+    let row = load_session_row(&conn, id)?.ok_or_else(|| e404("Session not found"))?;
+    Ok(Json(row))
+}
+
 pub async fn set_challan(
     State(pool): Db,
     _auth: AuthUser,

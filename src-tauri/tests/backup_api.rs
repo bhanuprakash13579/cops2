@@ -849,3 +849,37 @@ async fn a_config_file_from_the_python_version_restores() {
             "restored templates must be readable back out");
     eprintln!("RESTORED FROM THE OFFICE FILE: {templates} templates, {users} users, {flags} flags");
 }
+
+#[tokio::test]
+async fn a_session_can_be_found_by_its_date_and_shift() {
+    // An officer opening the duty register thinks in "the night shift on the
+    // 9th", not in row ids.
+    let (base, _d) = serve_with_tariffs().await;
+    let c = reqwest::Client::new();
+
+    let made: serde_json::Value = c.post(format!("{base}/dcr/sessions"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "report_date": "2026-08-09", "shift": "NIGHT" }))
+        .send().await.unwrap().json().await.unwrap();
+    let id = made["id"].as_i64().unwrap();
+
+    let found: serde_json::Value = c.get(format!("{base}/dcr/sessions/by-date/2026-08-09/NIGHT"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(found["id"], id, "wrong session came back: {found}");
+
+    // A link carrying a lower-case shift must still find it — the column holds
+    // DAY/NIGHT, and a case-sensitive match would look like a missing session.
+    let lower: serde_json::Value = c.get(format!("{base}/dcr/sessions/by-date/2026-08-09/night"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(lower["id"], id, "lower-case shift must match: {lower}");
+
+    // A date with no session says so, rather than returning someone else's.
+    let missing = c.get(format!("{base}/dcr/sessions/by-date/2026-01-01/DAY"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_eq!(missing.status(), 404);
+
+    // And it must not collide with /dcr/sessions/:id — different shapes, both live.
+    let by_id = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_eq!(by_id.status(), 200, "the by-id route must still work");
+}
