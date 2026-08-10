@@ -1023,3 +1023,43 @@ async fn a_session_still_explains_its_figures_after_the_rates_change() {
     assert_eq!(restored["tariff_applied"]["baggage_rate"], 0.38,
                "the applied rates must survive a restore: {restored}");
 }
+
+#[tokio::test]
+async fn a_month_of_sessions_comes_back_in_one_request() {
+    // The monthly register is built in the browser, so it needs the whole
+    // month. Session by session would be up to 62 round trips for one click.
+    let (base, _d) = serve_with_tariffs().await;
+    let c = reqwest::Client::new();
+
+    for (d, shift) in [("2026-03-01", "DAY"), ("2026-03-01", "NIGHT"),
+                       ("2026-03-15", "DAY"), ("2026-04-02", "DAY")] {
+        c.post(format!("{base}/dcr/sessions")).bearer_auth(officer_token())
+            .json(&serde_json::json!({ "report_date": d, "shift": shift }))
+            .send().await.unwrap();
+    }
+
+    let m: serde_json::Value = c.get(format!("{base}/dcr/month/2026/3"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let sessions = m["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 3, "April must not leak into March: {m}");
+
+    // Ordered as the register is read: by date, day shift before night.
+    assert_eq!(sessions[0]["report_date"], "2026-03-01");
+    assert_eq!(sessions[0]["shift"], "DAY");
+    assert_eq!(sessions[1]["shift"], "NIGHT");
+    assert_eq!(sessions[2]["report_date"], "2026-03-15");
+
+    // Entries must be present — the report cannot be built from headers alone.
+    assert!(sessions[0].get("entries").is_some(), "entries missing: {m}");
+    // And the rates it was worked under, for the register's duty columns.
+    assert!(sessions[0].get("tariff").is_some());
+
+    let empty: serde_json::Value = c.get(format!("{base}/dcr/month/2026/12"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(empty["sessions"].as_array().unwrap().len(), 0,
+               "a month with no sessions returns none, not an error");
+
+    let bad = c.get(format!("{base}/dcr/month/2026/13"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert_eq!(bad.status(), 400, "month 13 must be refused");
+}

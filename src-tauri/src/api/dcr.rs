@@ -342,6 +342,49 @@ pub async fn create_session(
     Ok(Json(session))
 }
 
+/// Every session in a month, with its entries — one request, not sixty-two.
+///
+/// The monthly register is built in the browser, so it needs the whole month's
+/// data. Fetching it session by session would be up to 62 round trips for one
+/// button press; on a LAN share that is the difference between a report that
+/// appears and one an officer gives up waiting for.
+///
+/// Ordered by date then shift, which is the order the register is read in.
+pub async fn month_sessions(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path((year, month)): Path<(i64, u32)>,
+) -> Result<Json<Value>, Err> {
+    if !(1..=12).contains(&month) || year < 2000 {
+        return Err(e400("Invalid year or month."));
+    }
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    // Text comparison on YYYY-MM-DD is exact and uses the index, and avoids
+    // month-length arithmetic entirely.
+    let prefix = format!("{year:04}-{month:02}-");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM dcr_sessions
+             WHERE report_date LIKE ?1 || '%'
+             ORDER BY report_date, CASE shift WHEN 'DAY' THEN 0 ELSE 1 END, id",
+        )
+        .map_err(|e| e500(&e.to_string()))?;
+    let ids: Vec<i64> = stmt
+        .query_map([&prefix], |r| r.get(0))
+        .map_err(|e| e500(&e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut sessions = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(full) = load_full_session(&conn, id)? {
+            sessions.push(full);
+        }
+    }
+    Ok(Json(json!({ "year": year, "month": month, "sessions": sessions })))
+}
+
 pub async fn get_session(
     State(pool): Db,
     _auth: AuthUser,

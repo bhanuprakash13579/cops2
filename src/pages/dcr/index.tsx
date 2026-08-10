@@ -8,7 +8,7 @@ import MessageGenerator from './MessageGenerator';
 import FormulaRulesPage from './FormulaRulesPage';
 import type { DrSession, DrFormulaRule } from './revenueCalc';
 import { fmtDate } from './revenueCalc';
-import { downloadAdcExcel, downloadRevenueExcel } from './dcrExcel';
+import { downloadAdcExcel, downloadRevenueExcel, downloadMonthlyRevenueExcel } from './dcrExcel';
 
 type View = 'dashboard' | 'sheet' | 'new' | 'config';
 
@@ -20,6 +20,12 @@ export default function DcrModule() {
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [showMessage, setShowMessage] = useState(false);
   const [filterDate, setFilterDate] = useState('');
+  // Month-end register. Defaults to the month being worked, which is the one an
+  // officer wants nine times out of ten.
+  const [reportMonth, setReportMonth] = useState<string>(
+    () => new Date().toISOString().slice(0, 7),
+  );
+  const [monthBusy, setMonthBusy] = useState(false);
 
   const [rules, setRules] = useState<DrFormulaRule[]>([]);
   const [rulesLoaded, setRulesLoaded] = useState(false);
@@ -96,9 +102,32 @@ export default function DcrModule() {
     } catch { /* silent */ }
   }, []);
 
+  const downloadMonthly = async () => {
+    const [y, m] = reportMonth.split('-').map(Number);
+    if (!y || !m) return;
+    setMonthBusy(true);
+    try {
+      // One request for the whole month. Session by session would be up to 62
+      // round trips for one button press.
+      const { data } = await api.get(`/dcr/month/${y}/${m}`, { timeout: 0 });
+      const sessions = data.sessions ?? [];
+      if (sessions.length === 0) {
+        alert(`No duty sessions were recorded in ${reportMonth}.`);
+        return;
+      }
+      await downloadMonthlyRevenueExcel(y, m, sessions);
+    } catch (err: unknown) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      alert(`Could not build the monthly register: ${detail ?? (err instanceof Error ? err.message : String(err))}`);
+    } finally {
+      setMonthBusy(false);
+    }
+  };
+
   // ── Config page ──────────────────────────────────────────────────────────
   if (view === 'config') {
-    return (
+
+  return (
       <FormulaRulesPage
         onBack={() => setView('dashboard')}
         onRulesChanged={handleRulesChanged}
@@ -188,6 +217,24 @@ export default function DcrModule() {
         <div className="flex items-center justify-between gap-4 flex-wrap">
           <h2 className="text-lg font-bold text-slate-800">Sessions</h2>
           <div className="flex items-center gap-2 flex-wrap">
+            {/* Month-end register — the figures the office files. */}
+            <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-xl px-3 py-1.5">
+              <input
+                type="month"
+                value={reportMonth}
+                onChange={e => setReportMonth(e.target.value)}
+                className="text-sm text-slate-700 bg-transparent focus:outline-none w-32"
+                title="Month for the revenue register"
+              />
+              <button
+                onClick={downloadMonthly}
+                disabled={monthBusy}
+                className="text-xs font-semibold text-teal-700 hover:text-teal-900 disabled:opacity-50 whitespace-nowrap"
+                title="Monthly Revenue Register — every session in the month"
+              >
+                {monthBusy ? 'Building…' : 'Monthly Register'}
+              </button>
+            </div>
             <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-xl px-3 py-1.5">
               <Calendar size={14} className="text-slate-500 shrink-0" />
               <input

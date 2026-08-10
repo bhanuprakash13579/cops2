@@ -205,6 +205,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/dcr/sessions",                          get(dcr::list_sessions).post(dcr::create_session))
         .route("/dcr/sessions/:id",                     get(dcr::get_session).put(dcr::update_session))
         .route("/dcr/sessions/by-date/:report_date/:shift", get(dcr::session_by_date))
+        .route("/dcr/month/:year/:month",                get(dcr::month_sessions))
         .route("/dcr/sessions/:id/entries",             put(dcr::bulk_save_entries))
         .route("/dcr/sessions/:id/challan",             patch(dcr::set_challan))
         .route("/dcr/sessions/:id/submit",              post(dcr::submit_session))
