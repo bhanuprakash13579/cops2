@@ -13,10 +13,11 @@ use typst::{
 
 /// The CBIC emblem, printed at the head of every OS.
 ///
-/// Indexed PNG at 640px, 96 KB. The emblem is a handful of flat colours, so an
-/// indexed palette costs nothing visually and a quarter of what the full-colour
-/// PNG did. 640px is what a 600 dpi printer can resolve at the size it appears;
-/// more pixels than that are weight no printer will ever use.
+/// Full resolution, 1170x1230 RGB PNG, 631 KB. An earlier version downsampled
+/// this to 640px and quantised it to a 64-colour palette to save weight, which
+/// was a mistake: at the size the emblem prints that is 683 dpi against the
+/// 1248 dpi it has now, and the softness showed in the on-screen preview. The
+/// 500 KB saved was 0.4% of the binary, and it bought nothing.
 ///
 /// It is deliberately NOT a JPEG. The old form used one, and JPEG's ringing
 /// artefacts land exactly on the fine ring lettering — the part that has to stay
