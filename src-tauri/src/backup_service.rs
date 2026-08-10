@@ -461,6 +461,17 @@ fn prune(folder: &str, keep: usize) -> usize {
 fn fingerprint(pool: &DbPool, counts: &[(String, i64)]) -> Option<String> {
     let conn = pool.get().ok()?;
     let mut parts: Vec<String> = counts.iter().map(|(t, n)| format!("{t}:{n}")).collect();
+
+    // Row counts and MAX(id) between them catch every INSERT and DELETE, and no
+    // UPDATE at all. data_revision is bumped by an AFTER UPDATE trigger on each
+    // case table, so an adjudication or a correction changes this even though
+    // nothing was added or removed. Reading it is one row, not a scan — the
+    // check stays O(1) while becoming correct.
+    let rev: i64 = conn
+        .query_row("SELECT n FROM data_revision WHERE id = 1", [], |r| r.get(0))
+        .unwrap_or(-1);
+    parts.push(format!("rev#{rev}"));
+
     for (t, _) in counts {
         let mx: i64 = conn
             .query_row(&format!("SELECT COALESCE(MAX(id),0) FROM \"{t}\""), [], |r| r.get(0))
@@ -776,22 +787,27 @@ mod tests {
     }
 
     /// A pool over a throwaway database, seeded with the tables the service checks.
+    /// A pool over a throwaway database built from the REAL migrations.
+    ///
+    /// It used to hand-create eight stub tables. That is why the edit-detection
+    /// fault survived: the fixture had no data_revision table and no triggers,
+    /// so a test could not have noticed them missing. A fixture that invents its
+    /// own schema can only ever test itself.
     fn test_pool(dir: &Path, rows: i64) -> DbPool {
         let db = dir.join("live.db");
         let pool = crate::db::create_pool(&db).unwrap();
+        crate::db::run_migrations(&pool).unwrap();
         let conn = pool.get().unwrap();
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT);
-             CREATE TABLE IF NOT EXISTS cops_master(id INTEGER PRIMARY KEY, pad TEXT);
-             CREATE TABLE IF NOT EXISTS cops_items(id INTEGER PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS br_master(id INTEGER PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS br_items(id INTEGER PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS dr_master(id INTEGER PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS dr_items(id INTEGER PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY);",
+            "CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT);",
         ).unwrap();
-        let mut st = conn.prepare("INSERT INTO cops_master(pad) VALUES (?1)").unwrap();
-        for _ in 0..rows { st.execute(params!["x".repeat(300)]).unwrap(); }
+        let mut st = conn
+            .prepare("INSERT INTO cops_master(os_no, os_date, os_year, pax_name) VALUES (?1,?2,?3,?4)")
+            .unwrap();
+        for i in 1..=rows {
+            // pax_name carries the padding the size checks rely on.
+            st.execute(params![format!("{i}"), "2026-08-09", 2026, "x".repeat(300)]).unwrap();
+        }
         drop(st); drop(conn);
         pool
     }
@@ -809,6 +825,33 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_record_still_produces_a_backup() {
+        // The change detector compared row counts and MAX(id). An UPDATE changes
+        // neither, so adjudicating a case — or correcting a name, or recording an
+        // outcome — left the fingerprint identical and the run was skipped. The
+        // decision never reached a backup until somebody happened to book a new
+        // case, which in a quiet week could be days.
+        let dir = tmpdir("editonly");
+        let dest = dir.join("d1");
+        std::fs::create_dir_all(&dest).unwrap();
+        let pool = test_pool(&dir, 200);
+        put_setting(&pool, "backup_dirs", dest.to_str().unwrap());
+
+        assert!(run_once(&pool, true, false).ok, "seed backup");
+        assert!(run_once(&pool, false, false).skipped, "unchanged must skip");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        // No new row, no higher id — exactly what adjudication does.
+        pool.get().unwrap()
+            .execute("UPDATE cops_master SET pax_name = 'adjudicated' WHERE id = 1", [])
+            .unwrap();
+
+        let r = run_once(&pool, false, false);
+        assert!(!r.skipped, "an edited record MUST produce a backup: {r:?}");
+        assert!(r.ok, "and it must succeed: {r:?}");
+    }
+
+    #[test]
     fn writes_then_skips_when_unchanged_then_writes_again_on_change() {
         let dir = tmpdir("cycle");
         let dest = dir.join("d1");
@@ -823,7 +866,7 @@ mod tests {
         assert!(r2.skipped, "unchanged database must skip: {r2:?}");
 
         pool.get().unwrap()
-            .execute("INSERT INTO cops_master(pad) VALUES ('new')", []).unwrap();
+            .execute("INSERT INTO cops_master(os_no, os_date, os_year) VALUES ('new','2026-08-09',2026)", []).unwrap();
         std::thread::sleep(Duration::from_millis(1100)); // distinct filename
         let r3 = run_once(&pool, false, false);
         assert!(r3.ok && !r3.skipped, "a change must produce a backup: {r3:?}");
@@ -840,7 +883,8 @@ mod tests {
 
         for i in 0..4 {
             pool.get().unwrap()
-                .execute("INSERT INTO cops_master(pad) VALUES (?1)", params![i.to_string()])
+                .execute("INSERT INTO cops_master(os_no, os_date, os_year) VALUES (?1,?2,?3)",
+                         params![i.to_string(), "2026-08-09", 2026])
                 .unwrap();
             std::thread::sleep(Duration::from_millis(1100));
             run_once(&pool, true, false);
@@ -919,7 +963,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(1100));
         pool.get().unwrap()
-            .execute("INSERT INTO cops_master(pad) VALUES ('new')", []).unwrap();
+            .execute("INSERT INTO cops_master(os_no, os_date, os_year) VALUES ('new','2026-08-09',2026)", []).unwrap();
 
         let r = run_once(&pool, false, false);
         assert!(r.refused, "unreadable backups must stop the run: {r:?}");
@@ -965,7 +1009,7 @@ mod tests {
             if i > 0 {
                 std::thread::sleep(Duration::from_millis(1100));
                 pool.get().unwrap()
-                    .execute("INSERT INTO cops_master(pad) VALUES ('more')", []).unwrap();
+                    .execute("INSERT INTO cops_master(os_no, os_date, os_year) VALUES ('more','2026-08-09',2026)", []).unwrap();
             }
             assert!(run_once(&pool, true, false).ok);
         }

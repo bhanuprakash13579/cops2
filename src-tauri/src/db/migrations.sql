@@ -815,3 +815,53 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- ── Edit counter ─────────────────────────────────────────────────────────────
+-- The backup skips when nothing has changed, and decided that by comparing row
+-- counts and MAX(id). An UPDATE changes neither, so adjudicating a case, or
+-- correcting a name, left the fingerprint identical and the change never
+-- reached a backup until somebody happened to book a new case.
+--
+-- Triggers fire on UPDATE ONLY. Inserts and deletes already move the row counts
+-- the fingerprint reads, so triggering on them would add a write to every row
+-- of a bulk import — 827,000 extra updates on the Chennai data — to learn
+-- something already known. This way an import costs nothing extra and an edit
+-- is caught.
+CREATE TABLE IF NOT EXISTS data_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    n  INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO data_revision (id, n) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS trg_rev_cops_master AFTER UPDATE ON cops_master
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_cops_items AFTER UPDATE ON cops_items
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_br_master AFTER UPDATE ON br_master
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_br_items AFTER UPDATE ON br_items
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_dr_master AFTER UPDATE ON dr_master
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_dr_items AFTER UPDATE ON dr_items
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_dcr_sessions AFTER UPDATE ON dcr_sessions
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rev_dcr_entries AFTER UPDATE ON dcr_entries
+BEGIN
+    UPDATE data_revision SET n = n + 1 WHERE id = 1;
+END;
