@@ -1299,3 +1299,36 @@ async fn a_long_case_still_prints_on_exactly_two_pages() {
     eprintln!("LONG CASE: 30 items, 1500+3000 chars of remarks -> {pages} pages");
     assert_eq!(pages, 2, "a long case must still be two pages, got {pages}");
 }
+
+#[tokio::test]
+async fn the_printed_os_carries_the_customs_emblem() {
+    // The emblem is part of the form, not decoration. Typst resolves the image
+    // through the World's file() hook, and a path it cannot resolve is a compile
+    // error rather than a blank space — but a template that simply stopped
+    // asking for it would fail silently and look fine in every other assertion.
+    // So check the PDF really contains an embedded image.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    c.post(format!("{base}/os")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "9004", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "EMBLEM TEST", "passport_no": "Z7777777",
+            "items": [{ "items_sno": 1, "items_desc": "WATCH",
+                        "items_qty": 1.0, "items_value": 40000.0,
+                        "items_release_category": "Under Duty" }]
+        })).send().await.unwrap();
+
+    let bytes = c.get(format!("{base}/os/9004/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap()
+        .bytes().await.unwrap();
+
+    if let Ok(dir) = std::env::var("OS_PDF_DUMP") {
+        std::fs::write(format!("{dir}/os_page.pdf"), &bytes).unwrap();
+    }
+    let t_ = String::from_utf8_lossy(&bytes);
+    assert!(t_.contains("/Subtype /Image") || t_.contains("/Subtype/Image"),
+            "the printed OS has no embedded image — the emblem is missing");
+    assert_eq!(count_pdf_pages(&bytes), 2, "still exactly two pages with the emblem");
+}

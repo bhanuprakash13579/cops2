@@ -11,6 +11,19 @@ use typst::{
 
 // ── Typst World ───────────────────────────────────────────────────────────────
 
+/// The CBIC emblem, printed at the head of every OS.
+///
+/// Indexed PNG at 640px, 96 KB. The emblem is a handful of flat colours, so an
+/// indexed palette costs nothing visually and a quarter of what the full-colour
+/// PNG did. 640px is what a 600 dpi printer can resolve at the size it appears;
+/// more pixels than that are weight no printer will ever use.
+///
+/// It is deliberately NOT a JPEG. The old form used one, and JPEG's ringing
+/// artefacts land exactly on the fine ring lettering — the part that has to stay
+/// legible when the form is printed in black and white.
+const LOGO_PNG:   &[u8] = include_bytes!("../../assets/customs-logo.png");
+const LOGO_VPATH: &str  = "customs-logo.png";
+
 struct OsWorld {
     library: LazyHash<Library>,
     book:    LazyHash<FontBook>,
@@ -59,6 +72,12 @@ impl World for OsWorld {
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
+        // The only file the document may reference. Compiled into the binary so
+        // the print does not depend on anything surviving on disk next to the
+        // executable — a printed OS with no emblem is not a valid form.
+        if id.vpath().as_rootless_path() == std::path::Path::new(LOGO_VPATH) {
+            return Ok(Bytes::new(LOGO_PNG));
+        }
         Err(FileError::NotFound(id.vpath().as_rootless_path().to_path_buf()))
     }
 
@@ -505,11 +524,15 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
 // ═══════════════════════════════ PAGE 1 ═══════════════════════════════════════
 
 // Header
-#rect(stroke: 2.5pt + black, inset: 4pt, width: 100%)[
-  #align(center)[
-    *{office_hdr1}*\
-    {office_hdr2}
-  ]
+#rect(stroke: 2.5pt + black, inset: 5pt, width: 100%)[
+  #grid(
+    columns: (72pt, 1fr, 72pt),
+    align: (left + horizon, center + horizon, right + horizon),
+    image("/customs-logo.png", width: 68pt),
+    [#text(size: 1.25em, weight: "bold")[{office_hdr1}]\
+     {office_hdr2}],
+    [],
+  )
 ]
 #v(4pt)
 #align(center)[#text(weight: "bold", size: 10pt)[{page1_title}]]
