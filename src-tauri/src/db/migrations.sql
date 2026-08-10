@@ -751,6 +751,10 @@ CREATE TABLE IF NOT EXISTS dcr_entries (
     personal_penalty REAL NOT NULL DEFAULT 0,
     other_charges REAL NOT NULL DEFAULT 0,
     fuel_duty REAL NOT NULL DEFAULT 0,
+    -- Manual entry: cess on cigarettes, column 26 of the monthly register.
+    -- It is a component of total_duty; omitting it understates the duty
+    -- collected on every cigarette case.
+    cess_on_cig REAL NOT NULL DEFAULT 0,
     total_duty REAL NOT NULL DEFAULT 0,
     flight_no TEXT NOT NULL DEFAULT '',
     is_sbi_challan INTEGER NOT NULL DEFAULT 0,

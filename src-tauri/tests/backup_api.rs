@@ -883,3 +883,50 @@ async fn a_session_can_be_found_by_its_date_and_shift() {
         .bearer_auth(officer_token()).send().await.unwrap();
     assert_eq!(by_id.status(), 200, "the by-id route must still work");
 }
+
+#[tokio::test]
+async fn cess_on_cigarettes_is_recorded_and_survives() {
+    // COPS2 had no column, no field and no place in the duty total, so every
+    // cigarette case produced a SMALLER total than the same case in cops-web —
+    // a wrong revenue figure, silently.
+    let (base, _d) = serve_with_tariffs().await;
+    let c = reqwest::Client::new();
+
+    let s: serde_json::Value = c.post(format!("{base}/dcr/sessions"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "report_date": "2026-08-09", "shift": "DAY" }))
+        .send().await.unwrap().json().await.unwrap();
+    let id = s["id"].as_i64().unwrap();
+
+    let saved = c.put(format!("{base}/dcr/sessions/{id}/entries"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "entries": [{
+                "sort_order": 1, "sl_no": 1, "br_no": "BR/1/2026",
+                "item_desc": "CIGARETTES", "dutiable_value": 40000.0,
+                "cigarette_duty": 10000.0,
+                "cess_on_cig": 1500.0,
+                "total_duty": 11500.0,
+                "is_offline_br": true
+            }],
+            "dr_entries": [], "os_entries": []
+        }))
+        .send().await.unwrap();
+    assert!(saved.status().is_success(), "saving entries failed: {}", saved.status());
+
+    let back: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let entry = &back["entries"][0];
+    assert_eq!(entry["cess_on_cig"], 1500.0,
+               "the cess must come back from the database: {entry}");
+
+    // And it must survive a backup and restore — a duty component that vanishes
+    // on restore understates the month after a recovery.
+    let archive = take_archive(&base).await;
+    let (status, body) = restore(&base, archive, true).await;
+    assert_eq!(status, 200, "{body}");
+    let after: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["entries"][0]["cess_on_cig"], 1500.0,
+               "the cess must survive a restore: {after}");
+}

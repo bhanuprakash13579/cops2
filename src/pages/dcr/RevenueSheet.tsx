@@ -48,6 +48,7 @@ const ENTRY_COLS = [
   { key: 'personal_penalty', label: 'Penalty',    width: 70,  type: 'num',    manual: true  },
   { key: 'other_charges',    label: 'Other',      width: 65,  type: 'num',    manual: true  },
   { key: 'fuel_duty',        label: 'Fuel',       width: 60,  type: 'num',    manual: true  },
+  { key: 'cess_on_cig',      label: 'Cess/Cig',   width: 60,  type: 'num',    manual: true  },
   { key: 'total_duty',       label: 'TOTAL',      width: 80,  type: 'num',    manual: false },
   { key: 'flight_no',        label: 'Flight',     width: 75,  type: 'text',   manual: true  },
   { key: 'is_sbi_challan',   label: 'SBI',        width: 40,  type: 'bool',   manual: true  },

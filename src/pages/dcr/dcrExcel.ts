@@ -17,7 +17,7 @@ const ENTRY_COLS: (keyof DrEntry)[] = [
   'gold_duty_bcd', 'gold_duty_cons', 'silver_duty_cons',
   'sws_on_gold', 'aidc_gold_silver', 'sws_on_silver', 'aidc_on_liquor',
   'redemption_fine', 'reexport_fine', 'personal_penalty', 'other_charges',
-  'fuel_duty', 'total_duty', 'flight_no',
+  'fuel_duty', 'cess_on_cig', 'total_duty', 'flight_no',
 ];
 
 const REVENUE_HEADERS = [
@@ -83,6 +83,7 @@ function entryToRevenueRow(e: DrEntry, idx: number): unknown[] {
     e.personal_penalty || 0,
     e.other_charges || 0,
     e.fuel_duty || 0,
+    e.cess_on_cig || 0,
     e.total_duty || 0,
     e.flight_no || '',
   ];

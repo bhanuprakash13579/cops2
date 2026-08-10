@@ -69,6 +69,9 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         // Bank deposit challan number — added after the first COPS2 builds
         // shipped, so existing databases need it too.
         ("dcr_sessions", "challan_no",     "VARCHAR(50)"),
+        // Cess on cigarettes — a duty component that was missing entirely,
+        // so existing databases need the column before it can be recorded.
+        ("dcr_entries",  "cess_on_cig",    "REAL NOT NULL DEFAULT 0"),
     ];
     for (table, col, col_type) in &col_migrations {
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type);

@@ -79,7 +79,8 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
                 sws_on_gold, aidc_gold_silver, sws_on_silver, aidc_on_liquor,
                 redemption_fine, reexport_fine, personal_penalty,
                 other_charges, fuel_duty, total_duty,
-                flight_no, is_sbi_challan, is_offline_br, overrides
+                flight_no, is_sbi_challan, is_offline_br, overrides,
+                  cess_on_cig
          FROM dcr_entries WHERE session_id = ? ORDER BY sort_order",
     ).map_err(|e| e500(&e.to_string()))?;
 
@@ -114,6 +115,9 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
             "is_sbi_challan":   r.get::<_, i64>(26)? != 0,
             "is_offline_br":    r.get::<_, i64>(27)? != 0,
             "overrides":        r.get::<_, Option<String>>(28)?,
+            // Appended last on purpose: inserting it mid-list would shift
+            // every index below it, and those are positional.
+            "cess_on_cig":      r.get::<_, f64>(29)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
@@ -354,8 +358,9 @@ pub async fn bulk_save_entries(
                     sws_on_gold, aidc_gold_silver, sws_on_silver, aidc_on_liquor,
                     redemption_fine, reexport_fine, personal_penalty,
                     other_charges, fuel_duty, total_duty,
-                    flight_no, is_sbi_challan, is_offline_br, overrides
-                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    flight_no, is_sbi_challan, is_offline_br, overrides,
+                      cess_on_cig
+                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     id,
                     e.get("sort_order").and_then(|v| v.as_i64()).unwrap_or(i as i64),
@@ -386,6 +391,7 @@ pub async fn bulk_save_entries(
                     if e.get("is_sbi_challan").and_then(|v| v.as_bool()).unwrap_or(false) { 1i64 } else { 0i64 },
                     if e.get("is_offline_br").and_then(|v| v.as_bool()).unwrap_or(false) { 1i64 } else { 0i64 },
                     e.get("overrides").and_then(|v| v.as_str()),
+                    e.get("cess_on_cig").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 ],
             ).map_err(|e| e500(&e.to_string()))?;
         }
