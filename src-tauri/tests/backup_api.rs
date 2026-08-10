@@ -1255,3 +1255,47 @@ async fn foreign_key_enforcement_is_restored_after_a_backup_and_a_restore() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(fk_on(&pool), 1, "enforcement must be back on after a restore");
 }
+
+#[tokio::test]
+async fn a_long_case_still_prints_on_exactly_two_pages() {
+    // The OS form is pre-printed stationery: page 1 is the booking, page 2 the
+    // adjudication order. A third page means the layout overflowed, and the
+    // officer finds out only when the filed copy does not match the form.
+    //
+    // The single-item case already covered here never exercises that. Real
+    // seizures run to dozens of items with remarks filled to the field limits,
+    // and that is precisely when the previous system's output spilled onto a
+    // third page.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    let items: Vec<_> = (1..=30).map(|i| serde_json::json!({
+        "items_sno": i,
+        "items_desc": format!(
+            "ASSORTED GOLD ORNAMENTS, ITEM {i} — chain with pendant, hallmarked, \
+             recovered from the concealed lining of the said baggage"),
+        "items_qty": 2.0,
+        "items_value": 125_000.0,
+        "items_release_category": "Under Duty"
+    })).collect();
+
+    let r = c.post(format!("{base}/os")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "9003", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "LONG CONTENT TEST", "passport_no": "Z9999999",
+            "supdts_remarks": "A".repeat(1500),       // the field's own limit
+            "adjn_offr_remarks": "B".repeat(3000),    // ditto
+            "items": items
+        }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200, "booking the long case failed: {}", r.text().await.unwrap());
+
+    let pdf = c.get(format!("{base}/os/9003/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap();
+    assert_eq!(pdf.status(), 200);
+    let bytes = pdf.bytes().await.unwrap();
+    let pages = count_pdf_pages(&bytes);
+    eprintln!("LONG CASE: 30 items, 1500+3000 chars of remarks -> {pages} pages");
+    assert_eq!(pages, 2, "a long case must still be two pages, got {pages}");
+}

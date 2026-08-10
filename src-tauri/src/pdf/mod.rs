@@ -224,7 +224,7 @@ fn slnos_text(slnos: &[String]) -> String {
 // ── Typst source builder ──────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn build_typst_source(case: &Value) -> String {
+fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     // ── Extract master fields ─────────────────────────────────────────────────
     let os_no    = str_val(case, "os_no");
     let os_year  = i64_val(case, "os_year");
@@ -498,7 +498,7 @@ fn build_typst_source(case: &Value) -> String {
 
     format!(r#"
 #set page(width: 8.5in, height: 14in, margin: (top: 0.35in, bottom: 0.3in, left: 0.45in, right: 0.45in))
-#set text(font: ("Liberation Sans", "Noto Sans", "Roboto", "Arial"), size: 9pt, lang: "en")
+#set text(font: ("Liberation Sans", "Noto Sans", "Roboto", "Arial"), size: {p1_size}pt, lang: "en")
 #set par(leading: 0.45em, spacing: 0.6em)
 #set table(inset: (x: 3pt, y: 2pt), stroke: 0.75pt + black)
 
@@ -586,7 +586,7 @@ fn build_typst_source(case: &Value) -> String {
 
 // ═══════════════════════════════ PAGE 2 ═══════════════════════════════════════
 
-#set text(size: 8pt)
+#set text(size: {p2_size}pt)
 #set par(leading: 0.6em, spacing: 0.8em)
 
 // Office heading
@@ -697,6 +697,8 @@ fn build_typst_source(case: &Value) -> String {
         oinfo_stay_text     = esc(&stay_text),
         oinfo_residence     = esc(&residence_at),
         oinfo_prev_visits   = esc(&previous_visits),
+        p1_size             = p1_size,
+        p2_size             = p2_size,
         inv_heading         = esc(inv_heading),
         col_fa_hdr          = esc(col_fa_hdr),
         col_duty_hdr        = esc(col_duty_hdr),
@@ -764,20 +766,76 @@ pub fn compile_typst(source_text: &str) -> Result<Vec<u8>> {
     Ok(pdf)
 }
 
+/// Base text sizes: page 1 (the booking) and page 2 (the order). Every entry
+/// keeps their 9:8 relationship, so shrinking to fit never makes the two pages
+/// look like they came from different documents.
+const OS_SIZE_LADDER: &[(f64, f64)] = &[
+    (9.0, 8.0), (8.5, 7.6), (8.0, 7.1), (7.5, 6.7),
+    (7.0, 6.2), (6.5, 5.8), (6.0, 5.3), (5.5, 4.9),
+];
+
 /// Generate a 2-page legal-size OS PDF using Typst.
 /// `case` is the full cops_master JSON row with an `items` array attached.
+///
+/// Exactly two pages, always. The form is pre-printed stationery — page 1 is
+/// the booking, page 2 the adjudication order — so a third page means the
+/// filed copy no longer matches the form it is supposed to be.
+///
+/// A seizure of thirty items with the remarks fields filled to their limits
+/// overflows at the full size, so the text is shrunk until it fits. The full
+/// size is tried first and almost always wins, which keeps the ordinary
+/// booking at one compile; only the long ones pay for the binary search that
+/// follows, and that is bounded at four more. Page count comes from the
+/// compiled document, so the search never exports a PDF it is going to throw
+/// away.
 pub fn generate_os_pdf(case: &Value) -> Result<Vec<u8>> {
-    let source = build_typst_source(case);
+    let compile = |p1: f64, p2: f64| -> Result<typst::layout::PagedDocument> {
+        let world = OsWorld::new(build_typst_source(case, p1, p2));
+        typst::compile(&world).output
+            .map_err(|errors| anyhow::anyhow!("Typst compile error(s): {errors:?}"))
+    };
 
-    let world  = OsWorld::new(source);
-    let result = typst::compile(&world);
-    let doc    = result.output
-        .map_err(|errors| anyhow::anyhow!("Typst compile error(s): {:?}", errors))?;
+    let (p1, p2) = OS_SIZE_LADDER[0];
+    let full = compile(p1, p2)?;
+    let mut doc = (full.pages.len() <= 2).then_some(full);
 
-    let pdf = typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default())
-        .map_err(|e| anyhow::anyhow!("Typst PDF export failed: {e:?}"))?;
+    if doc.is_none() {
+        // Fitting is monotonic down the ladder: once a size fits, every
+        // smaller one does too. Keep the largest that does.
+        let (mut lo, mut hi) = (1usize, OS_SIZE_LADDER.len() - 1);
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let (p1, p2) = OS_SIZE_LADDER[mid];
+            let d = compile(p1, p2)?;
+            if d.pages.len() <= 2 {
+                doc = Some(d);
+                if mid == 0 { break; }
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        }
+    }
 
-    Ok(pdf)
+    // Nothing on the ladder fit — take the smallest and say so. Three pages of
+    // a real case beats refusing to print it, but this should never happen
+    // quietly.
+    let doc = match doc {
+        Some(d) => d,
+        None => {
+            let (p1, p2) = OS_SIZE_LADDER[OS_SIZE_LADDER.len() - 1];
+            let d = compile(p1, p2)?;
+            tracing::error!(
+                "OS print overflowed two pages even at the smallest size ({p1}pt/{p2}pt) \
+                 — produced {} pages; the case has more content than the form can hold",
+                d.pages.len()
+            );
+            d
+        }
+    };
+
+    typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default())
+        .map_err(|e| anyhow::anyhow!("Typst PDF export failed: {e:?}"))
 }
 
 /// Generate a BR (Baggage Receipt) PDF.
