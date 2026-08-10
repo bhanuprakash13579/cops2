@@ -971,3 +971,55 @@ async fn revenue_tables_can_be_left_out_but_case_records_never_can() {
     assert!(body["rows"].as_i64().unwrap_or(0) >= 50,
             "the archive should still hold the case rows: {body}");
 }
+
+#[tokio::test]
+async fn a_session_still_explains_its_figures_after_the_rates_change() {
+    // The concern: a session stores tariff_id. Rates change, or the row is lost,
+    // and the shift's figures can no longer be explained — the value is there,
+    // the duty is there, and what rate connected them is gone.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    let c = reqwest::Client::new();
+
+    // A tariff in force, then a session worked under it.
+    c.post(format!("{base}/dcr/tariffs")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "effective_from": "2026-01-01", "label": "budget 2026",
+            "baggage_rate": 0.38, "liquor_duty_rate": 0.15, "aidc_liquor_rate": 0.035,
+            "gold_bcd_rate": 0.125, "aidc_gold_rate": 0.05,
+            "gold_cons_bcd_rate": 0.125, "aidc_gold_cons_rate": 0.05,
+            "silver_bcd_rate": 0.35, "aidc_silver_rate": 0.05,
+            "silver_cons_rate": 0.35, "aidc_silver_cons_rate": 0.05
+        })).send().await.unwrap();
+
+    let s: serde_json::Value = c.post(format!("{base}/dcr/sessions"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "report_date": "2026-03-01", "shift": "DAY" }))
+        .send().await.unwrap().json().await.unwrap();
+    let id = s["id"].as_i64().unwrap();
+    assert_eq!(s["tariff"]["baggage_rate"], 0.38, "the live rate should be joined: {s}");
+
+    // A foreign key already stops a tariff in use from being DELETED, so the
+    // real exposure is the rates being EDITED — which is what happens at a
+    // budget. The row keeps its id, the join keeps working, and it silently
+    // starts describing this old shift with next year's rates.
+    pool.get().unwrap().execute(
+        "UPDATE dcr_tariffs SET baggage_rate = 0.45, label = 'budget 2027'", []
+    ).unwrap();
+
+    let after: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["tariff_applied"]["baggage_rate"], 0.38,
+               "the shift must still report the rate it was WORKED under, not today's: {after}");
+    assert_eq!(after["tariff_applied"]["label"], "budget 2026");
+    assert!(after["tariff_applied"]["frozen_at"].is_string(),
+            "and when it was frozen, so the record is self-describing: {after}");
+
+    // It must also survive a backup and restore, or the protection is only skin deep.
+    let archive = take_archive(&base).await;
+    let (status, body) = restore(&base, archive, true).await;
+    assert_eq!(status, 200, "{body}");
+    let restored: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(restored["tariff_applied"]["baggage_rate"], 0.38,
+               "the applied rates must survive a restore: {restored}");
+}

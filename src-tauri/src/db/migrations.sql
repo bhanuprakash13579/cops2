@@ -720,7 +720,14 @@ CREATE TABLE IF NOT EXISTS dcr_sessions (
     -- Bank deposit challan / SBI receipt number for the session's offline BR
     -- collections. Recorded against the session, not an entry: one deposit
     -- covers the shift, and it is the reference an auditor traces cash by.
-    challan_no VARCHAR(50)
+    challan_no VARCHAR(50),
+    -- The duty rates AS APPLIED to this shift, copied in rather than referenced.
+    -- tariff_id points at a row that can be edited, superseded or lost, and then
+    -- the figures in this session can no longer be explained: the value is there,
+    -- the duty is there, and what rate connected them is gone. An invoice stores
+    -- the tax rate it charged for the same reason. About 200 bytes a shift —
+    -- 150 KB a year at two shifts a day.
+    tariff_snapshot TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_dcr_sessions_date_shift
     ON dcr_sessions (report_date, shift, COALESCE(batch_name,''));

@@ -21,12 +21,18 @@ fn load_session_row(conn: &rusqlite::Connection, id: i64) -> Result<Option<Value
                 t.gold_cons_bcd_rate, t.aidc_gold_cons_rate,
                 t.silver_bcd_rate, t.aidc_silver_rate,
                 t.silver_cons_rate, t.aidc_silver_cons_rate,
-                s.challan_no
+                s.challan_no, s.tariff_snapshot
          FROM dcr_sessions s
          LEFT JOIN dcr_tariffs t ON t.id = s.tariff_id
          WHERE s.id = ?",
         rusqlite::params![id],
         |r| {
+            // The rates as they were when this shift was worked. If the tariff
+            // row has since been edited or deleted the join yields nothing, and
+            // this is what keeps the session explainable.
+            let frozen: Option<Value> = r
+                .get::<_, Option<String>>(23)?
+                .and_then(|t| serde_json::from_str(&t).ok());
             let tariff = if r.get::<_, Option<String>>(9)?.is_some() {
                 json!({
                     "effective_from":        r.get::<_, Option<String>>(9)?,
@@ -44,7 +50,8 @@ fn load_session_row(conn: &rusqlite::Connection, id: i64) -> Result<Option<Value
                     "aidc_silver_cons_rate": r.get::<_, Option<f64>>(21)?,
                 })
             } else {
-                Value::Null
+                // Referenced tariff gone — use the copy frozen onto the session.
+                frozen.clone().unwrap_or(Value::Null)
             };
             Ok(json!({
                 "id":           r.get::<_, i64>(0)?,
@@ -57,6 +64,7 @@ fn load_session_row(conn: &rusqlite::Connection, id: i64) -> Result<Option<Value
                 "submitted_at": r.get::<_, Option<String>>(7)?,
                 "submitted_by": r.get::<_, Option<String>>(8)?,
                 "challan_no":   r.get::<_, Option<String>>(22)?,
+                "tariff_applied": frozen,
                 "tariff":       tariff,
             }))
         },
@@ -199,7 +207,7 @@ pub async fn list_sessions(
                 t.gold_cons_bcd_rate, t.aidc_gold_cons_rate,
                 t.silver_bcd_rate, t.aidc_silver_rate,
                 t.silver_cons_rate, t.aidc_silver_cons_rate,
-                s.challan_no
+                s.challan_no, s.tariff_snapshot
          FROM dcr_sessions s
          LEFT JOIN dcr_tariffs t ON t.id = s.tariff_id
          {where_sql}
@@ -211,6 +219,12 @@ pub async fn list_sessions(
     let rows: Vec<Value> = stmt.query_map(
         rusqlite::params_from_iter(where_params.iter()),
         |r| {
+            // The rates as they were when this shift was worked. If the tariff
+            // row has since been edited or deleted the join yields nothing, and
+            // this is what keeps the session explainable.
+            let frozen: Option<Value> = r
+                .get::<_, Option<String>>(23)?
+                .and_then(|t| serde_json::from_str(&t).ok());
             let tariff = if r.get::<_, Option<String>>(9)?.is_some() {
                 json!({
                     "effective_from":        r.get::<_, Option<String>>(9)?,
@@ -228,7 +242,8 @@ pub async fn list_sessions(
                     "aidc_silver_cons_rate": r.get::<_, Option<f64>>(21)?,
                 })
             } else {
-                Value::Null
+                // Referenced tariff gone — use the copy frozen onto the session.
+                frozen.clone().unwrap_or(Value::Null)
             };
             Ok(json!({
                 "id":           r.get::<_, i64>(0)?,
@@ -241,12 +256,51 @@ pub async fn list_sessions(
                 "submitted_at": r.get::<_, Option<String>>(7)?,
                 "submitted_by": r.get::<_, Option<String>>(8)?,
                 "challan_no":   r.get::<_, Option<String>>(22)?,
+                "tariff_applied": frozen,
                 "tariff":       tariff,
             }))
         },
     ).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
     Ok(Json(json!({ "items": rows })))
+}
+
+
+/// The full rate set for a tariff row, as JSON — what gets frozen onto a session.
+///
+/// Copied in rather than referenced because `tariff_id` points at a row that can
+/// be edited, superseded, or lost. When that happens the session still has the
+/// value and the duty, and nothing to say what rate connected them. An invoice
+/// stores the tax rate it charged for exactly this reason.
+fn tariff_json(conn: &rusqlite::Connection, id: i64) -> Option<Value> {
+    conn.query_row(
+        "SELECT effective_from, label,
+                baggage_rate, liquor_duty_rate, aidc_liquor_rate,
+                gold_bcd_rate, aidc_gold_rate,
+                gold_cons_bcd_rate, aidc_gold_cons_rate,
+                silver_bcd_rate, aidc_silver_rate,
+                silver_cons_rate, aidc_silver_cons_rate
+         FROM dcr_tariffs WHERE id = ?1",
+        [id],
+        |r| {
+            Ok(json!({
+                "effective_from":        r.get::<_, Option<String>>(0)?,
+                "label":                 r.get::<_, Option<String>>(1)?,
+                "baggage_rate":          r.get::<_, Option<f64>>(2)?,
+                "liquor_duty_rate":      r.get::<_, Option<f64>>(3)?,
+                "aidc_liquor_rate":      r.get::<_, Option<f64>>(4)?,
+                "gold_bcd_rate":         r.get::<_, Option<f64>>(5)?,
+                "aidc_gold_rate":        r.get::<_, Option<f64>>(6)?,
+                "gold_cons_bcd_rate":    r.get::<_, Option<f64>>(7)?,
+                "aidc_gold_cons_rate":   r.get::<_, Option<f64>>(8)?,
+                "silver_bcd_rate":       r.get::<_, Option<f64>>(9)?,
+                "aidc_silver_rate":      r.get::<_, Option<f64>>(10)?,
+                "silver_cons_rate":      r.get::<_, Option<f64>>(11)?,
+                "aidc_silver_cons_rate": r.get::<_, Option<f64>>(12)?,
+                "frozen_at":             chrono::Local::now().to_rfc3339(),
+            }))
+        },
+    ).ok()
 }
 
 pub async fn create_session(
@@ -271,9 +325,13 @@ pub async fn create_session(
     ).optional().map_err(|e| e500(&e.to_string()))?;
 
     conn.execute(
-        "INSERT INTO dcr_sessions (report_date, shift, batch_name, tariff_id, created_by)
-         VALUES (?, ?, ?, ?, ?)",
-        rusqlite::params![report_date, shift, batch_name, tariff_id, created_by],
+        "INSERT INTO dcr_sessions (report_date, shift, batch_name, tariff_id, created_by, tariff_snapshot)
+         VALUES (?, ?, ?, ?, ?,?)",
+        rusqlite::params![
+            report_date, shift, batch_name, tariff_id, created_by,
+            // Frozen at creation: the rates in force for this shift.
+            tariff_id.and_then(|t| tariff_json(&conn, t)).map(|v| v.to_string()),
+        ],
     ).map_err(|e| e500(&e.to_string()))?;
 
     let new_id = conn.last_insert_rowid();

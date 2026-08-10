@@ -72,6 +72,9 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         // Cess on cigarettes — a duty component that was missing entirely,
         // so existing databases need the column before it can be recorded.
         ("dcr_entries",  "cess_on_cig",    "REAL NOT NULL DEFAULT 0"),
+        // Rates as applied, so a session stays explainable if the
+        // tariff row is later edited or lost.
+        ("dcr_sessions", "tariff_snapshot", "TEXT"),
     ];
     for (table, col, col_type) in &col_migrations {
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type);
