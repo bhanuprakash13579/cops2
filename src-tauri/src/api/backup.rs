@@ -2110,3 +2110,132 @@ pub async fn archive_save_to(
         ),
     })))
 }
+
+// ── Custom report over the BR / DR registers ─────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct BrDrReportRequest {
+    /// "br" or "dr".
+    register: String,
+    #[serde(default)] master_cols: Vec<String>,
+    #[serde(default)] item_cols: Vec<String>,
+    from_date: Option<String>,
+    to_date: Option<String>,
+    #[serde(default)] limit: Option<i64>,
+}
+
+/// Columns a table really has. Used as the allow-list, so a request can only
+/// ever name a real column — and so the list cannot go stale the way a hardcoded
+/// one does the moment somebody adds a field.
+fn real_columns(conn: &rusqlite::Connection, table: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) {
+            for c in rows.flatten() { out.insert(c); }
+        }
+    }
+    out
+}
+
+/// Build a report over the baggage or detention register.
+///
+/// The OS custom report already existed; this is its counterpart for BR and DR,
+/// which officers need for the same reason — answering a question the fixed
+/// reports do not, without exporting the whole register.
+///
+/// Column names are checked against the table's ACTUAL columns before being put
+/// into SQL. Everything else is bound. That matters more here than usual: column
+/// names cannot be parameterised, so they are the one part of the query built
+/// from user input, and the allow-list is what stands between a report and an
+/// arbitrary read.
+pub async fn custom_report_brdr(
+    State(pool): Db,
+    _auth: AuthUser,
+    Json(body): Json<BrDrReportRequest>,
+) -> Result<Json<Value>, Err> {
+    let (master, items, no_col, year_col, date_col) = match body.register.to_lowercase().as_str() {
+        "br" => ("br_master", "br_items", "br_no", "br_year", "br_date"),
+        "dr" => ("dr_master", "dr_items", "dr_no", "dr_year", "dr_date"),
+        _ => return Err(e400("register must be 'br' or 'dr'")),
+    };
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let master_real = real_columns(&conn, master);
+    let items_real = real_columns(&conn, items);
+
+    let bad: Vec<&String> = body.master_cols.iter().filter(|c| !master_real.contains(*c))
+        .chain(body.item_cols.iter().filter(|c| !items_real.contains(*c)))
+        .collect();
+    if !bad.is_empty() {
+        return Err(e400(&format!("Unknown column(s): {}",
+            bad.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))));
+    }
+    if body.master_cols.is_empty() && body.item_cols.is_empty() {
+        return Err(e400("Choose at least one column."));
+    }
+
+    // Always include the register number and year, so a row can be traced back
+    // to the receipt it came from. A report nobody can reconcile is not a report.
+    let mut cols: Vec<String> = vec![
+        format!("m.\"{no_col}\" AS {no_col}"),
+        format!("m.\"{year_col}\" AS {year_col}"),
+    ];
+    for c in &body.master_cols {
+        if c != no_col && c != year_col { cols.push(format!("m.\"{c}\" AS \"{c}\"")); }
+    }
+    let include_items = !body.item_cols.is_empty();
+    for c in &body.item_cols {
+        cols.push(format!("i.\"{c}\" AS \"item_{c}\""));
+    }
+
+    let mut where_sql = vec!["(m.entry_deleted IS NULL OR m.entry_deleted != 'Y')".to_string()];
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(f) = body.from_date.as_ref().filter(|s| !s.trim().is_empty()) {
+        where_sql.push(format!("m.\"{date_col}\" >= ?")); binds.push(f.trim().to_string());
+    }
+    if let Some(t) = body.to_date.as_ref().filter(|s| !s.trim().is_empty()) {
+        where_sql.push(format!("m.\"{date_col}\" <= ?")); binds.push(t.trim().to_string());
+    }
+
+    // Bounded by default. An unbounded report over 357,705 item rows is a
+    // request nobody meant to make, and it arrives as a frozen window.
+    let limit = body.limit.unwrap_or(5000).clamp(1, 50_000);
+
+    let join = if include_items {
+        format!("LEFT JOIN \"{items}\" i ON i.\"{no_col}\" = m.\"{no_col}\" AND i.\"{year_col}\" = m.\"{year_col}\"")
+    } else {
+        String::new()
+    };
+    let sql = format!(
+        "SELECT {} FROM \"{master}\" m {join} WHERE {} ORDER BY m.\"{year_col}\" DESC, m.\"{no_col}\" DESC LIMIT {limit}",
+        cols.join(", "), where_sql.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e500(&e.to_string()))?;
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let rows: Vec<Value> = stmt
+        .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+            let mut o = serde_json::Map::new();
+            for (i, n) in names.iter().enumerate() {
+                o.insert(n.clone(), match r.get_ref(i) {
+                    Ok(rusqlite::types::ValueRef::Null) => Value::Null,
+                    Ok(rusqlite::types::ValueRef::Integer(v)) => json!(v),
+                    Ok(rusqlite::types::ValueRef::Real(v)) => json!(v),
+                    Ok(rusqlite::types::ValueRef::Text(t)) => json!(String::from_utf8_lossy(t)),
+                    _ => Value::Null,
+                });
+            }
+            Ok(Value::Object(o))
+        })
+        .map_err(|e| e500(&e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(json!({
+        "register": body.register.to_lowercase(),
+        "columns":  names,
+        "rows":     rows,
+        "count":    rows.len(),
+        "truncated": rows.len() as i64 >= limit,
+    })))
+}

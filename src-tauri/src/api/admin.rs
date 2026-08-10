@@ -268,6 +268,78 @@ pub async fn get_pit_config(
 
 // ── Allowed devices ───────────────────────────────────────────────────────────
 
+/// What this machine looks like to the allow-list, and whether it is on it.
+///
+/// Identified by HOSTNAME, deliberately, not by the value config::mac_address()
+/// returns. That is not a real MAC — it hashes the hostname together with the
+/// process id, so it changes every time the application restarts. Registering a
+/// device against it would work once and never match again. The hostname is
+/// stable, is what an administrator recognises on a network, and is what the
+/// allowed_devices table already stores.
+pub async fn device_info(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
+    let host = crate::config::hostname();
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let registered: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM allowed_devices
+             WHERE is_active = 1 AND LOWER(hostname) = LOWER(?1)",
+            [&host],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(Json(json!({
+        "hostname":   host,
+        "registered": registered > 0,
+        // Named for what it is. It identifies a RUN, not a machine.
+        "note": "Devices are matched on hostname. COPS2 does not read the network \
+                 adapter address.",
+    })))
+}
+
+/// Add THIS machine to the allow-list.
+///
+/// Idempotent: registering twice reactivates the existing row rather than adding
+/// a second one, because the obvious way to use this button is to press it again
+/// when unsure whether it worked.
+pub async fn register_device(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
+    let host = crate::config::hostname();
+    if host.trim().is_empty() {
+        return Err(e500("This machine has no hostname, so it cannot be registered."));
+    }
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM allowed_devices WHERE LOWER(hostname) = LOWER(?1)",
+            [&host],
+            |r| r.get(0),
+        )
+        .ok();
+
+    match existing {
+        Some(id) => {
+            conn.execute("UPDATE allowed_devices SET is_active = 1 WHERE id = ?1", [id])
+                .map_err(|e| e500(&e.to_string()))?;
+            Ok(Json(json!({
+                "message": format!("{host} was already registered; it is active again."),
+                "hostname": host, "id": id, "created": false,
+            })))
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO allowed_devices (label, hostname, is_active, added_by, added_on, notes)
+                 VALUES (?1, ?2, 1, 'system_admin', date('now'), 'Registered from this machine')",
+                rusqlite::params![&host, &host],
+            )
+            .map_err(|e| e500(&e.to_string()))?;
+            Ok(Json(json!({
+                "message": format!("{host} registered."),
+                "hostname": host, "id": conn.last_insert_rowid(), "created": true,
+            })))
+        }
+    }
+}
+
 pub async fn list_devices(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(

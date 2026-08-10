@@ -45,7 +45,7 @@ fn uuid_mac() -> u64 {
     h.finish()
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     std::env::var("COMPUTERNAME")                  // Windows
         .or_else(|_| std::env::var("HOSTNAME"))    // Linux/macOS env
         .unwrap_or_else(|_| {

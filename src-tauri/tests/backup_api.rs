@@ -1063,3 +1063,88 @@ async fn a_month_of_sessions_comes_back_in_one_request() {
         .bearer_auth(officer_token()).send().await.unwrap();
     assert_eq!(bad.status(), 400, "month 13 must be refused");
 }
+
+// ── Device registration ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn this_machine_can_register_itself_and_doing_it_twice_is_harmless() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    let before: serde_json::Value = c.get(format!("{base}/admin/device-info"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    assert!(before["hostname"].as_str().map(|h| !h.is_empty()).unwrap_or(false),
+            "a machine must report a hostname: {before}");
+    assert_eq!(before["registered"], false);
+
+    let first: serde_json::Value = c.post(format!("{base}/admin/register-device"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(first["created"], true, "{first}");
+
+    // Pressing it again when unsure whether it worked must not create a second
+    // row — that is the obvious way to use the button.
+    let again: serde_json::Value = c.post(format!("{base}/admin/register-device"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(again["created"], false, "a second press must not duplicate: {again}");
+    assert_eq!(again["id"], first["id"]);
+
+    let after: serde_json::Value = c.get(format!("{base}/admin/device-info"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["registered"], true);
+
+    let devices: serde_json::Value = c.get(format!("{base}/admin/devices"))
+        .bearer_auth(admin_token()).send().await.unwrap().json().await.unwrap();
+    let n = devices.as_array().map(|a| a.len())
+        .or_else(|| devices["items"].as_array().map(|a| a.len())).unwrap_or(0);
+    assert_eq!(n, 1, "exactly one device row: {devices}");
+
+    // An ordinary officer must not be able to add machines to the allow-list.
+    let officer = c.post(format!("{base}/admin/register-device"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert!(officer.status() == 401 || officer.status() == 403);
+}
+
+// ── BR / DR custom report ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_brdr_report_returns_rows_and_refuses_columns_that_do_not_exist() {
+    let (base, _d, pool) = serve_with_pool(5).await;
+    pool.get().unwrap().execute(
+        "INSERT INTO br_master(br_no, br_year, br_date, br_type, pax_name, entry_deleted)
+         VALUES (101, 2026, '2026-05-04', 'DUTY', 'BR PASSENGER', 'N')", []).unwrap();
+
+    let c = reqwest::Client::new();
+    let r: serde_json::Value = c.post(format!("{base}/backup/custom-report-brdr"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "register": "br", "master_cols": ["pax_name", "br_date"],
+            "from_date": "2026-01-01", "to_date": "2026-12-31"
+        }))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["count"], 1, "{r}");
+    assert_eq!(r["rows"][0]["pax_name"], "BR PASSENGER");
+    // The receipt number is always included, so a row can be traced back.
+    assert_eq!(r["rows"][0]["br_no"], 101, "every row must be traceable: {r}");
+
+    // Column names cannot be parameterised, so they are the one part of the
+    // query built from input. Anything not a real column must be refused.
+    for bad in ["pax_name; DROP TABLE br_master", "sqlite_master", "nonexistent_col"] {
+        let resp = c.post(format!("{base}/backup/custom-report-brdr"))
+            .bearer_auth(officer_token())
+            .json(&serde_json::json!({ "register": "br", "master_cols": [bad] }))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 400, "must refuse {bad:?}");
+    }
+
+    // And the register itself is a fixed choice.
+    let wrong = c.post(format!("{base}/backup/custom-report-brdr"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "register": "cops_master", "master_cols": ["pax_name"] }))
+        .send().await.unwrap();
+    assert_eq!(wrong.status(), 400, "only br or dr");
+
+    // The table survived every attempt above.
+    let still: i64 = pool.get().unwrap()
+        .query_row("SELECT COUNT(*) FROM br_master", [], |r| r.get(0)).unwrap();
+    assert_eq!(still, 1, "br_master must be intact");
+}

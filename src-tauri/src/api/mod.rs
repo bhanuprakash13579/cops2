@@ -152,6 +152,8 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/admin/config/os",                  get(admin::get_os_config))
         .route("/admin/config/remarks-templates",       get(admin::get_remarks_templates))
         .route("/admin/config/remarks-templates/:key", put(admin::upsert_remarks_template))
+        .route("/admin/device-info",                get(admin::device_info))
+        .route("/admin/register-device",            post(admin::register_device))
         .route("/admin/devices",                    get(admin::list_devices).post(admin::create_device))
         .route("/admin/devices/:id",               put(admin::update_device).delete(admin::delete_device))
         .route("/admin/purge-os",                   post(admin::purge_os))
@@ -162,6 +164,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/backup/upload/new",                post(backup::upload_new))
         .route("/backup/upload/legacy",             post(backup::upload_legacy))
         .route("/backup/custom-report",             post(backup::custom_report))
+        .route("/backup/custom-report-brdr",        post(backup::custom_report_brdr))
         .route("/backup/adjudication-summary-pdf",  post(backup::adjudication_summary_pdf))
 
         // ── Automatic backups ────────────────────────────────────────────────
