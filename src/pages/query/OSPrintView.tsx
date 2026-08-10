@@ -184,7 +184,7 @@ export default function OSPrintView() {
   useEffect(() => {
     if (data && os_no && os_year) {
       const req = api
-        .get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer' })
+        .get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer', timeout: 0 })
         .then((r) => r.data);
       req.catch(() => { pdfPromiseRef.current = null; });
       pdfPromiseRef.current = req;
@@ -296,7 +296,7 @@ export default function OSPrintView() {
   const handlePrint = async () => {
     // Use the pre-generated PDF (started when page loaded); fall back to a fresh request
     const pdfReady = pdfPromiseRef.current
-      ?? api.get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer' }).then((r) => r.data);
+      ?? api.get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer', timeout: 0 }).then((r) => r.data);
 
     try {
       const { save } = await import('@tauri-apps/plugin-dialog');
@@ -322,7 +322,7 @@ export default function OSPrintView() {
       // promise always throws immediately without retrying the network call.
       try {
         const pdfData = await api
-          .get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer' })
+          .get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer', timeout: 0 })
           .then((r) => r.data);
         const blob = new Blob([pdfData], { type: 'application/pdf' });
         const url = URL.createObjectURL(blob);

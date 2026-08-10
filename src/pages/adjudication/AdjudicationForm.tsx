@@ -597,7 +597,7 @@ export default function AdjudicationForm() {
   const handlePrint = async () => {
     setSubmitting(true);
     try {
-      const pdfData = await api.get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer' }).then((r) => r.data);
+      const pdfData = await api.get(`/os/${os_no}/${os_year}/print-pdf`, { responseType: 'arraybuffer', timeout: 0 }).then((r) => r.data);
       
       try {
         const { save } = await import('@tauri-apps/plugin-dialog');

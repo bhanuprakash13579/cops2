@@ -68,6 +68,9 @@ export default function AdjudicationList() {
 
     try {
       const res = await api.get(`/os/${os_no}/${os_year}/print-pdf`, {
+        // No timeout. PDF rendering on a loaded machine can exceed the
+        // client's 30s default, and the officer just sees it fail.
+        timeout: 0,
         responseType: 'arraybuffer',
         onDownloadProgress: (evt) => {
           if (evt.total && evt.total > 0) {
