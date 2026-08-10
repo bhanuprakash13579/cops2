@@ -4,7 +4,7 @@ import {
   ArrowLeft, ShieldCheck, ShieldAlert, Lock, LogIn,
   UserPlus, Users, Pencil, X, KeyRound, Download,
   Upload, FileUp, Eye, EyeOff, RefreshCw, Database, ToggleLeft, ToggleRight, ScanLine,
-  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2
+  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle
 } from 'lucide-react';
 import api from '@/lib/api';
 import { showDownloadToast } from '@/components/DownloadToast';
@@ -86,6 +86,73 @@ export default function RestoreBackup() {
 
   // Admin session (memory only — never persisted)
   const [adminToken, setAdminToken] = useState('');
+
+  // ── Trial / licence ────────────────────────────────────────────────────────
+  // Mirrors the Python app: the administrator owns the expiry date outright —
+  // set the length, restart the window, or disable it to make the installation
+  // permanent. Nothing here is automatic.
+  interface TrialInfo { trial_disabled: boolean; days_remaining: number | null; trial_days: number; expired: boolean }
+  const [trialStatus, setTrialStatus]   = useState<TrialInfo | null>(null);
+  const [trialDaysInput, setTrialDaysInput] = useState('30');
+  const [trialLoading, setTrialLoading] = useState(false);
+  const [trialMsg, setTrialMsg]         = useState('');
+
+  const reloadTrial = async () => {
+    const r = await api.get('/trial-status');
+    const td = r.data.trial_days ?? 30;
+    setTrialStatus({
+      trial_disabled: !!r.data.trial_disabled,
+      days_remaining: r.data.days_remaining ?? null,
+      trial_days: td,
+      expired: !!r.data.expired,
+    });
+    setTrialDaysInput(String(td));
+    return r.data;
+  };
+
+  const handleTrialReset = async () => {
+    setTrialLoading(true); setTrialMsg('');
+    try {
+      const res = await api.post('/admin/trial/reset', {}, { headers: adminHeaders(adminToken) });
+      await reloadTrial();
+      setTrialMsg(`Trial reset - ${res.data?.trial_days ?? 30}-day window starts today.`);
+    } catch (err: any) {
+      setTrialMsg(err.response?.data?.detail || 'Failed to reset trial.');
+    } finally { setTrialLoading(false); }
+  };
+
+  const handleTrialDisable = async () => {
+    setTrialLoading(true); setTrialMsg('');
+    try {
+      await api.post('/admin/trial/disable', {}, { headers: adminHeaders(adminToken) });
+      setTrialStatus(prev => ({
+        trial_disabled: true,
+        days_remaining: null,
+        trial_days: prev?.trial_days ?? 30,
+        expired: false,
+      }));
+      setTrialMsg('Trial disabled - installation is now permanent.');
+    } catch (err: any) {
+      setTrialMsg(err.response?.data?.detail || 'Failed to disable trial.');
+    } finally { setTrialLoading(false); }
+  };
+
+  const handleTrialDaysSave = async () => {
+    const days = parseInt(trialDaysInput, 10);
+    if (isNaN(days) || days < 1 || days > 3650) {
+      setTrialMsg('Enter a number of days between 1 and 3650.');
+      return;
+    }
+    setTrialLoading(true); setTrialMsg('');
+    try {
+      await api.post('/admin/trial/set-days', { trial_days: days }, { headers: adminHeaders(adminToken) });
+      await reloadTrial();
+      setTrialMsg(`Trial set to ${days} day${days === 1 ? '' : 's'}.`);
+    } catch (err: any) {
+      setTrialMsg(err.response?.data?.detail || 'Failed to update trial duration.');
+    } finally { setTrialLoading(false); }
+  };
+
   const [loginUser, setLoginUser] = useState('');
   const [loginPwd, setLoginPwd] = useState('');
   const [showLoginPwd, setShowLoginPwd] = useState(false);
@@ -192,6 +259,7 @@ export default function RestoreBackup() {
   // ── Load on login ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!adminToken) return;
+    reloadTrial().catch(() => setTrialStatus(null));
     loadUsers();
     api.get('/admin/features', { headers: adminHeaders(adminToken) })
       .then(r => setApisEnabled(r.data.apis_enabled === true || r.data.apis_enabled === 'true')).catch(() => {});
@@ -1578,6 +1646,88 @@ export default function RestoreBackup() {
                   </div>
                 )}
               </div>
+            )}
+          </section>
+
+          {/* ── Trial / Licence ─────────────────────────────────────────────
+              The administrator sets the expiry outright: choose a length,
+              restart the window, or disable it so the installation never
+              expires. Same three controls as the Python app. */}
+          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-4">
+            <div className="flex items-center gap-2">
+              <Clock size={18} className="text-blue-600" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-700">Trial / Licence</h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Set how long this installation runs before it expires, restart the
+                  window, or make it permanent. Only an administrator can change this.
+                </p>
+              </div>
+            </div>
+
+            {trialStatus ? (
+              trialStatus.trial_disabled ? (
+                <div className="flex items-center gap-2 px-4 py-3 bg-green-50 border border-green-200 rounded-lg">
+                  <CheckCircle size={16} className="text-green-600 shrink-0" />
+                  <p className="text-sm font-medium text-green-800">
+                    Permanent installation — this copy does not expire.
+                  </p>
+                </div>
+              ) : (
+                <div className={`flex items-center gap-3 px-4 py-3 rounded-lg border ${
+                  trialStatus.expired ? 'bg-red-50 border-red-300' :
+                  (trialStatus.days_remaining ?? trialStatus.trial_days) <= 7 ? 'bg-orange-50 border-orange-300' :
+                  'bg-blue-50 border-blue-200'
+                }`}>
+                  <Clock size={16} className={trialStatus.expired ? 'text-red-600' : 'text-blue-600'} />
+                  <p className={`text-sm font-semibold ${trialStatus.expired ? 'text-red-800' : 'text-blue-800'}`}>
+                    {trialStatus.expired
+                      ? `Expired — the ${trialStatus.trial_days}-day window has ended`
+                      : `${trialStatus.days_remaining} of ${trialStatus.trial_days} day${trialStatus.trial_days === 1 ? '' : 's'} remaining`}
+                  </p>
+                </div>
+              )
+            ) : (
+              <p className="text-xs text-slate-400 italic">Loading licence status…</p>
+            )}
+
+            <div className="border border-slate-200 rounded-lg p-3 bg-slate-50/50 space-y-2">
+              <label className="block text-[11px] font-semibold text-slate-600">
+                Duration in days
+                <span className="ml-1 font-normal text-slate-400">— between 1 and 3650</span>
+              </label>
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  type="number" min={1} max={3650}
+                  value={trialDaysInput}
+                  onChange={e => setTrialDaysInput(e.target.value)}
+                  className="w-24 border border-slate-200 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-400"
+                />
+                <button type="button" disabled={trialLoading} onClick={handleTrialDaysSave}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-60 font-semibold">
+                  Save duration
+                </button>
+                <span className="text-[10.5px] text-slate-500">
+                  Applies to the current window; use Reset to start it from today.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex gap-3 flex-wrap">
+              <button type="button" disabled={trialLoading} onClick={handleTrialReset}
+                className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 font-semibold">
+                <RefreshCw size={13} /> Reset — restart the {trialStatus?.trial_days ?? 30}-day window today
+              </button>
+              <button type="button" disabled={trialLoading || !!trialStatus?.trial_disabled}
+                onClick={handleTrialDisable}
+                className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-green-700 text-white hover:bg-green-800 disabled:opacity-60 font-semibold">
+                <CheckCircle size={13} /> Make permanent
+              </button>
+            </div>
+            {trialMsg && (
+              <p className={`text-xs font-medium ${trialMsg.startsWith('Failed') || trialMsg.startsWith('Enter') ? 'text-red-600' : 'text-emerald-700'}`}>
+                {trialMsg}
+              </p>
             )}
           </section>
         </div>

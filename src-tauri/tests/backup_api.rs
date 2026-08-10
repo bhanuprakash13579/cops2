@@ -1332,3 +1332,145 @@ async fn the_printed_os_carries_the_customs_emblem() {
             "the printed OS has no embedded image — the emblem is missing");
     assert_eq!(count_pdf_pages(&bytes), 2, "still exactly two pages with the emblem");
 }
+
+// ── Licensing ────────────────────────────────────────────────────────────────
+//
+// The codes live only as bcrypt hashes in the binary, so these tests cannot
+// contain them either — they would end up in the repository, which is the one
+// place the whole design says they must never be. Instead they exercise every
+// path that does NOT need a real code, plus the reuse record itself.
+
+async fn status(base: &str) -> serde_json::Value {
+    reqwest::get(format!("{base}/trial-status")).await.unwrap()
+        .json().await.unwrap()
+}
+
+async fn try_code(base: &str, code: &str) -> (u16, serde_json::Value) {
+    let r = reqwest::Client::new()
+        .post(format!("{base}/license/activate"))
+        .json(&serde_json::json!({ "code": code }))
+        .send().await.unwrap();
+    let st = r.status().as_u16();
+    (st, r.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn a_fresh_install_starts_its_trial_on_first_look() {
+    let (base, _d) = serve().await;
+    let s = status(&base).await;
+    assert_eq!(s["trial_disabled"], false);
+    assert_eq!(s["expired"], false);
+    assert_eq!(s["trial_days"], 30, "a fresh install gets the default 30 days");
+    assert_eq!(s["days_remaining"], 30, "the clock starts on first look, not at build time");
+    assert!(s["trial_start_date"].is_string());
+}
+
+#[tokio::test]
+async fn the_trial_endpoint_needs_no_login() {
+    // An expired installation cannot log in. If this required a session, the
+    // code entry would be locked behind the very thing the code unlocks.
+    let (base, _d) = serve().await;
+    let r = reqwest::get(format!("{base}/trial-status")).await.unwrap();
+    assert_eq!(r.status(), 200, "trial status must be readable anonymously");
+
+    let r = reqwest::Client::new()
+        .post(format!("{base}/license/activate"))
+        .json(&serde_json::json!({ "code": "XXXX-XXXX-XXXX-XXXX-XXXX" }))
+        .send().await.unwrap();
+    assert_ne!(r.status(), 401, "activation must be reachable without a session");
+}
+
+#[tokio::test]
+async fn a_wrong_code_is_refused_and_changes_nothing() {
+    let (base, _d) = serve().await;
+    let before = status(&base).await;
+
+    for bad in ["", "short", "XXXX-XXXX-XXXX-XXXX-XXXX", "0000000000000000000000000"] {
+        let (st, body) = try_code(&base, bad).await;
+        assert_eq!(st, 400, "'{bad}' should be refused, got {body}");
+    }
+
+    let after = status(&base).await;
+    assert_eq!(before["days_remaining"], after["days_remaining"],
+               "a refused code must not move the trial window");
+    assert_eq!(after["trial_disabled"], false, "a refused code must not license the install");
+}
+
+#[tokio::test]
+async fn the_administrator_keeps_full_control_of_the_trial() {
+    // Same three controls the Python app gives, so the office does not have to
+    // learn anything new.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.post(format!("{base}/admin/trial/set-days"))
+        .bearer_auth(&t).json(&serde_json::json!({ "trial_days": 120 }))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(status(&base).await["trial_days"], 120);
+
+    let r = c.post(format!("{base}/admin/trial/disable")).bearer_auth(&t)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let s = status(&base).await;
+    assert_eq!(s["trial_disabled"], true, "disabling makes the install permanent");
+    assert_eq!(s["expired"], false, "a disabled trial never expires");
+
+    let r = c.post(format!("{base}/admin/trial/reset")).bearer_auth(&t)
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let s = status(&base).await;
+    assert_eq!(s["trial_disabled"], false, "reset re-opens the window");
+    assert_eq!(s["days_remaining"], 120, "reset keeps the configured length");
+}
+
+#[tokio::test]
+async fn trial_controls_are_refused_to_everyone_but_the_administrator() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    for (path, tok) in [("disable", officer_token()), ("reset", officer_token())] {
+        let r = c.post(format!("{base}/admin/trial/{path}")).bearer_auth(&tok)
+            .send().await.unwrap();
+        assert!(r.status() == 401 || r.status() == 403,
+                "an officer must not be able to {path} the trial, got {}", r.status());
+    }
+    let r = c.post(format!("{base}/admin/trial/disable")).send().await.unwrap();
+    assert!(r.status() == 401 || r.status() == 403, "nor an anonymous caller");
+}
+
+#[tokio::test]
+async fn a_used_code_is_recorded_so_it_cannot_be_used_twice() {
+    // The reuse guard is the row in this table; activation writes it and refuses
+    // when it is already there. Insert one directly to prove the constraint the
+    // guard depends on actually holds.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    let _ = base;
+    let conn = pool.get().unwrap();
+    conn.execute(
+        "INSERT INTO license_codes_used (code_fingerprint, kind, used_at) VALUES (?,?,?)",
+        rusqlite::params!["deadbeef", "temporary", "2026-08-11T00:00:00Z"],
+    ).unwrap();
+    let second = conn.execute(
+        "INSERT INTO license_codes_used (code_fingerprint, kind, used_at) VALUES (?,?,?)",
+        rusqlite::params!["deadbeef", "temporary", "2026-08-11T00:00:01Z"],
+    );
+    assert!(second.is_err(), "the same code fingerprint must not be storable twice");
+}
+
+#[tokio::test]
+async fn the_codes_are_not_recoverable_from_the_binary() {
+    // The point of the whole design: the source carries bcrypt hashes, never the
+    // codes. If a plaintext code is ever pasted into the source this fails.
+    let src = std::fs::read_to_string("src/api/license.rs").unwrap();
+    let hashes = src.matches("\"$2b$12$").count();   // quoted literals only
+    assert_eq!(hashes, 5, "expected exactly five hashed codes, found {hashes}");
+
+    // A code is 5 groups of 4 from the Crockford alphabet. Nothing of that shape
+    // may appear in the file — the hashes themselves are base64 and contain the
+    // excluded letters, so they cannot match.
+    let re_like = regex::Regex::new(r"\b[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){4}\b").unwrap();
+    if let Some(m) = re_like.find(&src) {
+        panic!("something shaped like a plaintext activation code is in the source: {}", m.as_str());
+    }
+}

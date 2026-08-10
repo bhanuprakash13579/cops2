@@ -872,3 +872,12 @@ CREATE TRIGGER IF NOT EXISTS trg_rev_dcr_entries AFTER UPDATE ON dcr_entries
 BEGIN
     UPDATE data_revision SET n = n + 1 WHERE id = 1;
 END;
+
+-- ── Licence activation codes that have been used ─────────────────────────────
+-- Stores a SHA-256 fingerprint, never the code. A code is valid once per
+-- installation; this table is what makes the second attempt fail.
+CREATE TABLE IF NOT EXISTS license_codes_used (
+    code_fingerprint TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    used_at          TEXT NOT NULL
+);
