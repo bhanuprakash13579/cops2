@@ -1737,6 +1737,16 @@ pub async fn auto_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>
     // officers keep booking cases, and it is discovered on the day of a restore.
     // So staleness is reported as its own state rather than left for the reader
     // to work out from a timestamp.
+    let p2 = pool.clone();
+    let composition: Vec<Value> = tokio::task::spawn_blocking(move || {
+        crate::backup_service::last_backup_composition(&p2)
+            .into_iter()
+            .map(|(t, n)| serde_json::json!({ "table": t, "rows": n }))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+
     let last = get_setting(&pool, "backup_last_success");
     let hours_since = last
         .as_deref()
@@ -1759,6 +1769,10 @@ pub async fn auto_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>
         "hours_since_success": hours_since,
         "healthy":          healthy,
         "refusing":         get_setting(&pool, "backup_shrink_blocked"),
+        // What the last backup is made of, so the office can see whether any one
+        // table is starting to dominate and decide to leave it out.
+        "composition":      composition,
+        "excluded_tables":  get_setting(&pool, "backup_exclude_tables"),
     })))
 }
 

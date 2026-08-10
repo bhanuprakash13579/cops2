@@ -40,6 +40,8 @@ interface AutoBackupStatus {
   hours_since_success: number | null;
   healthy: boolean;
   refusing: string | null;
+  composition: { table: string; rows: number }[];
+  excluded_tables: string | null;
 }
 
 interface DeviceInfo {
@@ -1303,6 +1305,33 @@ export default function RestoreBackup() {
                 Check that the folders above are reachable — a backup that stops
                 working quietly is only discovered on the day it is needed.
               </p>
+            )}
+
+            {autoStatus && autoStatus.composition?.length > 0 && (
+              <details className="text-xs">
+                <summary className="cursor-pointer text-slate-600 hover:text-slate-800">
+                  What is in the backup
+                </summary>
+                <ul className="mt-1.5 space-y-0.5 pl-3">
+                  {autoStatus.composition.map(c => (
+                    <li key={c.table} className="flex justify-between max-w-sm text-slate-600">
+                      <span className="font-mono">{c.table}</span>
+                      <span className="tabular-nums">{c.rows.toLocaleString()} rows</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1.5 text-slate-500 max-w-lg">
+                  Shown so you can see whether any one table is starting to dominate.
+                  If it is, that table can be left out of the backup — but only
+                  where a copy exists elsewhere, as the duty reports do once
+                  they are emailed. Case records are never left out.
+                </p>
+                {autoStatus.excluded_tables && (
+                  <p className="mt-1 text-amber-700">
+                    Currently excluded: <span className="font-mono">{autoStatus.excluded_tables}</span>
+                  </p>
+                )}
+              </details>
             )}
 
             {autoStatus?.refusing && (

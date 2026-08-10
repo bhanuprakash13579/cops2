@@ -312,6 +312,24 @@ fn newest_usable_backup(pool: &DbPool) -> Option<PathBuf> {
     None
 }
 
+/// What the last backup is actually made of — the biggest tables, by row count.
+///
+/// Exists so the decision "is this table worth backing up?" can be re-made from
+/// evidence later, instead of from an estimate made once. Revenue data was
+/// judged small enough to keep (about 1.2 MB a year at 60 BRs a day); if that
+/// ever stops being true, this is where it becomes visible, without anyone
+/// having to open an archive to find out.
+///
+/// Read from the manifest, so it costs kilobytes rather than unpacking 177 MB.
+pub fn last_backup_composition(pool: &DbPool) -> Vec<(String, i64)> {
+    let Some(latest) = newest_usable_backup(pool) else { return Vec::new() };
+    let Ok(mut counts) = crate::backup_export::read_counts(&latest) else { return Vec::new() };
+    counts.retain(|(_, n)| *n > 0);
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.truncate(8);
+    counts
+}
+
 /// Rule 9 — is the live database plausibly intact, compared with the newest
 /// backup? Cheap size comparison first, row counts only when that looks wrong.
 fn check_shrink(
