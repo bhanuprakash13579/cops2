@@ -139,6 +139,43 @@ fn is_internal(name: &str) -> bool {
     name.starts_with("sqlite_")
 }
 
+/// Turn foreign-key enforcement back on, and PROVE it took.
+///
+/// Two ways this silently fails, and the connection then goes back to the pool
+/// with enforcement off — every later case write skipping its integrity checks
+/// with nothing to say so:
+///
+///   * SQLite ignores this pragma inside a transaction and still reports
+///     success, so checking the Result is not enough; the value has to be read
+///     back.
+///   * A rollback that did not complete leaves a transaction open, which is
+///     exactly the situation where this runs.
+///
+/// Failing loudly is the point. There is nothing sensible to do about it here,
+/// but a database quietly accepting rows it should refuse is worth a line in
+/// the log that names the cause.
+fn restore_foreign_keys(conn: &rusqlite::Connection, context: &str) {
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+    let on: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap_or(-1);
+    if on != 1 {
+        // One more attempt after closing anything still open.
+        let _ = conn.execute_batch("ROLLBACK");
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        let again: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap_or(-1);
+        if again != 1 {
+            tracing::error!(
+                "foreign key enforcement could NOT be restored after {context} \
+                 (pragma reads {again}). This connection will not check \
+                 relationships until the application is restarted."
+            );
+        }
+    }
+}
+
 /// Move `from` onto `to`, replacing whatever is there — on Windows as well.
 ///
 /// `fs::rename` silently replaces an existing destination on Unix and FAILS on
@@ -303,7 +340,7 @@ fn build_plain_export(pool: &DbPool, plain_path: &Path) -> Result<Vec<String>> {
     })();
     // This connection goes back to the pool for ordinary case work, where the
     // constraints very much are wanted.
-    let _ = src.execute_batch("PRAGMA foreign_keys = ON");
+    restore_foreign_keys(&src, "the export");
     // DETACH whether or not the copy worked, or the file stays locked and the
     // next run fails for a reason that has nothing to do with the next run.
     let _ = src.execute_batch("ROLLBACK");
@@ -632,7 +669,7 @@ pub fn restore_into(pool: &DbPool, plain_path: &Path) -> Result<RestoreReport> {
         let _ = conn.execute_batch("ROLLBACK");
     }
     let _ = conn.execute_batch("DETACH DATABASE src;");
-    let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+    restore_foreign_keys(&conn, "the restore");
 
     // The restored rows have never been constraint-checked as a set, so check
     // them now — after the transaction, where a failure can be reported rather

@@ -1234,3 +1234,24 @@ async fn the_office_csv_backup_restores_completely_into_cops2() {
     assert!(got[2].1 >= 300_000, "expected the baggage register, got {}", got[2].1);
     assert!(got[4].1 >= 14_000, "expected the detention register, got {}", got[4].1);
 }
+
+#[tokio::test]
+async fn foreign_key_enforcement_is_restored_after_a_backup_and_a_restore() {
+    // Both paths turn foreign keys OFF to copy rows in arbitrary order. If they
+    // do not come back on, the connection returns to the pool with integrity
+    // checks disabled and every later case write skips them, silently. SQLite
+    // also ignores that pragma inside a transaction while reporting success, so
+    // the value has to be READ BACK rather than assumed.
+    let (base, _d, pool) = serve_with_pool(30).await;
+    let fk_on = |p: &std::sync::Arc<db::DbPool>| -> i64 {
+        p.get().unwrap().query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap_or(-1)
+    };
+    assert_eq!(fk_on(&pool), 1, "enforcement should be on to begin with");
+
+    let archive = take_archive(&base).await;
+    assert_eq!(fk_on(&pool), 1, "enforcement must be back on after a backup");
+
+    let (status, body) = restore(&base, archive, true).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(fk_on(&pool), 1, "enforcement must be back on after a restore");
+}
