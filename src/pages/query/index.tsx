@@ -1,11 +1,12 @@
 import { useState, Component, ReactNode } from 'react';
 import { Routes, Route, useNavigate, Navigate } from 'react-router-dom';
-import { FileSearch, LogOut, Menu, ChevronLeft, Download, FileText, Users, AlertTriangle, BarChart2, Receipt } from 'lucide-react';
+import { FileSearch, LogOut, Menu, ChevronLeft, Download, FileText, Users, AlertTriangle, BarChart2, Receipt, FileSpreadsheet } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import OSQueryPage from './OSQueryPage';
 import OSPrintView from './OSPrintView';
 import ExportData from './ExportData';
 import CustomReport from './CustomReport';
+import CustomReportBRDR from './CustomReportBRDR';
 import AdjudicationSummaryReport from './AdjudicationSummaryReport';
 import MonthlyReportPage from './MonthlyReportPage';
 import BRDRLookupPage from './BRDRLookupPage';
@@ -99,6 +100,15 @@ export default function QueryModule() {
               {!isCollapsed && <span className="font-medium leading-tight">Custom Report</span>}
             </button>
 
+              <button
+                onClick={() => navigate('/query/report-brdr')}
+                className={`mt-2 w-full flex items-center ${isCollapsed ? 'justify-center py-3' : 'gap-3 px-4 py-3'} rounded-lg text-base transition-colors text-emerald-200 bg-slate-900/40 border border-slate-700/60 hover:bg-slate-800/70`}
+                title={isCollapsed ? 'Custom Report (BR/DR)' : undefined}
+              >
+                <FileSpreadsheet className="w-5 h-5 shrink-0 opacity-90" />
+                {!isCollapsed && <span className="font-medium leading-tight">Custom Report (BR/DR)</span>}
+              </button>
+
             <button
               onClick={() => navigate('/query/export')}
               className={`mt-2 w-full flex items-center ${isCollapsed ? 'justify-center py-3' : 'gap-3 px-4 py-3'} rounded-lg text-base transition-colors text-emerald-200 bg-slate-900/40 border border-slate-700/60 hover:bg-slate-800/70`}
@@ -180,6 +190,7 @@ export default function QueryModule() {
               <Route path="os" element={<OSQueryPage />} />
               <Route path="os/print/:os_no/:os_year" element={<OSPrintView />} />
               <Route path="report" element={<CustomReport />} />
+              <Route path="report-brdr" element={<CustomReportBRDR />} />
               <Route path="export" element={<ExportData />} />
               <Route path="adjn-summary" element={<AdjudicationSummaryReport />} />
               <Route path="monthly-report" element={<MonthlyReportPage />} />
