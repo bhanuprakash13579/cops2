@@ -1,7 +1,7 @@
 {
   "name": "cops2",
   "private": true,
-  "version": "3.0.15",
+  "version": "3.0.25",
   "type": "module",
   "scripts": {
     "dev": "vite",
