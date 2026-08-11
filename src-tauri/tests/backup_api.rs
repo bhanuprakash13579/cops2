@@ -1494,3 +1494,81 @@ async fn the_codes_are_not_recoverable_from_the_binary() {
         panic!("something shaped like a plaintext activation code is in the source: {}", m.as_str());
     }
 }
+
+// ── Register search ──────────────────────────────────────────────────────────
+
+async fn br_search(base: &str, term: &str) -> serde_json::Value {
+    reqwest::Client::new()
+        .get(format!("{base}/br?search={term}"))
+        .bearer_auth(officer_token())
+        .send().await.unwrap().json().await.unwrap()
+}
+
+#[tokio::test]
+async fn the_register_search_finds_the_same_records_through_either_path() {
+    // The full-text index answers what it can and the scan answers the rest.
+    // The officer must not be able to tell which ran — a search that is fast but
+    // misses records is worse than the slow one it replaced.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    {
+        let c = pool.get().unwrap();
+        for (i, (no, name, pp)) in [
+            ("101", "RAJADURAI SUBRAMANIAN", "U1724675"),
+            ("102", "SURESH KUMAR",          "M9988776"),
+            ("103", "PRIYA SHARMA",          "Z1234567"),
+        ].iter().enumerate() {
+            c.execute(
+                "INSERT INTO br_master (id, br_no, br_year, br_date, br_type, pax_name,
+                                        passport_no, entry_deleted)
+                 VALUES (?,?,?,?,?,?,?,'N')",
+                rusqlite::params![i as i64 + 1, no, 2026, "2026-08-01", "D", name, pp],
+            ).unwrap();
+        }
+    }
+
+    // Whole word — the index path.
+    let r = br_search(&base, "RAJADURAI").await;
+    assert_eq!(r["total"], 1, "whole-word search should find the record: {r}");
+
+    // Prefix — also the index path, because officers type as they go.
+    let r = br_search(&base, "SURE").await;
+    assert_eq!(r["total"], 1, "a prefix should find the record: {r}");
+
+    // Mid-string — the index CANNOT answer this, and the fallback must.
+    // This is the case that regressed if the fallback were ever removed.
+    let r = br_search(&base, "1724675").await;
+    assert_eq!(r["total"], 1, "a mid-string passport search must still work: {r}");
+
+    // Something absent stays absent through both paths.
+    let r = br_search(&base, "NOBODYHERE").await;
+    assert_eq!(r["total"], 0, "a search for nothing must find nothing: {r}");
+}
+
+#[tokio::test]
+async fn a_record_added_later_is_searchable_immediately() {
+    // The registers are frozen in normal use, but a RESTORE inserts rows. The
+    // triggers exist so the index cannot fall behind the table — an index that
+    // silently misses restored records would be a search that quietly lies.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    {
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO br_master (id, br_no, br_year, br_date, br_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (9, '999', 2026, '2026-08-02', 'D', 'LATECOMER SINGH', 'Q5551234', 'N')",
+            [],
+        ).unwrap();
+    }
+    let r = br_search(&base, "LATECOMER").await;
+    assert_eq!(r["total"], 1, "a row inserted after startup must be searchable: {r}");
+
+    // And an edit must not leave the old text findable.
+    {
+        let c = pool.get().unwrap();
+        c.execute("UPDATE br_master SET pax_name='CORRECTED NAME' WHERE id=9", []).unwrap();
+    }
+    let stale = br_search(&base, "LATECOMER").await;
+    assert_eq!(stale["total"], 0, "the old name must stop matching after an edit: {stale}");
+    let fresh = br_search(&base, "CORRECTED").await;
+    assert_eq!(fresh["total"], 1, "the new name must match after an edit: {fresh}");
+}

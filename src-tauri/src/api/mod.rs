@@ -31,6 +31,53 @@ mod dcr;
 mod config_backup;
 mod license;
 
+/// Row ids matching `term` in a full-text index, or `None` when the index cannot
+/// answer and the caller should fall back to a scan.
+///
+/// A cap is applied deliberately. FTS is a large win on a selective term — a
+/// passport went from 1413 ms to 0.3 ms — but a common surname matches tens of
+/// thousands of rows, and collecting them all to sort measured SLOWER than the
+/// scan, which walks the date index and stops after one page. So a broad match
+/// returns None and takes the path that terminates early. Fast where it is
+/// fast, out of the way where it is not.
+const SEARCH_ID_CAP: usize = 2_000;
+
+pub fn search_ids(conn: &rusqlite::Connection, fts: &str, term: &str) -> Option<Vec<i64>> {
+    let cleaned: String = term
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    // Every word must appear, the last one allowed to be a prefix so typing the
+    // first characters of a name or number finds it before it is finished.
+    let query = words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| if i + 1 == words.len() { format!("{w}*") } else { (*w).to_string() })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT rowid FROM {fts} WHERE {fts} MATCH ?1 LIMIT {}",
+            SEARCH_ID_CAP + 1
+        ))
+        .ok()?;
+    let ids: Vec<i64> = stmt
+        .query_map([&query], |r| r.get(0))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    if ids.len() > SEARCH_ID_CAP {
+        return None;      // too broad — the scan handles this better
+    }
+    Some(ids)
+}
+
+
 use std::sync::Arc;
 use axum::{Router, extract::DefaultBodyLimit, routing::{get, post, put, delete, patch}};
 use crate::db::DbPool;

@@ -28,9 +28,23 @@ pub async fn list_drs(
     let mut query_params: Vec<String> = Vec::new();
 
     if !search.is_empty() {
-        let p = format!("%{}%", search);
-        conditions.push("(dr_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)".to_string());
-        query_params.extend([p.clone(), p.clone(), p]);
+        // Same two-path search as the baggage register: the full-text index when
+        // it can answer, the scan when it cannot, so no search that worked
+        // before stops working.
+        match crate::api::search_ids(&conn, "dr_search", &search) {
+            Some(ids) if !ids.is_empty() => {
+                conditions.push(format!(
+                    "id IN ({})",
+                    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+                ));
+            }
+            _ => {
+                let p = format!("%{}%", search);
+                conditions
+                    .push("(dr_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)".to_string());
+                query_params.extend([p.clone(), p.clone(), p]);
+            }
+        }
     }
     if let Some(dt) = dr_type {
         conditions.push("UPPER(dr_type) = ?".to_string());

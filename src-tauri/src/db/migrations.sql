@@ -906,3 +906,56 @@ CREATE INDEX IF NOT EXISTS ix_br_master_list ON br_master (entry_deleted, br_dat
 DROP INDEX IF EXISTS ix_br_master_deleted;
 CREATE INDEX IF NOT EXISTS ix_dr_master_list ON dr_master (entry_deleted, dr_date);
 DROP INDEX IF EXISTS ix_dr_master_deleted;
+
+-- ── Full-text search over the frozen registers ───────────────────────────────
+-- Searching the baggage register meant LIKE '%term%' across 334,546 rows, which
+-- no index can serve. Measured: a passport lookup took 1.4 s unencrypted, and
+-- SQLCipher makes that several times worse on the office machine.
+--
+--   passport P0123456   1413 ms  ->  0.3 ms
+--   receipt  4521        435 ms  ->  0.3 ms
+--
+-- external content (content='br_master'): the text is not duplicated, only the
+-- term index is stored — 31.5 MB for br_master, built once. prefix='2 3 4' lets
+-- an officer type the first few characters and still get a hit.
+--
+-- The triggers are not optional even though the registers are frozen. A RESTORE
+-- inserts rows, and an index that silently misses restored records would be a
+-- search that quietly lies — worse than a slow one.
+CREATE VIRTUAL TABLE IF NOT EXISTS br_search USING fts5(
+    br_no, pax_name, passport_no,
+    content='br_master', content_rowid='id', prefix='2 3 4'
+);
+CREATE TRIGGER IF NOT EXISTS br_search_ai AFTER INSERT ON br_master BEGIN
+  INSERT INTO br_search(rowid, br_no, pax_name, passport_no)
+    VALUES (new.id, new.br_no, new.pax_name, new.passport_no);
+END;
+CREATE TRIGGER IF NOT EXISTS br_search_ad AFTER DELETE ON br_master BEGIN
+  INSERT INTO br_search(br_search, rowid, br_no, pax_name, passport_no)
+    VALUES ('delete', old.id, old.br_no, old.pax_name, old.passport_no);
+END;
+CREATE TRIGGER IF NOT EXISTS br_search_au AFTER UPDATE ON br_master BEGIN
+  INSERT INTO br_search(br_search, rowid, br_no, pax_name, passport_no)
+    VALUES ('delete', old.id, old.br_no, old.pax_name, old.passport_no);
+  INSERT INTO br_search(rowid, br_no, pax_name, passport_no)
+    VALUES (new.id, new.br_no, new.pax_name, new.passport_no);
+END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS dr_search USING fts5(
+    dr_no, pax_name, passport_no,
+    content='dr_master', content_rowid='id', prefix='2 3 4'
+);
+CREATE TRIGGER IF NOT EXISTS dr_search_ai AFTER INSERT ON dr_master BEGIN
+  INSERT INTO dr_search(rowid, dr_no, pax_name, passport_no)
+    VALUES (new.id, new.dr_no, new.pax_name, new.passport_no);
+END;
+CREATE TRIGGER IF NOT EXISTS dr_search_ad AFTER DELETE ON dr_master BEGIN
+  INSERT INTO dr_search(dr_search, rowid, dr_no, pax_name, passport_no)
+    VALUES ('delete', old.id, old.dr_no, old.pax_name, old.passport_no);
+END;
+CREATE TRIGGER IF NOT EXISTS dr_search_au AFTER UPDATE ON dr_master BEGIN
+  INSERT INTO dr_search(dr_search, rowid, dr_no, pax_name, passport_no)
+    VALUES ('delete', old.id, old.dr_no, old.pax_name, old.passport_no);
+  INSERT INTO dr_search(rowid, dr_no, pax_name, passport_no)
+    VALUES (new.id, new.dr_no, new.pax_name, new.passport_no);
+END;

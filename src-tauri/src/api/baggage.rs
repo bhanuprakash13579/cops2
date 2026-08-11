@@ -28,9 +28,26 @@ pub async fn list_brs(
     let mut query_params: Vec<String> = Vec::new();
 
     if !search.is_empty() {
-        let p = format!("%{}%", search);
-        conditions.push("(br_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)".to_string());
-        query_params.extend([p.clone(), p.clone(), p]);
+        // Try the full-text index first. It answers a receipt number or passport
+        // in well under a millisecond where the scan below took over a second,
+        // but it matches whole words and prefixes rather than any substring —
+        // so when it finds nothing, fall through to the scan rather than tell
+        // the officer the record does not exist. Nothing searchable before is
+        // unsearchable now; the fast path is simply taken when it applies.
+        match crate::api::search_ids(&conn, "br_search", &search) {
+            Some(ids) if !ids.is_empty() => {
+                conditions.push(format!(
+                    "id IN ({})",
+                    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+                ));
+            }
+            _ => {
+                let p = format!("%{}%", search);
+                conditions
+                    .push("(br_no LIKE ? OR pax_name LIKE ? OR passport_no LIKE ?)".to_string());
+                query_params.extend([p.clone(), p.clone(), p]);
+            }
+        }
     }
     if let Some(bt) = br_type {
         conditions.push("UPPER(br_type) = ?".to_string());

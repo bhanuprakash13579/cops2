@@ -63,6 +63,18 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         ("dr_master", "pax_nationality", "VARCHAR(100)"),
         ("dr_master", "booked_by",       "VARCHAR(200)"),
         ("dr_master", "os_year",         "INTEGER"),
+        // br_master needs these for exactly the same reason dr_master needs
+        // os_year, and was missed. The baggage list SELECTs both columns, so
+        // without them every request for the register failed with "no such
+        // column" — 334,546 receipts unreachable through the page built to show
+        // them, while the detention register beside it worked. Creating a BR
+        // failed too, since the INSERT names is_legacy as well.
+        //
+        // Found by a search test that happened to exercise the list. Neither
+        // route nor page nor file comparison could see it: everything existed,
+        // the query inside was simply wrong.
+        ("br_master", "os_year",         "INTEGER"),
+        ("br_master", "is_legacy",       "TEXT DEFAULT 'N'"),
         // dr_items: columns added in cops2 that were missing from the original cops1 schema
         ("dr_items",  "dr_year",         "INTEGER"),
         ("dr_items",  "items_category",  "VARCHAR(50)"),
@@ -117,7 +129,43 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
     // Seed DCR initial data (idempotent)
     seed_dcr_defaults(&conn)?;
 
+    backfill_search_indexes(&conn);
+
     Ok(())
+}
+
+/// Populate the full-text indexes on a database that already holds registers.
+///
+/// The triggers keep them in step from here on, but they only fire on rows
+/// written after the trigger exists — a database upgraded from an older build,
+/// or one restored before this shipped, has 334,546 receipts the index has never
+/// seen. Left alone, search would return nothing for them and look like the
+/// records were missing.
+///
+/// Rebuilding costs about four seconds and runs only when the index is empty
+/// while its table is not, so an ordinary start pays two counting queries.
+fn backfill_search_indexes(conn: &rusqlite::Connection) {
+    for (fts, table) in [("br_search", "br_master"), ("dr_search", "dr_master")] {
+        let indexed: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {fts}"), [], |r| r.get(0))
+            .unwrap_or(-1);
+        let actual: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap_or(0);
+        if indexed == 0 && actual > 0 {
+            tracing::info!("building the {fts} index over {actual} rows (one time)");
+            if let Err(e) =
+                conn.execute_batch(&format!("INSERT INTO {fts}({fts}) VALUES('rebuild')"))
+            {
+                // Not fatal: search falls back to the scan it used before, which
+                // is slow but correct. Saying so beats a search that is quietly
+                // fast and quietly incomplete.
+                tracing::error!(
+                    "could not build {fts} ({e}) — register search will use the slow path"
+                );
+            }
+        }
+    }
 }
 
 fn seed_dcr_defaults(conn: &rusqlite::Connection) -> Result<()> {
