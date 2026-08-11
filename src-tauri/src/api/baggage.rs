@@ -73,7 +73,7 @@ pub async fn list_brs(
     let rows: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(query_params.iter()), |r| {
         Ok(json!({
             "id":                r.get::<_, i64>(0)?,
-            "br_no":             r.get::<_, String>(1)?,
+            "br_no":             crate::api::col_text(r, 1)?.unwrap_or_default(),
             "br_year":           r.get::<_, i64>(2)?,
             "br_date":           r.get::<_, Option<String>>(3)?,
             "pax_name":          r.get::<_, Option<String>>(4)?,
@@ -124,8 +124,10 @@ pub async fn get_br(
 
     let mut case = case.ok_or_else(|| e404("BR not found"))?;
 
-    // Load BR items
-    let items = load_br_items(&conn, &br_no, br_year).map_err(|e| e500(&e.to_string()))?;
+    // Items are keyed on the receipt's own date, taken from the master row we
+    // just read rather than from the URL, so the two always agree.
+    let br_date = case.get("br_date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let items = load_br_items(&conn, &br_no, &br_date).map_err(|e| e500(&e.to_string()))?;
     case["items"] = json!(items);
 
     Ok(Json(case))
@@ -151,7 +153,7 @@ pub async fn get_brs_by_passport(
     let rows: Vec<Value> = stmt.query_map(rusqlite::params![pp], |r| {
         Ok(json!({
             "id":                r.get::<_, i64>(0)?,
-            "br_no":             r.get::<_, String>(1)?,
+            "br_no":             crate::api::col_text(r, 1)?.unwrap_or_default(),
             "br_year":           r.get::<_, i64>(2)?,
             "br_date":           r.get::<_, Option<String>>(3)?,
             "pax_name":          r.get::<_, Option<String>>(4)?,
@@ -298,7 +300,8 @@ pub async fn print_br_pdf(
     ).optional().map_err(|e| e500(&e.to_string()))?;
 
     let mut case = case.ok_or_else(|| e404("BR not found"))?;
-    let items = load_br_items(&conn, &br_no, br_year).map_err(|e| e500(&e.to_string()))?;
+    let br_date = case.get("br_date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let items = load_br_items(&conn, &br_no, &br_date).map_err(|e| e500(&e.to_string()))?;
     case["items"] = json!(items);
 
     let pdf_bytes = crate::pdf::generate_br_pdf(&case)
@@ -313,18 +316,29 @@ pub async fn print_br_pdf(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn load_br_items(conn: &rusqlite::Connection, br_no: &str, br_year: i64) -> rusqlite::Result<Vec<Value>> {
+/// Items belonging to one baggage receipt.
+///
+/// Keyed on (br_no, br_date), not br_year. That is what the register is actually
+/// keyed on — the restore matches items to receipts by number and date, and the
+/// index on this table is (br_no, br_date). br_year does not exist on the rows
+/// that arrive by restore, so filtering on it matched nothing and every receipt
+/// in the office's register appeared to have no items at all.
+///
+/// br_year is also read as an Option now. It was read as a plain i64, so a NULL
+/// made the row conversion fail, and the failure was swallowed by the
+/// filter_map below — the item vanished instead of the error surfacing.
+fn load_br_items(conn: &rusqlite::Connection, br_no: &str, br_date: &str) -> rusqlite::Result<Vec<Value>> {
     let mut stmt = conn.prepare(
         "SELECT id, br_no, br_year, items_sno, items_desc, items_qty, items_uqc,
                 items_value, cumulative_duty_rate, items_duty, items_duty_type,
                 items_category, items_release_category, items_sub_category
-         FROM br_items WHERE br_no=? AND br_year=? ORDER BY items_sno"
+         FROM br_items WHERE br_no=? AND br_date=? ORDER BY items_sno"
     )?;
-    let rows: Vec<Value> = stmt.query_map(rusqlite::params![br_no, br_year], |r| {
+    let rows: Vec<Value> = stmt.query_map(rusqlite::params![br_no, br_date], |r| {
         Ok(json!({
             "id":                    r.get::<_, i64>(0)?,
-            "br_no":                 r.get::<_, String>(1)?,
-            "br_year":               r.get::<_, i64>(2)?,
+            "br_no":                 crate::api::col_text(r, 1)?.unwrap_or_default(),
+            "br_year":               r.get::<_, Option<i64>>(2)?,
             "items_sno":             r.get::<_, i64>(3)?,
             "items_desc":            r.get::<_, Option<String>>(4)?,
             "items_qty":             r.get::<_, Option<f64>>(5)?,

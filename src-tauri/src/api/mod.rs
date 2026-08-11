@@ -31,6 +31,28 @@ mod dcr;
 mod config_backup;
 mod license;
 
+/// Read a column as text whatever SQLite actually stored there.
+///
+/// br_no and dr_no are declared INTEGER but were read as String in five places.
+/// rusqlite refuses that conversion, the row mapper returned Err, and every one
+/// of those call sites ended in `.filter_map(|r| r.ok())` — so the rows were not
+/// merely wrong, they silently disappeared. The registers listed a total and
+/// then showed nothing, and receipts appeared to have no items.
+///
+/// Reading through the raw value also survives the mixed types that arrive by
+/// restore, where the same column can hold a number in one row and text in the
+/// next depending on how the original system wrote it.
+pub fn col_text(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match r.get_ref(i)? {
+        rusqlite::types::ValueRef::Null       => None,
+        rusqlite::types::ValueRef::Integer(n) => Some(n.to_string()),
+        rusqlite::types::ValueRef::Real(f)    => Some(f.to_string()),
+        rusqlite::types::ValueRef::Text(t)    => Some(String::from_utf8_lossy(t).into_owned()),
+        rusqlite::types::ValueRef::Blob(b)    => Some(String::from_utf8_lossy(b).into_owned()),
+    })
+}
+
+
 /// Row ids matching `term` in a full-text index, or `None` when the index cannot
 /// answer and the caller should fall back to a scan.
 ///

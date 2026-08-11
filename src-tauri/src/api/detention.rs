@@ -69,7 +69,7 @@ pub async fn list_drs(
     let rows: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(query_params.iter()), |r| {
         Ok(json!({
             "id":                r.get::<_, i64>(0)?,
-            "dr_no":             r.get::<_, String>(1)?,
+            "dr_no":             crate::api::col_text(r, 1)?.unwrap_or_default(),
             "dr_year":           r.get::<_, i64>(2)?,
             "dr_date":           r.get::<_, Option<String>>(3)?,
             "pax_name":          r.get::<_, Option<String>>(4)?,
@@ -270,7 +270,7 @@ fn load_dr_items(conn: &rusqlite::Connection, dr_no: &str, dr_year: i64) -> rusq
     let rows: Vec<Value> = stmt.query_map(rusqlite::params![dr_no, dr_year], |r| {
         Ok(json!({
             "id":           r.get::<_, i64>(0)?,
-            "dr_no":        r.get::<_, String>(1)?,
+            "dr_no":        crate::api::col_text(r, 1)?.unwrap_or_default(),
             "dr_year":      r.get::<_, i64>(2)?,
             "items_sno":    r.get::<_, i64>(3)?,
             "items_desc":   r.get::<_, Option<String>>(4)?,

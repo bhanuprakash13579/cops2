@@ -75,6 +75,14 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         // the query inside was simply wrong.
         ("br_master", "os_year",         "INTEGER"),
         ("br_master", "is_legacy",       "TEXT DEFAULT 'N'"),
+        // br_items was short the same way, and its INSERT names all three — so
+        // booking a receipt with any item on it failed outright, and reading the
+        // items back failed too. dr_items has dr_year and cops_items has the
+        // other two; br_items alone had none of them. Types copied from those
+        // siblings so the three registers agree.
+        ("br_items",  "br_year",              "INTEGER"),
+        ("br_items",  "cumulative_duty_rate", "FLOAT DEFAULT 0"),
+        ("br_items",  "items_sub_category",   "VARCHAR(100)"),
         // dr_items: columns added in cops2 that were missing from the original cops1 schema
         ("dr_items",  "dr_year",         "INTEGER"),
         ("dr_items",  "items_category",  "VARCHAR(50)"),

@@ -1572,3 +1572,59 @@ async fn a_record_added_later_is_searchable_immediately() {
     let fresh = br_search(&base, "CORRECTED").await;
     assert_eq!(fresh["total"], 1, "the new name must match after an edit: {fresh}");
 }
+
+#[tokio::test]
+async fn the_baggage_register_can_be_listed_read_and_attached_to_a_case() {
+    // What the office actually does with BR/DR: look them up, and attach the
+    // number to an OS. Receipts are not created here any more — the registers
+    // arrive by restore and are read from then on. All three paths touch the
+    // columns br_master and br_items were missing.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    // Seed the way a restore does — straight into the table.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO br_master (id, br_no, br_year, br_date, br_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (1, '7001', 2026, '2026-08-11', 'D', 'REGISTER TEST', 'R1234567', 'N')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO br_items (br_no, br_year, br_date, br_type, items_sno, items_desc,
+                                   items_qty, items_value, cumulative_duty_rate, items_sub_category)
+             VALUES (7001, 2026, '2026-08-11', 'D', 1, 'WRIST WATCH', 1.0, 55000.0, 38.5, 'WATCHES')",
+            [],
+        ).unwrap();
+    }
+
+    // The list — this is the query that returned "no such column: os_year".
+    let list: serde_json::Value = c.get(format!("{base}/br?search=7001"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(list["total"], 1, "the register list must show the receipt: {list}");
+
+    // The detail, including the item columns br_items was missing.
+    let one: serde_json::Value = c.get(format!("{base}/br/7001/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let items = one["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "the item must be readable: {one}");
+    assert_eq!(items[0]["items_sub_category"], "WATCHES",
+               "a column that was missing must round-trip: {one}");
+
+    // Attaching the number to an adjudicated case.
+    book_and_adjudicate(&base).await;
+    let r = c.patch(format!("{base}/os/7001/2026/post-adj"))
+        .bearer_auth(&t)
+        .json(&serde_json::json!({ "post_adj_br_entries": "7001/2026" }))
+        .send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(st, 200, "attaching a BR number to the case failed: {body}");
+
+    let case: serde_json::Value = c.get(format!("{base}/os/7001/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(case["post_adj_br_entries"], "7001/2026",
+               "the attached BR number must stay on the case: {case}");
+}
