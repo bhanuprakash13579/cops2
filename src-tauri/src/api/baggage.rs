@@ -143,14 +143,27 @@ pub async fn get_brs_by_passport(
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let pp = format!("%{}%", passport_no.to_uppercase());
 
-    let mut stmt = conn.prepare(
+    // "Has this passenger been booked before?" is asked while someone waits at
+    // the counter, and it was a LIKE scan over the whole register. The full-text
+    // index answers it directly; the scan stays for a partial passport number,
+    // which the index cannot match mid-string.
+    let (where_pp, use_scan) = match crate::api::search_ids(&conn, "br_search", &passport_no) {
+        Some(ids) if !ids.is_empty() => (
+            format!("id IN ({})", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")),
+            false,
+        ),
+        _ => ("passport_no LIKE ?".to_string(), true),
+    };
+
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, br_no, br_year, br_date, pax_name, passport_no,
                 total_items_value, total_duty_amount, total_payable, br_printed
-         FROM br_master WHERE passport_no LIKE ? AND entry_deleted='N'
+         FROM br_master WHERE {where_pp} AND entry_deleted='N'
          ORDER BY br_date DESC LIMIT 50"
-    ).map_err(|e| e500(&e.to_string()))?;
+    )).map_err(|e| e500(&e.to_string()))?;
 
-    let rows: Vec<Value> = stmt.query_map(rusqlite::params![pp], |r| {
+    let params: Vec<&dyn rusqlite::ToSql> = if use_scan { vec![&pp] } else { vec![] };
+    let rows: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(params), |r| {
         Ok(json!({
             "id":                r.get::<_, i64>(0)?,
             "br_no":             crate::api::col_text(r, 1)?.unwrap_or_default(),

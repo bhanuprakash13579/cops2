@@ -1628,3 +1628,40 @@ async fn the_baggage_register_can_be_listed_read_and_attached_to_a_case() {
     assert_eq!(case["post_adj_br_entries"], "7001/2026",
                "the attached BR number must stay on the case: {case}");
 }
+
+#[tokio::test]
+async fn the_previous_receipts_lookup_finds_the_passenger_either_way() {
+    // Asked at the counter while the passenger waits, so it takes the index when
+    // it can. A partial passport number cannot be matched mid-string by an index,
+    // and must still find the record through the scan.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    {
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO br_master (id, br_no, br_year, br_date, br_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (1, 8001, 2026, '2026-08-11', 'D', 'REPEAT TRAVELLER', 'U1724675', 'N')",
+            [],
+        ).unwrap();
+    }
+    let c = reqwest::Client::new();
+    let get = |pp: &str| {
+        let url = format!("{base}/br/passport/{pp}");
+        let c = c.clone();
+        async move {
+            c.get(url).bearer_auth(officer_token()).send().await.unwrap()
+                .json::<serde_json::Value>().await.unwrap()
+        }
+    };
+
+    let n = |v: &serde_json::Value| v["items"].as_array().map(|a| a.len()).unwrap_or(0);
+
+    let exact = get("U1724675").await;
+    assert_eq!(n(&exact), 1, "the full passport number must find the receipt: {exact}");
+
+    let partial = get("1724675").await;
+    assert_eq!(n(&partial), 1, "a partial number must still find it through the scan: {partial}");
+
+    let absent = get("Z0000000").await;
+    assert_eq!(n(&absent), 0, "an unknown passport must find nothing: {absent}");
+}
