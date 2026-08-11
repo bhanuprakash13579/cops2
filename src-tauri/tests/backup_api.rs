@@ -1184,6 +1184,26 @@ async fn indexes_are_present_after_a_restore_even_though_the_archive_omits_them(
         [], |r| r.get(3)).unwrap();
     assert!(plan.to_lowercase().contains("index"),
             "the query planner should use an index, got: {plan}");
+
+    // The indexes live in the SCHEMA, which is rebuilt from migrations.sql when
+    // the database is opened — they are not carried in the archive at all. So an
+    // archive taken by an older build restores into a newer one and picks up
+    // every index that build added, without anyone reindexing anything. Check
+    // the newest one specifically, and check the planner actually reaches for it
+    // on the query it was added for.
+    let c = pool.get().unwrap();
+    let present: i64 = c.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='ix_br_master_list'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(present, 1, "the baggage list index must exist after a restore");
+
+    let plan: String = c.query_row(
+        "EXPLAIN QUERY PLAN
+         SELECT br_no FROM br_master WHERE entry_deleted='N'
+         ORDER BY br_date DESC LIMIT 20",
+        [], |r| r.get(3)).unwrap();
+    assert!(plan.contains("ix_br_master_list"),
+            "the baggage list should use its index after a restore, got: {plan}");
 }
 
 #[tokio::test]

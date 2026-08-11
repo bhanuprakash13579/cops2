@@ -883,20 +883,26 @@ CREATE TABLE IF NOT EXISTS license_codes_used (
 );
 
 -- ── Frozen-register read indexes ─────────────────────────────────────────────
--- BR and DR are no longer written to: the office books only OS in this app, and
--- the two registers are kept for lookup. That makes read cost the only cost
--- worth paying for here, since an index on a table nothing writes to is free
--- apart from the disk it sits on.
+-- The list pages order by date descending over 334,546 baggage receipts, and
+-- nothing here covered that column — every page load scanned and sorted the
+-- whole register. The Python app has carried this index since its own
+-- performance pass; it was simply not brought across, so this restores parity
+-- rather than inventing anything.
 --
--- The list pages order by date descending, over 334,546 baggage receipts, and
--- no index covered that column at all — every page load sorted the whole
--- register. Measured at real scale: 89 ms to 9 ms, and the query plan stops
--- building a temp B-tree for the whole ORDER BY.
+--   no index    97 ms   SCAN br_master, TEMP B-TREE FOR ORDER BY
+--   this one     8 ms   SEARCH USING ix_br_master_list
 --
--- These supersede the single-column entry_deleted indexes, whose only use was
--- a filter these cover with their leading column. Dropped rather than left to
--- occupy space on 348,000 rows for nothing.
-CREATE INDEX IF NOT EXISTS ix_br_master_list ON br_master (entry_deleted, br_date DESC, br_no DESC);
+-- Two columns, not three. Adding br_no looked free and measured 1.3 MB larger
+-- for 0.7 ms slower, because the query orders by CAST(br_no AS INTEGER) and a
+-- cast cannot use an index however the column is stored.
+--
+-- BR and DR take no more writes — the office books only OS in this app now — so
+-- the only cost these carry is the disk they occupy.
+--
+-- They supersede the single-column entry_deleted indexes, whose one use is a
+-- filter these serve from their leading column. Dropped rather than left paying
+-- rent on 348,000 rows.
+CREATE INDEX IF NOT EXISTS ix_br_master_list ON br_master (entry_deleted, br_date);
 DROP INDEX IF EXISTS ix_br_master_deleted;
-CREATE INDEX IF NOT EXISTS ix_dr_master_list ON dr_master (entry_deleted, dr_date DESC, dr_no DESC);
+CREATE INDEX IF NOT EXISTS ix_dr_master_list ON dr_master (entry_deleted, dr_date);
 DROP INDEX IF EXISTS ix_dr_master_deleted;
