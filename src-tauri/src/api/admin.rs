@@ -149,6 +149,12 @@ pub async fn upsert_baggage_rules(State(pool): Db, auth: AuthUser, Json(req): Js
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let from = req.get("effective_from").and_then(|v| v.as_str()).unwrap_or(&today);
 
+    // rule_value is NOT NULL — say which field is missing rather than letting the
+    // constraint surface as a database error the officer cannot act on.
+    if req.get("rule_value").and_then(|v| v.as_f64()).is_none() {
+        return Err(e400("A value for the rule is required."));
+    }
+
     // Versioned: INSERT a new row (multiple rows per key supported for history)
     conn.execute(
         "INSERT INTO baggage_rules_config (rule_key, rule_label, rule_value, rule_uqc, effective_from, created_by)
@@ -193,6 +199,14 @@ pub async fn get_special_allowances(State(pool): Db, _auth: AuthUser) -> Result<
 pub async fn create_special_allowance(State(pool): Db, auth: AuthUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Both NOT NULL. Same reasoning as above: name the field, not the constraint.
+    if req.get("item_name").and_then(|v| v.as_str()).map(str::trim).unwrap_or("").is_empty() {
+        return Err(e400("An item name is required."));
+    }
+    if req.get("allowance_qty").and_then(|v| v.as_f64()).is_none() {
+        return Err(e400("An allowance quantity is required."));
+    }
 
     conn.execute(
         "INSERT INTO special_item_allowances (item_name, keywords, allowance_qty, allowance_uqc,
@@ -381,11 +395,23 @@ pub async fn create_device(State(pool): Db, _admin: AdminUser, Json(req): Json<s
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
+    // label is NOT NULL. The admin panel's "register this machine" button posts an
+    // empty body, so an unchecked req.get() reached SQLite as NULL and the officer
+    // got "NOT NULL constraint failed: allowed_devices.label" — a database error
+    // for what is really a missing name. Fall back to the hostname, which is what
+    // registering this machine means, and only refuse when there is nothing at all
+    // to call it.
+    let label = req.get("label").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .or_else(|| req.get("hostname").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
+        .map(|s| s.to_string())
+        .or_else(|| { let h = crate::config::hostname(); if h.trim().is_empty() { None } else { Some(h) } })
+        .ok_or_else(|| e400("A name for the device is required."))?;
+
     conn.execute(
         "INSERT INTO allowed_devices (label, ip_address, mac_address, hostname, is_active, added_on, notes)
          VALUES (?,?,?,?,1,?,?)",
         rusqlite::params![
-            req.get("label").and_then(|v| v.as_str()),
+            label,
             req.get("ip_address").and_then(|v| v.as_str()),
             req.get("mac_address").and_then(|v| v.as_str()),
             req.get("hostname").and_then(|v| v.as_str()),

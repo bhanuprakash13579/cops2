@@ -459,10 +459,11 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
             row.sno, row.desc, row.qty_str, row.fa_disp, row.duty_disp, row.total_disp
         ));
     }
-    // Pad with empty rows if fewer than 5 items (keep table looking full)
-    for _ in item_rows.len()..5 {
-        rows_markup.push_str("[], [], [], [], [], [],\n");
-    }
+    // No padding rows. They were added to "keep the table looking full", but on a
+    // two-item seizure they print as four blank numbered lines under the goods,
+    // which reads as entries that failed to render rather than as a tidy table.
+    // The Python form does not pad, and the fit search now fills the page by
+    // growing the text instead.
 
     // ── Versioned config defaults ─────────────────────────────────────────────
     let office_hdr1   = "Office of the Deputy / Asst. Commissioner of Customs";
@@ -790,12 +791,19 @@ pub fn compile_typst(source_text: &str) -> Result<Vec<u8>> {
     Ok(pdf)
 }
 
-/// Base text sizes: page 1 (the booking) and page 2 (the order). Every entry
-/// keeps their 9:8 relationship, so shrinking to fit never makes the two pages
-/// look like they came from different documents.
+/// Base text sizes: page 1 (the booking) and page 2 (the order), largest first.
+/// Every entry keeps their 9:8 relationship, so resizing never makes the two
+/// pages look like they came from different documents.
+///
+/// The top of the ladder is 11pt because two pages is only half the requirement
+/// — the text also has to be as large as it can be. An earlier version started
+/// at 9pt, the old fixed size, so a three-item case could never grow into the
+/// space it had and printed small with most of the page empty. The Python app
+/// searches from 11pt for the same reason.
 const OS_SIZE_LADDER: &[(f64, f64)] = &[
-    (9.0, 8.0), (8.5, 7.6), (8.0, 7.1), (7.5, 6.7),
-    (7.0, 6.2), (6.5, 5.8), (6.0, 5.3), (5.5, 4.9),
+    (11.0, 9.8), (10.5, 9.3), (10.0, 8.9), (9.5, 8.4),
+    (9.0,  8.0), (8.5,  7.6), (8.0,  7.1), (7.5, 6.7),
+    (7.0,  6.2), (6.5,  5.8), (6.0,  5.3), (5.5, 4.9),
 ];
 
 /// Generate a 2-page legal-size OS PDF using Typst.
