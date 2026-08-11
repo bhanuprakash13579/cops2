@@ -87,6 +87,38 @@ impl World for OsWorld {
     fn today(&self, _offset: Option<i64>) -> Option<Datetime> { None }
 }
 
+
+/// The office's own wording for the printed form, as it stood on a given date.
+///
+/// These headings are editable in the admin panel and versioned by
+/// effective_from, so a case printed today and the same case reprinted after a
+/// heading changes both show what was correct when the case was booked.
+///
+/// COPS2 hardcoded every one of them. The editor saved rows into
+/// print_template_config that nothing ever read, so an administrator could
+/// change the office name, save it, see it listed — and the printed OS would
+/// carry the old text forever. The Python app has always resolved them this way.
+pub fn template_config(conn: &rusqlite::Connection, as_of: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT field_key, field_value
+           FROM print_template_config
+          WHERE effective_from <= ?1
+            AND effective_from = (
+                SELECT MAX(p2.effective_from) FROM print_template_config p2
+                 WHERE p2.field_key = print_template_config.field_key
+                   AND p2.effective_from <= ?1)"
+    ) else { return out };
+    if let Ok(rows) = stmt.query_map([as_of], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) {
+        for (k, v) in rows.filter_map(|r| r.ok()) {
+            if !v.trim().is_empty() { out.insert(k, v); }
+        }
+    }
+    out
+}
+
 // ── Text helpers ──────────────────────────────────────────────────────────────
 
 /// Escape special characters for Typst content blocks.
@@ -466,19 +498,29 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     // growing the text instead.
 
     // ── Versioned config defaults ─────────────────────────────────────────────
-    let office_hdr1   = "Office of the Deputy / Asst. Commissioner of Customs";
-    let office_hdr2   = "(Airport), Anna International Airport, Chennai-600027";
+    // Wording the office can change, resolved as it stood on the case's own date.
+    // Every default below is the text this form has always carried, so an office
+    // that never opens the editor sees no difference.
+    let tcfg = case.get("__template_config").and_then(|v| v.as_object()).cloned()
+        .unwrap_or_default();
+    let cfg = |key: &str, default: &str| -> String {
+        tcfg.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+            .unwrap_or(default).to_string()
+    };
+
+    let office_hdr1   = cfg("office_header_line1", "Office of the Deputy / Asst. Commissioner of Customs");
+    let office_hdr2   = cfg("office_header_line2", "(Airport), Anna International Airport, Chennai-600027");
     let page1_title   = if is_export { "DETENTION / SEIZURE OF PASSENGER'S BAGGAGE (EXPORT)" }
                         else { "DETENTION / SEIZURE OF PASSENGER'S BAGGAGE" };
     let inv_heading   = if is_export { "INVENTORY OF THE GOODS DETAINED FOR EXPORT" }
                         else { "INVENTORY OF THE GOODS IMPORTED" };
-    let col_fa_hdr    = "Goods Allowed Free Under Rule 5 / Rule 13 of Baggage Rules, 1994";
-    let col_duty_hdr  = "Goods Passed On Duty";
-    let col_liable_hdr= "Goods Liable to Action Under FEMA / Foreign Trade Act, 1992 & Customs Act, 1962";
-    let sum_duty_txt  = "Value of Goods Charged to Duty Under Foreign Trade (D&R) Act, 1992 & Customs Act, 1962";
-    let sum_liab_txt  = "Value of Goods Liable to Action under FEMA / Foreign Trade (D&R) Act, 1992 & Customs Act 1962";
-    let supdt_sig     = "Supdt. of Customs";
-    let p2_office_hdr = "Office of the Deputy / Asst. Commissioner of Customs (Airport), Anna International airport, Chennai-600027.";
+    let col_fa_hdr    = cfg("col_fa_heading", "Goods Allowed Free Under Rule 5 / Rule 13 of Baggage Rules, 1994");
+    let col_duty_hdr  = cfg("col_duty_heading", "Goods Passed On Duty");
+    let col_liable_hdr= cfg("col_liable_heading", "Goods Liable to Action Under FEMA / Foreign Trade Act, 1992 & Customs Act, 1962");
+    let sum_duty_txt  = cfg("summary_duty_text", "Value of Goods Charged to Duty Under Foreign Trade (D&R) Act, 1992 & Customs Act, 1962");
+    let sum_liab_txt  = cfg("summary_liable_text", "Value of Goods Liable to Action under FEMA / Foreign Trade (D&R) Act, 1992 & Customs Act 1962");
+    let supdt_sig     = cfg("supdt_sig_title", "Supdt. of Customs");
+    let p2_office_hdr = cfg("p2_office_heading", "Office of the Deputy / Asst. Commissioner of Customs (Airport), Anna International airport, Chennai-600027.");
     let waiver_hdr    = "WAIVER OF SHOW CAUSE NOTICE";
     let waiver_txt1   = if is_export {
         "The Charges have been orally communicated to me in respect of the goods mentioned overleaf and detained at the time of my departure. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing."
@@ -490,7 +532,7 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     let order_hdr     = "ORDER";
     let nb1_txt       = "N.B: 1. This copy is granted free of charge for the private use of the person to whom it is issued.";
     let nb2_txt       = "2. An Appeal against this Order shall lie before the Commissioner of Customs (Appeals), Custom House, Chennai-600 001 on payment of 7.5% of the duty demanded where duty or duty and penalty are in dispute, or penalty, where penalty alone is in dispute. The Appeal shall be filed within 60 days provided under Section 128 of the Customs Act, 1962 from the date of receipt of this Order.";
-    let note_scn      = "Note: The issue of Show Cause Notice was waived at the instance of the Passenger.";
+    let note_scn      = cfg("note_scn_waived", "Note: The issue of Show Cause Notice was waived at the instance of the Passenger.");
     let legal_p1      = if is_export {
         "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962."
     } else {
@@ -501,11 +543,11 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     } else {
         "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992."
     };
-    let deputy_sig    = "Deputy / Asst. Commissioner of Customs (Airport)";
-    let bottom_nb1    = "N.B: 1. Perishables will be disposed off within seven days from the date of detention.";
+    let deputy_sig    = cfg("deputy_sig_title", "Deputy / Asst. Commissioner of Customs (Airport)");
+    let bottom_nb1    = cfg("bottom_nb1", "N.B: 1. Perishables will be disposed off within seven days from the date of detention.");
     let bottom_nb2    = if !is_export { "2. Where re-export is permitted, the passenger is advised to intimate the date of departure of flight atleast 48 hours in advance." } else { "" };
-    let bottom_nb3    = "3. Warehouse rent and Handling Charges are chargeable for the goods detained.";
-    let recv_txt      = "Received the Order-in-Original";
+    let bottom_nb3    = cfg("bottom_nb3", "3. Warehouse rent and Handling Charges are chargeable for the goods detained.");
+    let recv_txt      = cfg("received_order_text", "Received the Order-in-Original");
 
     // ── Assemble Typst document ───────────────────────────────────────────────
     let order_paras = {
@@ -704,8 +746,8 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
   align(right)[#v(14pt)_Signature of the Passenger_],
 )
 "#,
-        office_hdr1     = esc(office_hdr1),
-        office_hdr2     = esc(office_hdr2),
+        office_hdr1     = esc(&office_hdr1),
+        office_hdr2     = esc(&office_hdr2),
         page1_title     = esc(page1_title),
         oinfo_os_no     = esc(&os_no),
         oinfo_os_year   = os_year,
@@ -725,22 +767,22 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         p1_size             = p1_size,
         p2_size             = p2_size,
         inv_heading         = esc(inv_heading),
-        col_fa_hdr          = esc(col_fa_hdr),
-        col_duty_hdr        = esc(col_duty_hdr),
-        col_liable_hdr      = esc(col_liable_hdr),
+        col_fa_hdr          = esc(&col_fa_hdr),
+        col_duty_hdr        = esc(&col_duty_hdr),
+        col_liable_hdr      = esc(&col_liable_hdr),
         rows_markup         = rows_markup,
         oinfo_prev_offence  = esc(&prev_offence_display),
         oinfo_other_pp      = esc(&other_pp_offences),
         oinfo_total_fa_fmt  = esc(&fmt_indian(total_fa_monetary)),
         oinfo_fa_dash       = if total_fa_monetary > 0.0 { "/-" } else { "" },
         fa_qty_note         = fa_qty_note,
-        sum_duty_txt        = esc(sum_duty_txt),
+        sum_duty_txt        = esc(&sum_duty_txt),
         oinfo_total_dutiable_fmt = esc(&fmt_indian(total_dutiable)),
-        sum_liab_txt        = esc(sum_liab_txt),
+        sum_liab_txt        = esc(&sum_liab_txt),
         oinfo_total_items_fmt    = esc(&fmt_indian(total_items_value)),
-        supdt_sig           = esc(supdt_sig),
+        supdt_sig           = esc(&supdt_sig),
         oinfo_supdts_remarks= esc(&supdts_remarks),
-        p2_office_hdr       = esc(p2_office_hdr),
+        p2_office_hdr       = esc(&p2_office_hdr),
         oinfo_pax_name      = esc(&pax_name),
         day_night           = day_night,
         waiver_hdr          = esc(waiver_hdr),
@@ -751,22 +793,22 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         oinfo_adj_date      = esc(&adj_date),
         nb1_txt             = esc(nb1_txt),
         nb2_txt             = esc(nb2_txt),
-        note_scn            = esc(note_scn),
+        note_scn            = esc(&note_scn),
         legal_p1            = esc(legal_p1),
         legal_p2            = esc(legal_p2),
         record_hdr          = esc(record_hdr),
         oinfo_adj_remarks   = esc(&adj_remarks),
         order_hdr           = esc(order_hdr),
         order_paras         = order_paras,
-        deputy_sig          = esc(deputy_sig),
-        bottom_nb1          = esc(bottom_nb1),
+        deputy_sig          = esc(&deputy_sig),
+        bottom_nb1          = esc(&bottom_nb1),
         bottom_nb2_markup   = if !bottom_nb2.is_empty() {
             format!("#par(justify: true)[#h(2em){}]", esc(bottom_nb2))
         } else { String::new() },
-        bottom_nb3          = esc(bottom_nb3),
+        bottom_nb3          = esc(&bottom_nb3),
         br_display          = br_display,
         dr_display          = dr_display,
-        recv_txt            = esc(recv_txt),
+        recv_txt            = esc(&recv_txt),
     )
 }
 

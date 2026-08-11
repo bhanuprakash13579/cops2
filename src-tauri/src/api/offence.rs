@@ -391,8 +391,16 @@ pub async fn create_os(State(pool): Db, auth: AuthUser, Json(mut req): Json<Crea
     Ok(Json(case_json))
 }
 
-pub async fn create_offline(State(pool): Db, _auth: SdoUser, Json(mut req): Json<CreateOsRequest>) -> Result<Json<Value>, Err> {
+pub async fn create_offline(State(pool): Db, auth: SdoUser, Json(mut req): Json<CreateOsRequest>) -> Result<Json<Value>, Err> {
     // Same as create_os but forces is_offline_adjudication='Y'
+    //
+    // An offline case is entered from a paper record, often long after the fact,
+    // which makes who entered it more worth knowing rather than less. This path
+    // had no fallback at all, so a bare-minimum entry — which is the normal shape
+    // here — saved with no author.
+    if req.booked_by.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        req.booked_by = Some(auth.0.name.clone());
+    }
     req.passport_no = normalize_passport(req.passport_no);
     validate_flight_date(req.flight_date.as_deref())?;
     validate_pax_dates(req.pax_date_of_birth.as_deref(), req.date_of_departure.as_deref())?;
@@ -457,7 +465,7 @@ pub async fn create_offline(State(pool): Db, _auth: SdoUser, Json(mut req): Json
 /// Returns: `{ imported, skipped, failed: [{os_no, error}] }`
 pub async fn bulk_import_offline(
     State(pool): Db,
-    _auth: SdoUser,
+    auth: SdoUser,
     Json(rows): Json<Vec<Value>>,
 ) -> Result<Json<Value>, Err> {
     if rows.is_empty() { return Err(e400("No rows to import.")); }
@@ -513,7 +521,9 @@ pub async fn bulk_import_offline(
             row.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0)
         };
 
-        let booked_by           = s("booked_by");
+        // The spreadsheet rarely carries an officer column; fall back to whoever
+        // is running the import, so a bulk-loaded case is not anonymous either.
+        let booked_by           = { let b = s("booked_by"); if b.trim().is_empty() { auth.0.name.clone() } else { b } };
         let flight_no           = s("flight_no");
         let pax_name            = s("pax_name");
         let pax_nationality     = s("pax_nationality");
@@ -1055,6 +1065,15 @@ pub async fn print_pdf(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
     let mut case = get_case_json(&conn, &os_no, os_year).map_err(|e| e500(&e.to_string()))?;
     let items = load_items(&conn, &os_no, os_year).map_err(|e| e500(&e.to_string()))?;
     case["items"] = json!(items);
+
+    // The office's editable wording, as it stood on the case's own date rather
+    // than today's — a heading changed last month must not rewrite the form of a
+    // case booked before it. Falling back to os_date keeps a reprint identical to
+    // the original print.
+    let as_of = case.get("os_date").and_then(|v| v.as_str())
+        .unwrap_or("9999-12-31").to_string();
+    let tcfg = crate::pdf::template_config(&conn, &as_of);
+    case["__template_config"] = json!(tcfg);
 
     let pdf_bytes = crate::pdf::generate_os_pdf(&case)
         .map_err(|e| e500(&format!("PDF generation failed: {e}")))?;

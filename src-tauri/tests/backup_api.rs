@@ -1789,3 +1789,117 @@ async fn cases_can_be_found_by_who_registered_them_as_well_as_who_adjudicated() 
     let r = search(serde_json::json!({ "search": "BRAVO" })).await;
     assert_eq!(r["total"], 1, "the keyword box should find the booking officer: {r}");
 }
+
+#[tokio::test]
+async fn editing_the_os_template_actually_changes_the_printed_form() {
+    // The admin panel lets the office rewrite the headings on the form. COPS2
+    // hardcoded every one of them, so the editor saved rows nothing ever read —
+    // an administrator could change the office name, see it listed, and the
+    // printed OS would carry the old text forever.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    book_and_adjudicate(&base).await;
+
+    let r = c.get(format!("{base}/os/7001/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap();
+    let st = r.status();
+    let before = r.bytes().await.unwrap();
+    assert_eq!(st, 200, "print failed: {}", String::from_utf8_lossy(&before));
+    assert_eq!(&before[..4], b"%PDF", "not a PDF: {}", String::from_utf8_lossy(&before));
+
+    // Change the office name, effective before the case date.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO print_template_config (field_key, field_label, field_value,
+                                                effective_from, created_by, created_at)
+             VALUES ('office_header_line1', 'Office header', ?, '2020-01-01', 'admin', datetime('now'))",
+            ["OFFICE OF THE COMMISSIONER OF CUSTOMS, CHENNAI ZONE"],
+        ).unwrap();
+    }
+
+    let after = c.get(format!("{base}/os/7001/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap().bytes().await.unwrap();
+    assert_ne!(before.len(), after.len(),
+               "changing a heading must change the printed form");
+
+    // A heading that takes effect AFTER the case must not rewrite it — the form
+    // has to keep saying what was correct when the case was booked.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO print_template_config (field_key, field_label, field_value,
+                                                effective_from, created_by, created_at)
+             VALUES ('office_header_line1', 'Office header', ?, '2099-01-01', 'admin', datetime('now'))",
+            ["A HEADING FROM THE FUTURE"],
+        ).unwrap();
+    }
+    let later = c.get(format!("{base}/os/7001/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(after.len(), later.len(),
+               "a heading effective after the case must not change its printed form");
+}
+
+#[tokio::test]
+async fn the_sdo_can_add_an_offline_case_with_only_the_bare_details() {
+    // An offline case is entered after the fact from a paper record, so most of
+    // the form is unknown. It must go in on the few facts that exist and be
+    // findable afterwards.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    let r = c.post(format!("{base}/os/offline")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "4001", "os_year": 2026, "os_date": "2026-08-11",
+            "pax_name": "OFFLINE MINIMAL", "passport_no": "O1112223"
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(st, 200, "a bare-minimum offline case must be accepted: {body}");
+
+    let case: serde_json::Value = c.get(format!("{base}/os/4001/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(case["pax_name"], "OFFLINE MINIMAL", "the case must be readable back: {case}");
+    assert_eq!(case["is_offline_adjudication"], "Y",
+               "it must be marked as an offline adjudication: {case}");
+    assert!(case["booked_by"].as_str().unwrap_or("").len() > 0,
+            "an offline case still records who entered it: {case}");
+}
+
+#[tokio::test]
+async fn the_sdo_excel_import_adds_rows_and_refuses_the_bad_ones() {
+    // The Excel route hands over many rows at once. Duplicates must be skipped
+    // rather than doubling a case, and one unusable row must not lose the rest.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    let rows = serde_json::json!([
+        { "os_no": "4101", "os_year": 2026, "os_date": "2026-08-11", "pax_name": "BULK ONE" },
+        { "os_no": "4102", "os_year": 2026, "os_date": "2026-08-11", "pax_name": "BULK TWO" },
+        { "os_no": "4101", "os_year": 2026, "os_date": "2026-08-11", "pax_name": "BULK ONE AGAIN" },
+        { "os_year": 2026, "pax_name": "NO OS NUMBER AT ALL" }
+    ]);
+    let r = c.post(format!("{base}/os/offline/bulk-import")).bearer_auth(officer_token())
+        .json(&rows).send().await.unwrap();
+    let st = r.status();
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(st, 200, "the import itself must succeed: {body}");
+
+    let inserted = body["inserted"].as_i64().or(body["imported"].as_i64()).unwrap_or(-1);
+    assert_eq!(inserted, 2, "two good rows should go in, the duplicate and the \
+                             unusable one should not: {body}");
+
+    for (no, name) in [("4101", "BULK ONE"), ("4102", "BULK TWO")] {
+        let case: serde_json::Value = c.get(format!("{base}/os/{no}/2026"))
+            .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+        assert_eq!(case["pax_name"], name, "row {no} should be readable: {case}");
+    }
+
+    // The duplicate must not have overwritten the original.
+    let first: serde_json::Value = c.get(format!("{base}/os/4101/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(first["pax_name"], "BULK ONE",
+               "a duplicate row must not overwrite the case already there: {first}");
+}
