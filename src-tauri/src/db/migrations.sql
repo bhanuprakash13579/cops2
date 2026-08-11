@@ -881,3 +881,22 @@ CREATE TABLE IF NOT EXISTS license_codes_used (
     kind             TEXT NOT NULL,
     used_at          TEXT NOT NULL
 );
+
+-- ── Frozen-register read indexes ─────────────────────────────────────────────
+-- BR and DR are no longer written to: the office books only OS in this app, and
+-- the two registers are kept for lookup. That makes read cost the only cost
+-- worth paying for here, since an index on a table nothing writes to is free
+-- apart from the disk it sits on.
+--
+-- The list pages order by date descending, over 334,546 baggage receipts, and
+-- no index covered that column at all — every page load sorted the whole
+-- register. Measured at real scale: 89 ms to 9 ms, and the query plan stops
+-- building a temp B-tree for the whole ORDER BY.
+--
+-- These supersede the single-column entry_deleted indexes, whose only use was
+-- a filter these cover with their leading column. Dropped rather than left to
+-- occupy space on 348,000 rows for nothing.
+CREATE INDEX IF NOT EXISTS ix_br_master_list ON br_master (entry_deleted, br_date DESC, br_no DESC);
+DROP INDEX IF EXISTS ix_br_master_deleted;
+CREATE INDEX IF NOT EXISTS ix_dr_master_list ON dr_master (entry_deleted, dr_date DESC, dr_no DESC);
+DROP INDEX IF EXISTS ix_dr_master_deleted;
