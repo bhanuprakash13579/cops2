@@ -320,6 +320,16 @@ pub async fn get_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): Pat
 }
 
 pub async fn create_os(State(pool): Db, auth: AuthUser, Json(mut req): Json<CreateOsRequest>) -> Result<Json<Value>, Err> {
+    // Who registered the case is part of the record, and a different officer
+    // adjudicates it later — booked_by and adj_offr_name are the two halves of
+    // that trail. booked_by was taken purely from the request body, so a client
+    // that did not send it left the column NULL and the case had no author at
+    // all. Fall back to whoever is signed in, which is the only party the server
+    // can actually vouch for.
+    if req.booked_by.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        req.booked_by = Some(auth.0.name.clone());
+    }
+
     // ── Business rule validations ─────────────────────────────────────────────
     req.passport_no = normalize_passport(req.passport_no);
     validate_flight_date(req.flight_date.as_deref())?;
@@ -1121,6 +1131,16 @@ pub async fn query_search(State(pool): Db, _auth: AuthUser, Json(body): Json<ser
     }
     like_cond!("flight_no",            "flight_no");
     like_cond!("country_of_departure", "country_of_departure");
+    // The two officers on a case are different people doing different jobs, and
+    // the register is asked about both: who adjudicated, and who booked it in.
+    // Only the adjudicating officer was reachable, and only through the general
+    // keyword box. Both are now filters in their own right.
+    //
+    // No schema change is involved — booked_by has always been a cops_master
+    // column, so it is already in every backup ever taken and an old archive
+    // restores with this searchable straight away.
+    like_cond!("adj_offr_name",        "adj_offr_name");
+    like_cond!("booked_by",            "booked_by");
 
     if let Some(from) = body.get("from_date").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         conditions.push("cm.os_date >= ?".to_string());
@@ -1159,9 +1179,10 @@ pub async fn query_search(State(pool): Db, _auth: AuthUser, Json(body): Json<ser
         let p = format!("%{}%", search);
         conditions.push(
             "(cm.os_no LIKE ? OR cm.pax_name LIKE ? OR cm.passport_no LIKE ? \
-              OR cm.flight_no LIKE ? OR cm.adj_offr_name LIKE ?)".to_string()
+              OR cm.flight_no LIKE ? OR cm.adj_offr_name LIKE ? \
+              OR cm.booked_by LIKE ?)".to_string()
         );
-        for _ in 0..5 { params.push(p.clone()); }
+        for _ in 0..6 { params.push(p.clone()); }
     }
 
     let where_clause = conditions.join(" AND ");

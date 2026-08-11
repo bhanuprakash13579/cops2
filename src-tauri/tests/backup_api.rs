@@ -1665,3 +1665,127 @@ async fn the_previous_receipts_lookup_finds_the_passenger_either_way() {
     let absent = get("Z0000000").await;
     assert_eq!(n(&absent), 0, "an unknown passport must find nothing: {absent}");
 }
+
+#[tokio::test]
+async fn the_registering_and_adjudicating_officers_are_both_recorded() {
+    // Different officers do the two jobs, and the case has to say who did which.
+    // booked_by was taken only from the request body, so a client that omitted it
+    // left the case with no author.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    // Register WITHOUT sending booked_by — the server must fill it from the session.
+    let r = c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "6001", "os_date": "2026-08-11", "os_year": 2026,
+            "pax_name": "TRAIL TEST", "passport_no": "T1112223",
+            "items": [{ "items_sno": 1, "items_desc": "LAPTOP", "items_qty": 1.0,
+                        "items_value": 80000.0, "items_release_category": "Under OS" }]
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "registering failed: {}", r.text().await.unwrap());
+
+    let case: serde_json::Value = c.get(format!("{base}/os/6001/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let booked = case["booked_by"].as_str().unwrap_or("");
+    assert!(!booked.is_empty(),
+            "the case must record who registered it even when the client sends nothing: {case}");
+
+    // Adjudicate as a different officer.
+    let r = c.post(format!("{base}/os/6001/2026/adjudicate")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "adj_offr_name": "ADJUDICATING OFFICER",
+            "adj_offr_designation": "Deputy Commissioner",
+            "adjn_offr_remarks": "Released on payment of duty."
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "adjudicating failed: {}", r.text().await.unwrap());
+
+    let done: serde_json::Value = c.get(format!("{base}/os/6001/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(done["booked_by"], booked,
+               "the registering officer must survive adjudication: {done}");
+    assert_eq!(done["adj_offr_name"], "ADJUDICATING OFFICER",
+               "the adjudicating officer must be recorded separately: {done}");
+    assert_ne!(done["booked_by"], done["adj_offr_name"],
+               "the two officers must be distinguishable on the record");
+}
+
+#[tokio::test]
+async fn an_export_case_prints_with_its_own_wording() {
+    // Export cases use different headings and a different from/to line. The
+    // template branches on case_type, so a case saved without it silently prints
+    // as an import.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    c.post(format!("{base}/os")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "os_no": "6002", "os_date": "2026-08-11", "os_year": 2026,
+            "pax_name": "EXPORT TEST", "passport_no": "E1112223",
+            "case_type": "EXPORT CASE", "port_of_destination": "SINGAPORE",
+            "items": [{ "items_sno": 1, "items_desc": "CURRENCY", "items_qty": 1.0,
+                        "items_value": 500000.0, "items_release_category": "Under OS" }]
+        })).send().await.unwrap();
+
+    let case: serde_json::Value = c.get(format!("{base}/os/6002/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(case["case_type"], "EXPORT CASE",
+               "case_type must be stored — the print branches on it: {case}");
+
+    let pdf = c.get(format!("{base}/os/6002/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&pdf[..4], b"%PDF");
+    assert_eq!(count_pdf_pages(&pdf), 2, "an export case is still two pages");
+}
+
+#[tokio::test]
+async fn cases_can_be_found_by_who_registered_them_as_well_as_who_adjudicated() {
+    // Two officers, two jobs, and the register is asked about both. Only the
+    // adjudicating officer was reachable before, and only through the keyword box.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    {
+        let conn = pool.get().unwrap();
+        for (no, booked, adj) in [
+            ("5001", "OFFICER ALPHA", "ADJUDICATOR ONE"),
+            ("5002", "OFFICER BRAVO", "ADJUDICATOR ONE"),
+            ("5003", "OFFICER ALPHA", "ADJUDICATOR TWO"),
+        ] {
+            conn.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, booked_by, adj_offr_name,
+                                          pax_name, entry_deleted, is_draft)
+                 VALUES (?,?,?,?,?,?,'N','N')",
+                rusqlite::params![no, 2026, "2026-08-11", booked, adj, format!("PAX {no}")],
+            ).unwrap();
+        }
+    }
+
+    let search = |body: serde_json::Value| {
+        let url = format!("{base}/os-query/search");
+        let c = c.clone(); let t = t.clone();
+        async move {
+            c.post(url).bearer_auth(t).json(&body).send().await.unwrap()
+                .json::<serde_json::Value>().await.unwrap()
+        }
+    };
+
+    // By who registered it — the new filter.
+    let r = search(serde_json::json!({ "booked_by": "OFFICER ALPHA" })).await;
+    assert_eq!(r["total"], 2, "two cases were registered by ALPHA: {r}");
+
+    // By who adjudicated it — now a filter in its own right, not just a keyword.
+    let r = search(serde_json::json!({ "adj_offr_name": "ADJUDICATOR TWO" })).await;
+    assert_eq!(r["total"], 1, "one case was adjudicated by TWO: {r}");
+
+    // Both together — the pair that identifies a single case.
+    let r = search(serde_json::json!({
+        "booked_by": "OFFICER ALPHA", "adj_offr_name": "ADJUDICATOR ONE"
+    })).await;
+    assert_eq!(r["total"], 1, "ALPHA registered one case that ONE adjudicated: {r}");
+
+    // And the general keyword box reaches the registering officer too.
+    let r = search(serde_json::json!({ "search": "BRAVO" })).await;
+    assert_eq!(r["total"], 1, "the keyword box should find the booking officer: {r}");
+}

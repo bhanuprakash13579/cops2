@@ -76,6 +76,8 @@ export default function OSQueryPage() {
     passport_no: '',
     flight_no: '',
     country_of_departure: '',
+    booked_by: '',
+    adj_offr_name: '',
     min_value: '',
     max_value: '',
     item_desc: '',
@@ -289,6 +291,17 @@ export default function OSQueryPage() {
               <input type="text" name="country_of_departure" value={formData.country_of_departure} onChange={handleInputChange} className="w-full bg-white border border-slate-300 shadow-sm rounded-md text-sm px-3 py-2 text-slate-800 placeholder-slate-400 focus:ring-emerald-500 focus:border-emerald-500 transition-shadow focus:shadow-md" placeholder="e.g. DUBAI" />
             </div>
 
+            {/* Officers — two different people do these two jobs, and the
+                register gets asked about both. */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Registered By</label>
+              <input type="text" name="booked_by" value={formData.booked_by} onChange={handleInputChange} className="w-full bg-white border border-slate-300 shadow-sm rounded-md text-sm px-3 py-2 text-slate-800 placeholder-slate-400 focus:ring-emerald-500 focus:border-emerald-500 transition-shadow focus:shadow-md" placeholder="Officer who booked the case" />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Adjudicated By</label>
+              <input type="text" name="adj_offr_name" value={formData.adj_offr_name} onChange={handleInputChange} className="w-full bg-white border border-slate-300 shadow-sm rounded-md text-sm px-3 py-2 text-slate-800 placeholder-slate-400 focus:ring-emerald-500 focus:border-emerald-500 transition-shadow focus:shadow-md" placeholder="Adjudicating officer" />
+            </div>
+
             {/* Goods / Value */}
             <div>
               <label className="block text-xs font-semibold text-slate-600 mb-1">Item Description</label>
@@ -315,7 +328,7 @@ export default function OSQueryPage() {
           <div className="flex justify-end border-t border-slate-100 pt-4">
             <button 
               type="button" 
-              onClick={() => setFormData({os_no:'', os_year:'', from_date:'', to_date:'', pax_name:'', passport_no:'', flight_no:'', country_of_departure:'', min_value:'', max_value:'', item_desc:'', case_type:''})}
+              onClick={() => setFormData({os_no:'', os_year:'', from_date:'', to_date:'', pax_name:'', passport_no:'', flight_no:'', country_of_departure:'', booked_by:'', adj_offr_name:'', min_value:'', max_value:'', item_desc:'', case_type:''})}
               className="px-4 py-2 text-sm font-medium text-slate-600 bg-white border border-slate-300 shadow-sm rounded-md hover:bg-slate-50 mr-3"
             >
               Clear
