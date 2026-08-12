@@ -1143,6 +1143,13 @@ pub async fn print_pdf(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): 
     let tcfg = crate::pdf::template_config(&conn, &as_of);
     case["__template_config"] = json!(tcfg);
 
+    // Worked out from the register, the way the screen does it — not read from
+    // the free-text columns, which nothing has maintained and which made the
+    // printed form disagree with the preview beside it.
+    let (same_pp, other_pp) = previous_offences(&conn, &case);
+    case["__prev_same_pp"] = json!(same_pp);
+    case["__prev_other_pp"] = json!(other_pp);
+
     let pdf_bytes = crate::pdf::generate_os_pdf(&case)
         .map_err(|e| e500(&format!("PDF generation failed: {e}")))?;
 
@@ -1931,4 +1938,167 @@ trait YearExt { fn year(&self) -> i64; fn month(&self) -> u32; }
 impl YearExt for chrono::DateTime<chrono::Local> {
     fn year(&self) -> i64 { chrono::Datelike::year(self) as i64 }
     fn month(&self) -> u32 { chrono::Datelike::month(self) }
+}
+
+// ── Previous offences, as the printed form must state them ───────────────────
+//
+// These two fields were read from `previous_visits` and `previous_os_details`,
+// free-text columns typed by hand years ago. The screen has never used them: it
+// works the answer out from the register each time it renders. So the officer
+// checked one thing on screen and handed the passenger a form saying something
+// else.
+//
+// The rules below are the screen's, ported unchanged, because they encode a
+// correction that was already made once. Unclaimed goods, cargo, and cases
+// booked with a placeholder name or passport must not be matched against each
+// other — otherwise every unclaimed case in the register becomes a "previous
+// offence" of every other, and a passenger is told they have a history that
+// belongs to a pile of abandoned baggage.
+
+/// Passport values that mean "there isn't one", not a passport.
+fn is_real_passport(pp: &str) -> bool {
+    const PLACEHOLDERS: &[&str] = &[
+        "NA", "N/A", "N.A", "N.A.", "NIL", "NONE", "NILL", "NULL",
+        "UNKNOWN", "NOT APPLICABLE", "NOTAPPLICABLE",
+        "NOT AVAILABLE", "NOTAVAILABLE", "0", "00", "000", "0000", "00000000",
+    ];
+    let s = pp.trim().to_uppercase();
+    if s.is_empty() || PLACEHOLDERS.contains(&s.as_str()) { return false; }
+    !(s.starts_with("UNCLAIM") || s.starts_with("CARGO") || s.starts_with("FREIGHT"))
+}
+
+/// Names that identify nobody, so must never be matched to another case.
+fn is_unclaimed_name(name: &str) -> bool {
+    const PLACEHOLDERS: &[&str] = &[
+        "na", "n/a", "n.a", "n.a.", "nil", "nill", "none", "unknown",
+        "not available", "not known", "notknown",
+    ];
+    let n = name.trim().to_lowercase();
+    if n.is_empty() || PLACEHOLDERS.contains(&n.as_str()) { return true; }
+    n.starts_with("unclaimed") || n.starts_with("cargo") || n.starts_with("freight")
+}
+
+
+/// Dates of birth that are placeholders rather than a date of birth.
+///
+/// Unclaimed and no-document cases get a filler date typed into this field. Two
+/// cases sharing 01/01/1900 are not the same person, and treating them as such
+/// is how a passenger ends up holding a form that lists someone else's history.
+/// A dummy here means identity was never established, so nothing is matched on
+/// it at all.
+fn is_real_dob(d: &str) -> bool {
+    const PLACEHOLDERS: &[&str] = &[
+        "1900-01-01", "1901-01-01", "1800-01-01", "0000-00-00", "1970-01-01",
+        "0001-01-01", "9999-12-31", "1899-12-30",
+    ];
+    let t = d.trim();
+    if t.is_empty() || PLACEHOLDERS.contains(&t) { return false; }
+    // Must look like a real ISO date before it is worth comparing.
+    t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-'
+        && t[0..4].bytes().all(|b| b.is_ascii_digit())
+}
+
+const PREV_DISPLAY_CAP: usize = 20;
+
+/// The two previous-offence lines for one case: (same passport, other passports).
+pub fn previous_offences(conn: &rusqlite::Connection, case: &Value) -> (String, String) {
+    let os_no   = case.get("os_no").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let os_year = case.get("os_year").and_then(|v| v.as_i64()).unwrap_or(0);
+    let os_date = case.get("os_date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let pp      = case.get("passport_no").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let name    = case.get("pax_name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let dob     = case.get("pax_date_of_birth").and_then(|v| v.as_str())
+        .map(str::trim).filter(|s| is_real_dob(s)).map(|s| s.to_string());
+
+    // ── Same passport, earlier than this case ────────────────────────────────
+    let same_pp = if is_real_passport(&pp) {
+        let mut found: Vec<(String, i64)> = Vec::new();
+        if let Ok(mut st) = conn.prepare(
+            "SELECT os_no, os_year, os_date FROM cops_master
+              WHERE entry_deleted='N' AND is_draft='N' AND passport_no = ?1
+              ORDER BY os_date DESC LIMIT 500")
+        {
+            if let Ok(rows) = st.query_map([&pp], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default()))
+            }) {
+                for (n, y, d) in rows.filter_map(|r| r.ok()) {
+                    if n == os_no && y == os_year { continue; }
+                    if !os_date.is_empty() && d.as_str() >= os_date.as_str() { continue; }
+                    found.push((n, y));
+                }
+            }
+        }
+        if found.is_empty() { "NIL".to_string() } else {
+            let shown: Vec<String> = found.iter().take(PREV_DISPLAY_CAP)
+                .map(|(n, y)| format!("{n}/{y}")).collect();
+            let over = found.len().saturating_sub(shown.len());
+            let suffix = if over > 0 { format!(", and {over} more") } else { String::new() };
+            format!("{} ({}{})", found.len(), shown.join(", "), suffix)
+        }
+    } else {
+        // A dummy passport identifies nobody. Matching on it would tie every
+        // unclaimed case in the register to every other.
+        "NIL".to_string()
+    };
+
+    // ── The same person under a different passport ───────────────────────────
+    let other_pp = if is_unclaimed_name(&name) {
+        "NIL".to_string()
+    } else {
+        let upper_name = name.to_uppercase();
+        let mut found: Vec<(String, String, i64)> = Vec::new();
+        if let Ok(mut st) = conn.prepare(
+            "SELECT os_no, os_year, pax_name, passport_no, pax_date_of_birth, os_date
+               FROM cops_master
+              WHERE entry_deleted='N' AND is_draft='N'
+                AND UPPER(pax_name) = ?1
+              ORDER BY os_date DESC LIMIT 500")
+        {
+            if let Ok(rows) = st.query_map([&upper_name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?.unwrap_or_default()))
+            }) {
+                for (n, y, other_name, other_pp_no, other_dob, other_date) in rows.filter_map(|r| r.ok()) {
+                    if n == os_no && y == os_year { continue; }
+                    // Only what was already on record when THIS case was booked.
+                    // The form is a statement of the passenger's history as it
+                    // stood that day; a copy reprinted years later must not grow
+                    // new prior offences that had not happened yet. The same
+                    // filter already guarded the same-passport list above.
+                    if !os_date.is_empty() && other_date.as_str() >= os_date.as_str() { continue; }
+                    // Same passport belongs to the field above; never both.
+                    if !pp.is_empty() && other_pp_no.trim() == pp { continue; }
+                    // A dummy passport on the other case identifies nobody either.
+                    if !is_real_passport(&other_pp_no) { continue; }
+                    let ok = match &dob {
+                        // A real date of birth on both sides, matching exactly,
+                        // with names all but identical.
+                        Some(d) => other_dob.as_deref().map(str::trim)
+                                .filter(|o| is_real_dob(o)) == Some(d.as_str())
+                            && name_score(&upper_name, &other_name.to_uppercase()) >= 0.90,
+                        // No usable date of birth means identity was never
+                        // established. A name on its own is not an identity —
+                        // two people share one often enough — and this is the
+                        // exact route by which the wrong history reached the
+                        // form before.
+                        None => false,
+                    };
+                    if ok { found.push((other_pp_no, n, y)); }
+                }
+            }
+        }
+        if found.is_empty() { "NIL".to_string() } else {
+            let shown: Vec<String> = found.iter().take(PREV_DISPLAY_CAP)
+                .map(|(p, n, y)| format!("{p} (OS {n}/{y})")).collect();
+            let over = found.len().saturating_sub(shown.len());
+            let suffix = if over > 0 { format!(", and {over} more") } else { String::new() };
+            format!("{}{}", shown.join(", "), suffix)
+        }
+    };
+
+    (same_pp, other_pp)
 }

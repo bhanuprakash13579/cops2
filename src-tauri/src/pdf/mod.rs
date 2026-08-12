@@ -150,6 +150,32 @@ fn esc(s: &str) -> String {
 /// the template writes `*{dr_no}/{dr_year}*`, an empty number left `*/`, and
 /// Typst reads `*/` as the end of a block comment it never saw opened. The whole
 /// print failed with a syntax error whose cause was a missing value.
+
+/// A date as the office writes it: 25/12/2026, not 2026-12-25.
+///
+/// The database stores ISO, which is right for storage and wrong on a form.
+/// COPS2 printed the stored string unchanged, so every date on the order came
+/// out in ISO while the same case on screen read normally — the officer and the
+/// passenger were looking at two different-looking documents. The Python app
+/// has always formatted these.
+///
+/// Anything that is not an ISO date is passed through untouched: "N.A." must
+/// stay "N.A.", and a legacy row holding an already-formatted value is left as
+/// it is rather than mangled.
+fn fmt_date(d: &str) -> String {
+    let t = d.trim();
+    if t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-' {
+        let (y, m, day) = (&t[0..4], &t[5..7], &t[8..10]);
+        if y.bytes().all(|b| b.is_ascii_digit())
+            && m.bytes().all(|b| b.is_ascii_digit())
+            && day.bytes().all(|b| b.is_ascii_digit())
+        {
+            return format!("{day}/{m}/{y}");
+        }
+    }
+    t.to_string()
+}
+
 fn str_val(v: &Value, k: &str) -> String {
     match v.get(k) {
         Some(Value::String(s)) => s.clone(),
@@ -350,8 +376,25 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     let dr_display = esc(&fmt_dr(&str_val(case, "post_adj_dr_no"), &str_val(case, "post_adj_dr_date")));
 
     // Previous offences (use stored fields — no live cross-query in PDF)
-    let prev_offence_display = { let v = str_val(case, "previous_visits"); if v.is_empty() { "NIL".into() } else { v } };
-    let other_pp_offences    = { let v = str_val(case, "previous_os_details"); if v.is_empty() { "NIL".into() } else { v } };
+    // Computed by the caller from the register. The legacy columns
+    // previous_visits and previous_os_details are only a fallback for a case
+    // printed outside that path — the screen has never trusted them, and a form
+    // that says something different from the screen beside it is worse than one
+    // that says nothing.
+    let prev_offence_display = {
+        let v = str_val(case, "__prev_same_pp");
+        if !v.is_empty() { v } else {
+            let l = str_val(case, "previous_visits");
+            if l.is_empty() { "NIL".into() } else { l }
+        }
+    };
+    let other_pp_offences = {
+        let v = str_val(case, "__prev_other_pp");
+        if !v.is_empty() { v } else {
+            let l = str_val(case, "previous_os_details");
+            if l.is_empty() { "NIL".into() } else { l }
+        }
+    };
 
     // ── Items pass — compute per-item display + summary totals ────────────────
     let empty_items = Value::Array(vec![]);
@@ -611,10 +654,15 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
 #table(
   columns: (24pt, 1fr, 72pt, 14%, 13%, 18%),
   align: (center, left, center, right, right, right),
-  [*S.No.*], [*Description of Goods*], [*Qty.*],
-  [*#text(size: 7pt)[{col_fa_hdr}]*],
-  [*#text(size: 7.5pt)[{col_duty_hdr}]*\ #v(2pt)#text(weight: "bold")[Value (in Rs.)]],
-  [*#text(size: 7pt)[{col_liable_hdr}]*\ Total Value (in Rs.)],
+  // The three money columns carry long headings in narrow cells. Centred, with
+  // their own tighter leading, they wrap into a block instead of drifting to one
+  // side and leaving the header row looking ragged.
+  table.cell(align: center)[*S.No.*],
+  table.cell(align: center)[*Description of Goods*],
+  table.cell(align: center)[*Qty.*],
+  table.cell(align: center + horizon)[#par(leading: 0.35em, justify: false)[*#text(size: 7pt)[{col_fa_hdr}]*]],
+  table.cell(align: center + horizon)[#par(leading: 0.35em, justify: false)[*#text(size: 7.5pt)[{col_duty_hdr}]*\ #v(2pt)#text(weight: "bold")[Value (in Rs.)]]],
+  table.cell(align: center + horizon)[#par(leading: 0.35em, justify: false)[*#text(size: 7pt)[{col_liable_hdr}]*\ Total Value (in Rs.)]],
   {rows_markup}
 )
 #v(4pt)
@@ -637,15 +685,18 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
 )
 #v(8pt)
 
-// Signatures row
+// Signatures row. These are signed by hand on the printed sheet, so the space
+// above each line matters more than tightening the layout — 8pt left a caption
+// with nowhere to sign.
+#v(26pt)
 #grid(columns: (1fr, 1fr),
   [*Name & Signature of Customs Officer*],
   align(right)[*Signature of Passenger*],
 )
-#v(8pt)
+#v(14pt)
 
 // Remarks
-*#underline[Remarks:]* {oinfo_supdts_remarks}
+#par(justify: true)[*#underline[Remarks:]* {oinfo_supdts_remarks}]
 
 #v(6pt)
 #align(right)[*{supdt_sig}*]
@@ -753,15 +804,15 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         oinfo_os_no     = esc(&os_no),
         oinfo_os_year   = os_year,
         oinfo_booked_by = esc(&booked_by),
-        oinfo_os_date   = esc(&os_date),
+        oinfo_os_date   = esc(&fmt_date(&os_date)),
         oinfo_pax_name_addr = esc(&pax_name_addr),
         oinfo_passport_no   = esc(&passport_no),
-        oinfo_passport_date = esc(&passport_date),
+        oinfo_passport_date = esc(&fmt_date(&passport_date)),
         oinfo_flight_no     = esc(&flight_no),
-        oinfo_flight_date   = esc(&flight_date),
+        oinfo_flight_date   = esc(&fmt_date(&flight_date)),
         oinfo_from_to       = esc(&from_to),
         oinfo_nationality   = esc(&nationality),
-        oinfo_date_dep      = esc(&date_of_dep),
+        oinfo_date_dep      = esc(&fmt_date(&date_of_dep)),
         oinfo_stay_text     = esc(&stay_text),
         oinfo_residence     = esc(&residence_at),
         oinfo_prev_visits   = esc(&previous_visits),
@@ -791,7 +842,7 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         waiver_txt2         = esc(&waiver_txt2),
         oinfo_adj_name      = esc(&adj_name),
         oinfo_adj_desig     = esc(&adj_desig),
-        oinfo_adj_date      = esc(&adj_date),
+        oinfo_adj_date      = esc(&fmt_date(&adj_date)),
         nb1_txt             = esc(&nb1_txt),
         nb2_txt             = esc(&nb2_txt),
         note_scn            = esc(&note_scn),

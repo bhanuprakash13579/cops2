@@ -362,8 +362,14 @@ export default function RestoreBackup() {
     setRegLoading(true);
     setRegMsg('');
     try {
-      const res = await api.post('/admin/devices', {}, { headers: adminHeaders(adminToken) });
-      setDeviceInfo(res.data);
+      // /admin/register-device is the one that registers THIS machine.
+      // /admin/devices adds an arbitrary row and answers with that row, so
+      // posting there left the panel holding a shape with no `registered` field
+      // — the machine really was authorised and the screen went on saying it
+      // was not. Read the status back from the endpoint that reports it.
+      await api.post('/admin/register-device', {}, { headers: adminHeaders(adminToken) });
+      const info = await api.get('/admin/device-info', { headers: adminHeaders(adminToken) });
+      setDeviceInfo(info.data);
       setRegMsg('Device registered. This machine is now authorised.');
     } catch (err: any) {
       setRegMsg(err.response?.data?.detail || 'Registration failed.');

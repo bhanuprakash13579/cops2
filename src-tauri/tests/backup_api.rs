@@ -3761,3 +3761,127 @@ async fn the_report_generator_answers_for_a_range() {
             "the report generator should answer or explain: {} {}",
             r.status(), r.text().await.unwrap());
 }
+
+#[tokio::test]
+async fn unclaimed_cases_are_never_treated_as_the_same_passenger() {
+    // Unclaimed goods are booked with a placeholder name and a dummy passport.
+    // Matching on either ties every unclaimed case in the register to every
+    // other, and a passenger is handed a form claiming a history that belongs to
+    // a pile of abandoned baggage. This was corrected once on screen; the
+    // printed form was still doing it.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    {
+        let conn = pool.get().unwrap();
+        // Three unclaimed cases, sharing the placeholder name and dummy passport
+        // exactly as the office records them.
+        for (n, nm, pp) in [
+            ("8801", "UNCLAIMED", "NA"),
+            ("8802", "UNCLAIMED", "NA"),
+            ("8803", "UNCLAIMED BAGGAGE", "UNCLAIMED"),
+        ] {
+            conn.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no,
+                                          entry_deleted, is_draft)
+                 VALUES (?,2026,'2026-03-01',?,?,'N','N')",
+                rusqlite::params![n, nm, pp]).unwrap();
+        }
+        // And a real passenger with two genuine visits on one passport.
+        for (n, d) in [("8804", "2026-01-10"), ("8805", "2026-05-20")] {
+            conn.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no,
+                                          pax_date_of_birth, entry_deleted, is_draft)
+                 VALUES (?,2026,?, 'GENUINE TRAVELLER', 'Z1234567', '1990-04-04', 'N','N')",
+                rusqlite::params![n, d]).unwrap();
+        }
+    }
+
+    let text_of = |no: String| {
+        let url = format!("{base}/os/{no}/2026/print-pdf");
+        let c = c.clone();
+        async move {
+            let pdf = c.get(url).bearer_auth(officer_token()).send().await.unwrap()
+                .bytes().await.unwrap();
+            assert_eq!(&pdf[..4], b"%PDF", "case {no} did not print");
+            let out = std::process::Command::new("pdftotext")
+                .args(["-", "-"]).stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped()).spawn()
+                .and_then(|mut ch| {
+                    use std::io::Write;
+                    ch.stdin.as_mut().unwrap().write_all(&pdf)?;
+                    ch.wait_with_output()
+                });
+            out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).ok()
+        }
+    };
+
+    let Some(unclaimed) = text_of("8802".to_string()).await else {
+        eprintln!("pdftotext unavailable — skipping"); return;
+    };
+    // The other two unclaimed cases must not appear anywhere on this form.
+    for ghost in ["8801", "8803"] {
+        assert!(!unclaimed.contains(&format!("{ghost}/2026")),
+                "an unclaimed case must not cite another unclaimed case as a previous \
+                 offence — found {ghost} on the form for 8802");
+    }
+
+    // The genuine repeat visitor still gets their real history.
+    let Some(genuine) = text_of("8805".to_string()).await else { return };
+    assert!(genuine.contains("8804/2026"),
+            "a real passenger's earlier case on the same passport must still be cited:\n{}",
+            &genuine[..genuine.len().min(600)]);
+}
+
+#[tokio::test]
+async fn an_old_case_reprinted_today_shows_only_what_was_known_then() {
+    // A form is a statement of the passenger's history on the day it was issued.
+    // Reprinting case 1/2025 in 2026 must not show it having acquired prior
+    // offences that had not happened yet — the copy in the file and the copy
+    // printed today have to say the same thing.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    {
+        let conn = pool.get().unwrap();
+        // One passenger, one passport, three visits either side of the middle one.
+        for (no, date) in [("1", "2024-06-01"), ("2", "2025-01-01"), ("3", "2026-03-01")] {
+            conn.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no,
+                                          pax_date_of_birth, entry_deleted, is_draft)
+                 VALUES (?,?,?, 'REPEAT TRAVELLER', 'P7654321', '1985-02-02', 'N','N')",
+                rusqlite::params![no, date[0..4].parse::<i64>().unwrap(), date]).unwrap();
+        }
+        // And the same person under a different passport, also on both sides.
+        for (no, date) in [("11", "2024-08-01"), ("12", "2026-05-01")] {
+            conn.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no,
+                                          pax_date_of_birth, entry_deleted, is_draft)
+                 VALUES (?,?,?, 'REPEAT TRAVELLER', 'Q1122334', '1985-02-02', 'N','N')",
+                rusqlite::params![no, date[0..4].parse::<i64>().unwrap(), date]).unwrap();
+        }
+    }
+
+    let pdf = c.get(format!("{base}/os/2/2025/print-pdf"))
+        .bearer_auth(officer_token()).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&pdf[..4], b"%PDF");
+    let Ok(out) = std::process::Command::new("pdftotext")
+        .args(["-", "-"]).stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped()).spawn()
+        .and_then(|mut ch| {
+            use std::io::Write;
+            ch.stdin.as_mut().unwrap().write_all(&pdf)?;
+            ch.wait_with_output()
+        }) else { eprintln!("pdftotext unavailable — skipping"); return };
+    let txt = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // What had happened before 01/01/2025.
+    assert!(txt.contains("1/2024"),
+            "the earlier visit on the same passport must be cited:\n{}", &txt[..txt.len().min(700)]);
+    assert!(txt.contains("Q1122334"),
+            "the earlier case under the other passport must be cited:\n{}", &txt[..txt.len().min(700)]);
+
+    // What had not happened yet.
+    assert!(!txt.contains("3/2026"),
+            "a case booked AFTER this one must not appear as a prior offence");
+    assert!(!txt.contains("12/2026"),
+            "nor one under another passport booked after this one");
+}

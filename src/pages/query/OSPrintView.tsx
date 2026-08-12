@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Printer } from 'lucide-react';
 import api from '../../lib/api';
 import { showDownloadToast } from '@/components/DownloadToast';
+import { fitToPrintedPages, PRINT_PAGE_CLASS } from '../../lib/fitToPrintedPages';
 
 export default function OSPrintView() {
   const { os_no, os_year } = useParams();
@@ -30,6 +31,10 @@ export default function OSPrintView() {
     if (s.includes('C') || s.includes('D') || s.includes('NIGHT')) return '(N)';
     return '';
   };
+
+  // Keep the print to two sheets. Costs nothing until the moment of
+  // printing: it only registers beforeprint listeners.
+  useEffect(() => fitToPrintedPages(), []);
 
   useEffect(() => {
     const fetchRecord = async () => {
@@ -143,17 +148,39 @@ export default function OSPrintView() {
             } else {
               const nameData = ppByNameResult.status === 'fulfilled' ? ppByNameResult.value?.data : null;
               const nameItems: any[] = nameData?.items ?? [];
-              const ourDob = fetchedData.pax_date_of_birth || null;
+              // A filler date of birth is not a date of birth. Unclaimed and
+              // no-document cases carry one, and two cases sharing 01/01/1900
+              // are not the same person. Without a usable date, identity was
+              // never established and nothing is matched — a name on its own is
+              // not an identity, which is how the wrong history reached this
+              // field once before.
+              const DOB_PLACEHOLDERS = new Set([
+                '1900-01-01', '1901-01-01', '1800-01-01', '0000-00-00',
+                '1970-01-01', '0001-01-01', '9999-12-31', '1899-12-30',
+              ]);
+              const isRealDob = (d: string | null | undefined): boolean => {
+                const t = (d || '').trim();
+                return !!t && !DOB_PLACEHOLDERS.has(t) && /^\d{4}-\d{2}-\d{2}/.test(t);
+              };
+              const ourDob = isRealDob(fetchedData.pax_date_of_birth)
+                ? fetchedData.pax_date_of_birth : null;
               const otherPassport = nameItems.filter((o: any) => {
                 if (o.os_no === fetchedData.os_no && o.os_year === fetchedData.os_year) return false;
+                // Only what was already on record when THIS case was booked.
+                // Reprinting an old order must not show it acquiring prior
+                // offences that had not happened yet — the same-passport list
+                // above has always been filtered this way.
+                if (!(new Date(o.os_date) < currentOsDate)) return false;
                 // Exclude same passport — those belong to "Prev. Offence"
                 if (currentPp && o.passport_no === currentPp) return false;
+                // The other case's passport must be a real one too.
+                if (!isRealPassport(o.passport_no)) return false;
                 if (ourDob) {
-                  if (!o.pax_date_of_birth || o.pax_date_of_birth !== ourDob) return false;
+                  if (!isRealDob(o.pax_date_of_birth)) return false;
+                  if (o.pax_date_of_birth !== ourDob) return false;
                   return nameScore(fetchedData.pax_name || '', o.pax_name || '') >= 0.90;
-                } else {
-                  return (o.pax_name || '').trim().toLowerCase() === paxNameLower;
                 }
+                return false;
               });
               if (otherPassport.length > 0) {
                 const shown = otherPassport.slice(0, DISPLAY_CAP);
@@ -465,13 +492,13 @@ export default function OSPrintView() {
       <div id="os-print-pages" className="max-w-[8.5in] mx-auto mt-8 print:mt-0 print:max-w-none print:w-[8.5in] text-black leading-tight print:leading-tight space-y-8 print:space-y-0" style={{ fontFamily: '"Times New Roman", Times, serif', fontSize: '10.5pt' }}>
         
         {/* --- PAGE 1: BOOKING REPORT --- */}
-        <div className="bg-white p-8 shadow-md print:shadow-none relative print:w-[8.5in] print:max-w-[8.5in] box-border print:px-6 print:py-4 flex flex-col print:block overflow-hidden print:overflow-hidden m-auto" style={{ pageBreakAfter: 'always' }}>
+        <div className={`${PRINT_PAGE_CLASS} bg-white p-8 shadow-md print:shadow-none relative print:w-[8.5in] print:max-w-[8.5in] box-border print:px-6 print:py-4 flex flex-col print:block overflow-hidden print:overflow-hidden m-auto`} style={{ pageBreakAfter: 'always' }}>
           
           {/* Header */}
           <div className="border-4 border-solid border-black p-2 flex items-center mb-4 min-h-[5rem]">
             {/* Real Logo */}
             <div className="w-1/6 flex justify-center">
-              <img src="/customs-logo.jpg" alt="Indian Customs Logo" className="w-16 h-16 object-contain grayscale print:grayscale" />
+              <img src="/customs-logo.png" alt="Indian Customs Logo" className="w-24 h-auto object-contain" />
             </div>
             {/* Header Text */}
             <div className="w-5/6 text-center font-bold flex flex-col justify-center">
@@ -646,7 +673,7 @@ export default function OSPrintView() {
         </div>
 
         {/* --- PAGE 2: ADJUDICATION ORDER --- */}
-        <div className="bg-white p-8 shadow-md print:shadow-none relative print:w-[8.5in] box-border print:px-6 print:py-4 flex flex-col print:block">
+        <div className={`${PRINT_PAGE_CLASS} bg-white p-8 shadow-md print:shadow-none relative print:w-[8.5in] box-border print:px-6 print:py-4 flex flex-col print:block`}>
           
           <div className="w-full text-center">
             <span className="font-bold">{p2OfficeHeading}</span>

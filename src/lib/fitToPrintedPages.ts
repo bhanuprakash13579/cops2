@@ -44,8 +44,17 @@ const CSS_PX_PER_IN = 96;
  */
 const SAFETY = 0.97;
 
-/** Below this the text stops being readable; an extra sheet is better. */
-const MIN_ZOOM = 0.62;
+/**
+ * The floor on shrinking. The form is two sheets of pre-printed stationery and
+ * a third is not an option — a filed copy that runs onto a page the form does
+ * not have is not the form. So this is a floor, not a bail-out: content that
+ * needs more than this is still shrunk to it, and the print stays two sheets.
+ *
+ * An earlier version gave up below 0.62 and let the browser paginate, on the
+ * reasoning that a readable third sheet beats an unreadable second one. That is
+ * true of a report and false of a legal form.
+ */
+const MIN_ZOOM = 0.42;
 
 const PRINTABLE_PX =
   (SHEET_HEIGHT_IN - MARGIN_TOP_IN - MARGIN_BOTTOM_IN) * CSS_PX_PER_IN * SAFETY;
@@ -67,12 +76,9 @@ function shrinkToFit(): void {
     if (height <= PRINTABLE_PX) continue;
 
     const needed = PRINTABLE_PX / height;
-    if (needed < MIN_ZOOM) {
-      // Too much content to shrink honestly. Leave it alone and let the browser
-      // paginate — a readable third sheet beats an unreadable second one.
-      continue;
-    }
-    page.style.zoom = String(Math.floor(needed * 1000) / 1000);
+    // Clamped, never abandoned: the sheet count is fixed and the text gives way.
+    const zoom = Math.max(needed, MIN_ZOOM);
+    page.style.zoom = String(Math.floor(zoom * 1000) / 1000);
   }
 }
 
