@@ -2784,3 +2784,127 @@ async fn a_second_download_is_served_from_the_work_already_done() {
     assert_ne!(&second[..], &third[..],
                "a case booked after the archive was built must appear in the next one");
 }
+
+// ── Case lifecycle: the actions that change a case after adjudication ─────────
+
+#[tokio::test]
+async fn quashing_a_case_marks_it_without_destroying_it() {
+    // Quashing sets an order aside. The case must stay on the record — the fact
+    // that it was quashed is itself part of the history — and must stop counting
+    // as an adjudicated case.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    book_and_adjudicate(&base).await;
+
+    let r = c.post(format!("{base}/os/7001/2026/quash"))
+        .bearer_auth(dc_token()).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "quash failed: {st} {body}");
+
+    // Quashing archives the case and then removes it from the live register —
+    // deliberate, and the same in the Python app. What must never happen is the
+    // removal without the archive: that would be a case erased with no trace.
+    let conn = pool.get().unwrap();
+    let live: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cops_master WHERE os_no='7001' AND os_year=2026",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(live, 0, "a quashed case leaves the live register");
+
+    let archived: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cops_master_deleted WHERE os_no='7001' AND os_year=2026",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(archived, 1, "but it MUST be in the archive — otherwise it is simply gone");
+
+    let pax: Option<String> = conn.query_row(
+        "SELECT pax_name FROM cops_master_deleted WHERE os_no='7001' AND os_year=2026",
+        [], |r| r.get(0)).unwrap();
+    assert!(pax.unwrap_or_default().len() > 0,
+            "the archived copy must carry the case's details, not just its number");
+
+    let items: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cops_items_deleted WHERE os_no='7001' AND os_year=2026",
+        [], |r| r.get(0)).unwrap_or(0);
+    assert!(items > 0, "the goods on the case must be archived too, not dropped");
+
+    // A quashed case is not an adjudicated one.
+    let list: serde_json::Value = c.get(format!("{base}/os?status=adjudicated"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let listed = list["items"].as_array()
+        .map(|a| a.iter().any(|x| x["os_no"] == "7001")).unwrap_or(false);
+    assert!(!listed, "a quashed case must leave the adjudicated list: {list}");
+}
+
+#[tokio::test]
+async fn an_os_number_already_in_use_is_reported_before_the_officer_types_the_rest() {
+    // The duplicate check the booking form calls as the number is entered. It is
+    // per year, because numbers restart.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "3401", "os_date": "2026-08-11",
+            "pax_name": "TAKEN", "passport_no": "T2223334"
+        })).send().await.unwrap();
+
+    let taken: serde_json::Value = c.get(format!("{base}/os/check-os-no?os_no=3401&os_year=2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(taken["exists"], true, "a number in use must be reported: {taken}");
+
+    let free: serde_json::Value = c.get(format!("{base}/os/check-os-no?os_no=3401&os_year=2025"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(free["exists"], false,
+               "the same number in another year is free — numbers restart: {free}");
+}
+
+#[tokio::test]
+async fn the_item_classifier_recognises_the_goods_the_office_actually_sees() {
+    // Fills the duty category as the officer types a description. Wrong here
+    // means the wrong duty on the form.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    for (desc, expect) in [
+        ("GOLD CHAIN 24K",        "Gold"),
+        ("MOBILE PHONE IPHONE",   "Cell Phones"),
+        ("MARLBORO CIGARETTES",   "Cigarettes"),
+        ("JOHNNIE WALKER WHISKY", "Liquor"),
+        ("SOMETHING UNHEARD OF",  "Miscellaneous"),
+    ] {
+        let r: serde_json::Value = c
+            .get(format!("{base}/os/classify-item?description={}", urlencoding::encode(desc)))
+            .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+        let got = r["duty_type"].as_str().unwrap_or("");
+        assert!(got.contains(expect),
+                "'{desc}' should classify as {expect}, got {got} — {r}");
+    }
+}
+
+#[tokio::test]
+async fn the_adjudication_queue_counts_match_the_lists_behind_them() {
+    // The sidebar numbers are what an officer trusts to know there is work
+    // waiting. A count that disagrees with its own list is worse than no count.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    for n in ["3501", "3502", "3503"] {
+        c.post(format!("{base}/os")).bearer_auth(officer_token())
+            .json(&serde_json::json!({
+                "os_no": n, "os_date": "2026-08-11",
+                "pax_name": format!("PAX {n}"), "passport_no": "Q3334445",
+                "items": [{ "items_sno": 1, "items_desc": "WATCH", "items_qty": 1.0,
+                            "items_value": 5000.0, "items_release_category": "Under OS" }]
+            })).send().await.unwrap();
+    }
+
+    let counts: serde_json::Value = c.get(format!("{base}/os/sidebar-counts"))
+        .bearer_auth(dc_token()).send().await.unwrap().json().await.unwrap();
+    let pending_count = counts["pending"].as_i64().unwrap_or(-1);
+
+    let list: serde_json::Value = c.get(format!("{base}/os?status=pending&per_page=100"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let pending_total = list["total"].as_i64().unwrap_or(-2);
+
+    assert_eq!(pending_count, pending_total,
+               "the badge and the list must agree: badge {pending_count}, list {pending_total}");
+    assert_eq!(pending_count, 3, "all three cases are waiting: {counts}");
+}

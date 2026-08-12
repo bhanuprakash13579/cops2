@@ -1081,6 +1081,17 @@ pub async fn quash_os(State(pool): Db, auth: AdjnUser, Path((os_no, os_year)): P
             rusqlite::params![auth.0.sub, today, os_no, os_year],
         ).map_err(|e| e500(&format!("Audit archive failed — quash aborted: {e}")))?;
 
+        // Archive the goods before removing them. The header was already copied
+        // into cops_master_deleted above, but the items were not — so a quashed
+        // case kept a record of the passenger and lost every trace of what was
+        // actually seized from them. cops_items_deleted has existed in the schema
+        // and in every backup all along; nothing had ever written to it.
+        conn.execute(
+            "INSERT INTO cops_items_deleted (os_no,os_date,os_year,location_code,items_sno,items_desc,items_qty,items_uqc,items_value,items_fa,items_duty,items_duty_type,items_category,items_release_category,items_sub_category,items_dr_no,items_dr_year,unique_no,entry_deleted,bkup_taken)
+             SELECT os_no,os_date,os_year,location_code,items_sno,items_desc,items_qty,items_uqc,items_value,items_fa,items_duty,items_duty_type,items_category,items_release_category,items_sub_category,items_dr_no,items_dr_year,unique_no,entry_deleted,bkup_taken FROM cops_items WHERE os_no=? AND os_year=?",
+            rusqlite::params![os_no, os_year],
+        ).map_err(|e| e500(&e.to_string()))?;
+
         conn.execute("DELETE FROM cops_items WHERE os_no=? AND os_year=?", rusqlite::params![os_no, os_year])
             .map_err(|e| e500(&e.to_string()))?;
         conn.execute("DELETE FROM cops_master WHERE os_no=? AND os_year=?", rusqlite::params![os_no, os_year])

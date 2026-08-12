@@ -74,6 +74,7 @@ encoding_rs      = "0.8"
 calamine         = { version = "0.25", features = ["dates"] }
 
 [dev-dependencies]
+urlencoding = "2"
 # Integration tests drive the real router over a real socket, so they need an
 # HTTP client. Both are already in the lock file — no new downloads.
 reqwest  = { version = "0.13", features = ["json", "multipart"] }
