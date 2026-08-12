@@ -881,7 +881,16 @@ pub async fn adjudicate(State(pool): Db, auth: AdjnUser, Path((os_no, os_year)):
     }
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let adj_date_val = req.adjudication_date.clone().unwrap_or(today);
+    let adj_date_val = req.adjudication_date.clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| today.clone());
+    // An order cannot be dated in the future. The Python app refuses this, and
+    // beyond being wrong on the face of the document it moves the 24-hour
+    // modification window forward with it — a case adjudicated "next month"
+    // stays editable until then.
+    if adj_date_val.as_str() > today.as_str() {
+        return Err(e400("Adjudication date cannot be in the future."));
+    }
     let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Only stamp adjudication_time on first adjudication

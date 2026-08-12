@@ -521,28 +521,16 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     let sum_liab_txt  = cfg("summary_liable_text", "Value of Goods Liable to Action under FEMA / Foreign Trade (D&R) Act, 1992 & Customs Act 1962");
     let supdt_sig     = cfg("supdt_sig_title", "Supdt. of Customs");
     let p2_office_hdr = cfg("p2_office_heading", "Office of the Deputy / Asst. Commissioner of Customs (Airport), Anna International airport, Chennai-600027.");
-    let waiver_hdr    = "WAIVER OF SHOW CAUSE NOTICE";
-    let waiver_txt1   = if is_export {
-        "The Charges have been orally communicated to me in respect of the goods mentioned overleaf and detained at the time of my departure. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing."
-    } else {
-        "The Charges have been orally communicated to me in respect of the goods mentioned overleaf and imported by me. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing."
-    };
-    let waiver_txt2   = "I was present during the personal hearing conducted by the Deputy / Asst. Commissioner and I was heard.";
-    let record_hdr    = "RECORD OF PERSONAL HEARING & FINDINGS";
-    let order_hdr     = "ORDER";
-    let nb1_txt       = "N.B: 1. This copy is granted free of charge for the private use of the person to whom it is issued.";
-    let nb2_txt       = "2. An Appeal against this Order shall lie before the Commissioner of Customs (Appeals), Custom House, Chennai-600 001 on payment of 7.5% of the duty demanded where duty or duty and penalty are in dispute, or penalty, where penalty alone is in dispute. The Appeal shall be filed within 60 days provided under Section 128 of the Customs Act, 1962 from the date of receipt of this Order.";
+    let waiver_hdr    = cfg("p2_waiver_heading", "WAIVER OF SHOW CAUSE NOTICE");
+    let waiver_txt1   = if is_export { cfg("export_waiver_text_1", "The Charges have been orally communicated to me in respect of the goods mentioned overleaf and detained at the time of my departure. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing.") } else { cfg("waiver_text_1", "The Charges have been orally communicated to me in respect of the goods mentioned overleaf and imported by me. Orders in the case may please be passed without issue of Show Cause Notice. However I may kindly be given a Personal Hearing.") };
+    let waiver_txt2   = cfg("waiver_text_2", "I was present during the personal hearing conducted by the Deputy / Asst. Commissioner and I was heard.");
+    let record_hdr    = cfg("record_heading", "RECORD OF PERSONAL HEARING & FINDINGS");
+    let order_hdr     = cfg("order_heading", "ORDER");
+    let nb1_txt       = cfg("nb1_text", "N.B: 1. This copy is granted free of charge for the private use of the person to whom it is issued.");
+    let nb2_txt       = cfg("nb2_text", "2. An Appeal against this Order shall lie before the Commissioner of Customs (Appeals), Custom House, Chennai-600 001 on payment of 7.5% of the duty demanded where duty or duty and penalty are in dispute, or penalty, where penalty alone is in dispute. The Appeal shall be filed within 60 days provided under Section 128 of the Customs Act, 1962 from the date of receipt of this Order.");
     let note_scn      = cfg("note_scn_waived", "Note: The issue of Show Cause Notice was waived at the instance of the Passenger.");
-    let legal_p1      = if is_export {
-        "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962."
-    } else {
-        "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992 read with the Rules framed thereunder, also read with Section 11(2)(u) of Customs Act, 1962, import of 'goods in commercial quantity / goods in the nature of non-bonafide baggage' is not permitted without a valid import licence, though exemption exists under clause 3(h) of the Foreign Trade (Exemption from application of Rules in certain cases) order 1993 for import of goods by a passenger from abroad only to the extent admissible under the Baggage Rules framed under Section 79 of the Customs Act, 1962."
-    };
-    let legal_p2      = if is_export {
-        "Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under Section 113 of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992."
-    } else {
-        "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992."
-    };
+    let legal_p1      = if is_export { cfg("export_legal_para_1", "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.") } else { cfg("legal_para_1", "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992 read with the Rules framed thereunder, also read with Section 11(2)(u) of Customs Act, 1962, import of 'goods in commercial quantity / goods in the nature of non-bonafide baggage' is not permitted without a valid import licence, though exemption exists under clause 3(h) of the Foreign Trade (Exemption from application of Rules in certain cases) order 1993 for import of goods by a passenger from abroad only to the extent admissible under the Baggage Rules framed under Section 79 of the Customs Act, 1962.") };
+    let legal_p2      = if is_export { cfg("export_legal_para_2", "Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under Section 113 of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.") } else { cfg("legal_para_2", "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.") };
     let deputy_sig    = cfg("deputy_sig_title", "Deputy / Asst. Commissioner of Customs (Airport)");
     let bottom_nb1    = cfg("bottom_nb1", "N.B: 1. Perishables will be disposed off within seven days from the date of detention.");
     let bottom_nb2    = if !is_export { "2. Where re-export is permitted, the passenger is advised to intimate the date of departure of flight atleast 48 hours in advance." } else { "" };
@@ -785,20 +773,20 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         p2_office_hdr       = esc(&p2_office_hdr),
         oinfo_pax_name      = esc(&pax_name),
         day_night           = day_night,
-        waiver_hdr          = esc(waiver_hdr),
-        waiver_txt1         = esc(waiver_txt1),
-        waiver_txt2         = esc(waiver_txt2),
+        waiver_hdr          = esc(&waiver_hdr),
+        waiver_txt1         = esc(&waiver_txt1),
+        waiver_txt2         = esc(&waiver_txt2),
         oinfo_adj_name      = esc(&adj_name),
         oinfo_adj_desig     = esc(&adj_desig),
         oinfo_adj_date      = esc(&adj_date),
-        nb1_txt             = esc(nb1_txt),
-        nb2_txt             = esc(nb2_txt),
+        nb1_txt             = esc(&nb1_txt),
+        nb2_txt             = esc(&nb2_txt),
         note_scn            = esc(&note_scn),
-        legal_p1            = esc(legal_p1),
-        legal_p2            = esc(legal_p2),
-        record_hdr          = esc(record_hdr),
+        legal_p1            = esc(&legal_p1),
+        legal_p2            = esc(&legal_p2),
+        record_hdr          = esc(&record_hdr),
         oinfo_adj_remarks   = esc(&adj_remarks),
-        order_hdr           = esc(order_hdr),
+        order_hdr           = esc(&order_hdr),
         order_paras         = order_paras,
         deputy_sig          = esc(&deputy_sig),
         bottom_nb1          = esc(&bottom_nb1),
@@ -842,9 +830,26 @@ pub fn compile_typst(source_text: &str) -> Result<Vec<u8>> {
 /// at 9pt, the old fixed size, so a three-item case could never grow into the
 /// space it had and printed small with most of the page empty. The Python app
 /// searches from 11pt for the same reason.
+/// Text sizes for the form, largest first.
+///
+/// 12pt is the ceiling, not 14. The form's column widths were drawn around a
+/// 9-11pt body, and at 14pt "S.No" collides with the description column and the
+/// office heading wraps to two lines — bigger, but visibly wrong. 12pt fills the
+/// page with the header still on one line. Below 5.5pt the form stops being
+/// readable and there is no point pretending otherwise.
 const OS_SIZE_LADDER: &[f64] = &[
-    11.0, 10.5, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5,
+    12.0, 11.5, 11.0, 10.5, 10.0, 9.5,
+    9.0, 8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5,
 ];
+
+/// How far apart the two pages may be.
+///
+/// Page 1 is the booking and usually short; page 2 is the order and usually
+/// full. Sizing them independently lets page 1 fill its space instead of being
+/// held down by page 2 — but past a couple of points the difference stops
+/// looking like a well-set form and starts looking like two documents stapled
+/// together. Page 1 is pulled back down to within this of page 2.
+const MAX_PAGE_SIZE_GAP: f64 = 2.0;
 
 /// Generate a 2-page legal-size OS PDF using Typst.
 /// `case` is the full cops_master JSON row with an `items` array attached.
@@ -884,6 +889,14 @@ pub fn generate_os_pdf(case: &Value) -> Result<Vec<u8>> {
     };
     let mut p1 = fit(1)?;
     let mut p2 = fit(2)?;
+
+    // Page 1 may be larger than page 2 — it usually has room to be — but only
+    // so much larger.
+    if p1 - p2 > MAX_PAGE_SIZE_GAP {
+        p1 = OS_SIZE_LADDER.iter().copied()
+            .find(|s| *s <= p2 + MAX_PAGE_SIZE_GAP)
+            .unwrap_or(p2);
+    }
 
     // Each page fit alone; the combined document is checked and stepped down if
     // the pair still overflows, up to three times, as the Python app does.

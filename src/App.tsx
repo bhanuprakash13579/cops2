@@ -257,25 +257,39 @@ function BackendGate({ children }: { children: React.ReactNode }) {
     }
 
     const poll = async () => {
-      // Fast path: if backend is already up (e.g. app restart), skip splash entirely
-      try {
-        await api.get('/mode', { timeout: 500 });
-        if (!cancelled) setReady(true);
-        return;
-      } catch { /* not ready yet — fall through to normal polling with splash */ }
+      const started = Date.now();
 
-      // Backend is starting — show splash and poll until it responds
+      // Ask straight away and keep asking quickly. The backend runs in this same
+      // process, so it is usually answering within tens of milliseconds — an
+      // 800ms gap between attempts meant the app could be ready and still sit on
+      // the splash for most of a second, which is the whole of what an officer
+      // experiences as a slow start.
+      for (let waited = 0; !cancelled && waited < 1500; waited += 40) {
+        try {
+          await api.get('/mode', { timeout: 1500 });
+          if (!cancelled) setReady(true);   // no fade: nothing was really shown
+          return;
+        } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 40));
+      }
+
+      // A genuinely slow start. Now the splash earns its place, and the fade is
+      // worth having because the officer has actually been looking at it.
       dotTimer = setInterval(() => setDots((d: string) => d.length >= 3 ? '' : d + '.'), 500);
       while (!cancelled) {
         try {
           await api.get('/mode', { timeout: 5000 });
           if (!cancelled) {
-            setFadeOut(true);
-            setTimeout(() => { if (!cancelled) setReady(true); }, 300);
+            if (Date.now() - started > 1800) {
+              setFadeOut(true);
+              setTimeout(() => { if (!cancelled) setReady(true); }, 300);
+            } else {
+              setReady(true);
+            }
           }
           return;
         } catch {
-          await new Promise(r => setTimeout(r, 800));
+          await new Promise(r => setTimeout(r, 200));
         }
       }
     };

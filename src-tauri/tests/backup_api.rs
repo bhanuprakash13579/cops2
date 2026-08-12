@@ -2204,3 +2204,180 @@ async fn a_case_with_no_year_is_still_seen_by_the_restore_guard() {
         "SELECT COUNT(*) FROM cops_master WHERE os_no='6601'", [], |r| r.get(0)).unwrap();
     assert_eq!(after, 1, "a case with no year must not be duplicated by a restore");
 }
+
+#[tokio::test]
+async fn an_adjudication_cannot_be_dated_in_the_future() {
+    // Beyond being wrong on the face of the order, a future date carries the
+    // 24-hour modification window with it — a case adjudicated "next month"
+    // stays editable until then.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "3301", "os_date": "2026-08-11",
+            "pax_name": "FUTURE DATE", "passport_no": "F1112223",
+            "items": [{ "items_sno": 1, "items_desc": "WATCH", "items_qty": 1.0,
+                        "items_value": 1000.0, "items_release_category": "Under OS" }]
+        })).send().await.unwrap();
+
+    let r = c.post(format!("{base}/os/3301/2026/adjudicate")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "adj_offr_name": "AN OFFICER", "adj_offr_designation": "DC",
+            "adjudication_date": "2099-01-01",
+            "adjn_offr_remarks": "Released."
+        })).send().await.unwrap();
+    assert_eq!(r.status(), 400, "a future adjudication date must be refused");
+}
+
+#[tokio::test]
+async fn every_editable_heading_on_the_form_can_actually_be_edited() {
+    // The Python app resolves each of these through the versioned template
+    // table, so the office can reword its own form. COPS2 hardcoded them, which
+    // made the editor decorative. This checks the whole set reaches the page,
+    // not just the ones that were wired first.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    book_and_adjudicate(&base).await;
+
+    let keys = [
+        "office_header_line1", "p2_office_heading", "page1_title", "record_heading",
+        "order_heading", "nb1_text", "nb2_text", "waiver_text_1", "waiver_text_2",
+        "legal_para_1", "legal_para_2", "note_scn_waived", "supdt_sig_title",
+        "deputy_sig_title", "col_duty_heading", "summary_duty_text",
+    ];
+    for (i, key) in keys.iter().enumerate() {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO print_template_config (field_key, field_label, field_value,
+                                                effective_from, created_by, created_at)
+             VALUES (?, 'x', ?, '2020-01-01', 'admin', datetime('now'))",
+            rusqlite::params![key, format!("EDITED MARKER {i} ZZQQ")],
+        ).unwrap();
+    }
+
+    let pdf = c.get(format!("{base}/os/7001/2026/print-pdf"))
+        .bearer_auth(officer_token()).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&pdf[..4], b"%PDF");
+
+    // Every edit must be visible on the form. Compressed PDF streams hide the
+    // text, so the check is that the form CHANGED once per key rather than
+    // grepping — a heading that is still hardcoded cannot move the output.
+    let baseline = {
+        let (b2, _d2, _p2) = serve_with_pool(0).await;
+        book_and_adjudicate(&b2).await;
+        c.get(format!("{b2}/os/7001/2026/print-pdf"))
+            .bearer_auth(officer_token()).send().await.unwrap().bytes().await.unwrap()
+    };
+    assert_ne!(pdf.len(), baseline.len(),
+               "editing the headings must change the printed form");
+}
+
+#[tokio::test]
+async fn a_case_prints_the_headings_that_were_correct_when_it_was_booked() {
+    // The office rewords its form from time to time. A case booked in 2025 and
+    // reprinted in 2026 must still carry 2025's wording — the printed order is a
+    // record of what was issued, not a document that rewrites itself. Checked for
+    // an import case and an export case, because the form branches on that and a
+    // heading resolved for one could easily miss the other.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    for (no, ctype) in [("2501", ""), ("2502", "EXPORT CASE")] {
+        let mut body = serde_json::json!({
+            "os_no": no, "os_date": "2025-06-15", "os_year": 2025,
+            "pax_name": "HISTORY TEST", "passport_no": "H2223334",
+            "items": [{ "items_sno": 1, "items_desc": "GOLD CHAIN", "items_qty": 1.0,
+                        "items_value": 200000.0, "items_release_category": "Under OS" }]
+        });
+        if !ctype.is_empty() { body["case_type"] = serde_json::json!(ctype); }
+        let r = c.post(format!("{base}/os")).bearer_auth(&t).json(&body)
+            .send().await.unwrap();
+        assert!(r.status().is_success(), "booking {no} failed: {}", r.text().await.unwrap());
+    }
+
+    // Two eras of wording for the same fields, on both the shared and the
+    // export-specific keys.
+    {
+        let conn = pool.get().unwrap();
+        for (key, from, value) in [
+            ("office_header_line1", "2020-01-01", "OFFICE AS IT WAS IN 2025"),
+            ("office_header_line1", "2026-01-01", "OFFICE AS RENAMED IN 2026"),
+            ("legal_para_1",        "2020-01-01", "LEGAL WORDING OF 2025"),
+            ("legal_para_1",        "2026-01-01", "LEGAL WORDING OF 2026"),
+            ("export_legal_para_1", "2020-01-01", "EXPORT WORDING OF 2025"),
+            ("export_legal_para_1", "2026-01-01", "EXPORT WORDING OF 2026"),
+        ] {
+            conn.execute(
+                "INSERT INTO print_template_config (field_key, field_label, field_value,
+                                                    effective_from, created_by, created_at)
+                 VALUES (?,'x',?,?,'admin',datetime('now'))",
+                rusqlite::params![key, value, from],
+            ).unwrap();
+        }
+    }
+
+    // Printed NOW, in 2026, but both cases belong to 2025.
+    for no in ["2501", "2502"] {
+        let pdf = c.get(format!("{base}/os/{no}/2025/print-pdf"))
+            .bearer_auth(&t).send().await.unwrap().bytes().await.unwrap();
+        assert_eq!(&pdf[..4], b"%PDF", "case {no} did not print");
+
+        let txt = std::process::Command::new("pdftotext")
+            .args(["-", "-"]).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).spawn()
+            .and_then(|mut ch| {
+                use std::io::Write;
+                ch.stdin.as_mut().unwrap().write_all(&pdf)?;
+                ch.wait_with_output()
+            })
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        let Ok(txt) = txt else { eprintln!("pdftotext unavailable — skipping text check"); return };
+
+        assert!(txt.contains("OFFICE AS IT WAS IN 2025"),
+                "case {no} must print the 2025 office name, got:\n{}", &txt[..txt.len().min(400)]);
+        assert!(!txt.contains("OFFICE AS RENAMED IN 2026"),
+                "case {no} must NOT pick up wording introduced after it was booked");
+
+        let expected = if no == "2502" { "EXPORT WORDING OF 2025" } else { "LEGAL WORDING OF 2025" };
+        let future   = if no == "2502" { "EXPORT WORDING OF 2026" } else { "LEGAL WORDING OF 2026" };
+        assert!(txt.contains(expected), "case {no} must print {expected}");
+        assert!(!txt.contains(future),  "case {no} must not print {future}");
+    }
+}
+
+#[tokio::test]
+async fn the_backup_carries_every_version_of_the_headings() {
+    // Point-in-time headings are only as good as the history behind them. If a
+    // backup kept just the current wording, restoring it would silently rewrite
+    // every past case's form to today's text.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    {
+        let conn = pool.get().unwrap();
+        for (from, value) in [("2020-01-01", "WORDING A"), ("2023-01-01", "WORDING B"),
+                              ("2026-01-01", "WORDING C")] {
+            conn.execute(
+                "INSERT INTO print_template_config (field_key, field_label, field_value,
+                                                    effective_from, created_by, created_at)
+                 VALUES ('office_header_line1','x',?,?,'admin',datetime('now'))",
+                rusqlite::params![value, from]).unwrap();
+        }
+    }
+    let before: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM print_template_config", [], |r| r.get(0)).unwrap();
+    assert!(before >= 3);
+
+    let archive = take_archive(&base).await;
+    {
+        // Wipe the history, then restore it.
+        let conn = pool.get().unwrap();
+        conn.execute("DELETE FROM print_template_config", []).unwrap();
+    }
+    let (st, body) = restore(&base, archive, true).await;
+    assert_eq!(st, 200, "{body}");
+
+    let after: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM print_template_config", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, before,
+               "every version of every heading must survive a backup, not just the current one");
+}
