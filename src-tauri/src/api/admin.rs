@@ -613,11 +613,49 @@ pub async fn purge_os(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_
     deleted.insert("cops_master_deleted".into(), json!(del("DELETE FROM cops_master_deleted WHERE os_no=? AND os_year=?", &[&os_no, &os_year])));
     deleted.insert("cops_master".into(),         json!(del("DELETE FROM cops_master WHERE os_no=? AND os_year=?", &[&os_no, &os_year])));
 
-    // BR/DR linked via post_adj fields (best-effort)
-    del("DELETE FROM br_items WHERE br_no IN (SELECT br_no FROM br_master WHERE os_no=?)", &[&os_no]);
-    del("DELETE FROM br_master WHERE os_no=?", &[&os_no]);
-    del("DELETE FROM dr_items WHERE dr_no IN (SELECT dr_no FROM dr_master WHERE os_no=?)", &[&os_no]);
-    del("DELETE FROM dr_master WHERE os_no=?", &[&os_no]);
+    // Receipts linked to THIS case, and only this case.
+    //
+    // These four statements used to match on os_no alone, with no year, and the
+    // items by br_no alone. O.S. numbers restart every year and so do receipt
+    // numbers, so purging case 100/2026 also destroyed the baggage and detention
+    // receipts of case 100/2025, 100/2024, and every receipt in any year that
+    // happened to reuse the same number. The one operation in the application
+    // that deletes permanently was the one least careful about what it matched.
+    //
+    // Now the receipts belonging to this case are looked up by (os_no, os_year)
+    // and removed by their own key, so nothing outside the case is touched.
+    for (master, items, no_col, year_col, date_col) in [
+        ("br_master", "br_items", "br_no", "br_year", "br_date"),
+        ("dr_master", "dr_items", "dr_no", "dr_year", "dr_date"),
+    ] {
+        let keys: Vec<(String, String)> = {
+            let Ok(mut st) = conn.prepare(&format!(
+                "SELECT {no_col}, COALESCE({date_col},'') FROM {master} WHERE os_no=? AND os_year=?"
+            )) else { continue };
+            let rows = st.query_map(rusqlite::params![os_no, os_year], |r| {
+                Ok((crate::api::col_text(r, 0)?.unwrap_or_default(),
+                    r.get::<_, String>(1)?))
+            });
+            match rows {
+                Ok(it) => it.filter_map(|r| r.ok()).collect(),
+                Err(_) => continue,
+            }
+        };
+        let mut item_rows = 0i64;
+        let mut master_rows = 0i64;
+        for (no, date) in &keys {
+            item_rows += conn.execute(
+                &format!("DELETE FROM {items} WHERE {no_col}=? AND {date_col}=?"),
+                rusqlite::params![no, date],
+            ).unwrap_or(0) as i64;
+        }
+        master_rows += conn.execute(
+            &format!("DELETE FROM {master} WHERE os_no=? AND {year_col} IS NOT NULL AND os_year=?"),
+            rusqlite::params![os_no, os_year],
+        ).unwrap_or(0) as i64;
+        if item_rows  > 0 { deleted.insert(items.into(),  json!(item_rows)); }
+        if master_rows > 0 { deleted.insert(master.into(), json!(master_rows)); }
+    }
 
     let total_rows_deleted: i64 = deleted.values()
         .filter_map(|v| v.as_i64())

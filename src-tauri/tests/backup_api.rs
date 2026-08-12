@@ -2513,3 +2513,111 @@ async fn signing_in_works_and_a_wrong_password_is_refused() {
     assert!(bad.status() == 401 || bad.status() == 400,
             "a wrong password must be refused, got {}", bad.status());
 }
+
+#[tokio::test]
+async fn purging_one_case_leaves_every_other_year_untouched() {
+    // Needs the admin password, which lives in the environment and never in the
+    // source. Without it there is nothing meaningful to assert.
+    if std::env::var("ADMIN_PASSWORD").is_err() {
+        eprintln!("skipping: ADMIN_PASSWORD not set");
+        return;
+    }
+    // The only operation that deletes permanently. It matched receipts on os_no
+    // alone, with no year, and their items on the receipt number alone — and
+    // both O.S. numbers and receipt numbers restart every year. Purging case
+    // 100/2026 therefore destroyed the receipts of 100/2025 and of any year that
+    // reused the number. This is the test that would have caught it.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    {
+        let c = pool.get().unwrap();
+        // The same O.S. number in two years, each with its own receipt, and both
+        // receipts sharing a number as they naturally would across years.
+        for year in [2025i64, 2026] {
+            c.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, entry_deleted, is_draft)
+                 VALUES ('100', ?, ?, ?, 'N', 'N')",
+                rusqlite::params![year, format!("{year}-06-01"), format!("CASE OF {year}")],
+            ).unwrap();
+            c.execute(
+                "INSERT INTO br_master (br_no, br_year, br_date, br_type, pax_name,
+                                        os_no, os_year, entry_deleted)
+                 VALUES (77, ?, ?, 'D', ?, '100', ?, 'N')",
+                rusqlite::params![year, format!("{year}-06-01"), format!("PAX {year}"), year],
+            ).unwrap();
+            c.execute(
+                "INSERT INTO br_items (br_no, br_year, br_date, br_type, items_sno, items_desc)
+                 VALUES (77, ?, ?, 'D', 1, ?)",
+                rusqlite::params![year, format!("{year}-06-01"), format!("GOODS OF {year}")],
+            ).unwrap();
+        }
+    }
+    let count = |sql: &str| -> i64 {
+        pool.get().unwrap().query_row(sql, [], |r| r.get(0)).unwrap_or(-1)
+    };
+    assert_eq!(count("SELECT COUNT(*) FROM br_master WHERE br_no=77"), 2);
+    assert_eq!(count("SELECT COUNT(*) FROM br_items  WHERE br_no=77"), 2);
+
+    let r = reqwest::Client::new()
+        .post(format!("{base}/admin/purge-os"))
+        .bearer_auth(admin_token())
+        .json(&serde_json::json!({
+            // The password is never written down here. The app reads it from
+            // ADMIN_PASSWORD when no hash was baked in, so the test sets the same
+            // variable and uses that — nothing secret enters the repository.
+            "os_no": "100", "os_year": 2026,
+            "admin_password": std::env::var("ADMIN_PASSWORD").unwrap_or_default()
+        }))
+        .send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(st, 200, "purge failed: {body}");
+
+    // The 2026 case and its receipt are gone.
+    assert_eq!(count("SELECT COUNT(*) FROM cops_master WHERE os_no='100' AND os_year=2026"), 0,
+               "the purged case must be gone");
+    assert_eq!(count("SELECT COUNT(*) FROM br_master WHERE br_no=77 AND br_year=2026"), 0,
+               "its own receipt must go with it");
+
+    // Everything belonging to 2025 must still be there.
+    assert_eq!(count("SELECT COUNT(*) FROM cops_master WHERE os_no='100' AND os_year=2025"), 1,
+               "the case of another year must survive");
+    assert_eq!(count("SELECT COUNT(*) FROM br_master WHERE br_no=77 AND br_year=2025"), 1,
+               "and its receipt");
+    assert_eq!(count("SELECT COUNT(*) FROM br_items WHERE br_no=77 AND br_year=2025"), 1,
+               "and the goods on that receipt");
+}
+
+#[tokio::test]
+async fn a_deleted_case_is_kept_not_destroyed() {
+    // Deleting a case inside the window is a correction, not a purge — the record
+    // has to remain recoverable and say who removed it and why.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    book_and_adjudicate(&base).await;
+
+    let r = c.delete(format!("{base}/os/7001/2026?reason=Entered%20against%20the%20wrong%20passenger"))
+        .bearer_auth(officer_token())
+        .send().await.unwrap();
+    assert!(r.status().is_success(), "delete failed: {}", r.text().await.unwrap());
+
+    let conn = pool.get().unwrap();
+    let still_there: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cops_master WHERE os_no='7001' AND os_year=2026", [], |r| r.get(0)).unwrap();
+    assert_eq!(still_there, 1, "the row must remain — a delete here is a soft delete");
+
+    let flag: String = conn.query_row(
+        "SELECT entry_deleted FROM cops_master WHERE os_no='7001' AND os_year=2026", [], |r| r.get(0)).unwrap();
+    assert_eq!(flag, "Y", "and be marked deleted");
+
+    let reason: Option<String> = conn.query_row(
+        "SELECT deleted_reason FROM cops_master WHERE os_no='7001' AND os_year=2026", [], |r| r.get(0)).unwrap();
+    assert!(reason.unwrap_or_default().contains("wrong passenger"),
+            "the reason must be kept with the record");
+
+    // And it must not come back in the ordinary list.
+    let list: serde_json::Value = c.get(format!("{base}/os?status=adjudicated"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let found = list["items"].as_array().map(|a|
+        a.iter().any(|x| x["os_no"] == "7001")).unwrap_or(false);
+    assert!(!found, "a deleted case must not appear in the register: {list}");
+}
