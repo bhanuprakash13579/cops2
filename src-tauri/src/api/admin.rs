@@ -718,3 +718,56 @@ pub async fn get_db_cipher_key(_admin: AdminUser) -> Json<Value> {
     }))
 }
 
+
+/// Look for records that reference something no longer there.
+///
+/// The purge used to delete baggage and detention receipts without matching on
+/// the year, so purging one case could remove the receipts of a case in another
+/// year that happened to share a number. That scoping is fixed, but a database
+/// this ran against would already carry the damage, and the damage has a
+/// fingerprint: a case that names a receipt the register no longer holds, or an
+/// item whose parent has gone.
+///
+/// Read-only. It answers "did anything get lost", which is not a question the
+/// row counts alone can settle.
+pub async fn integrity_check(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+
+    let orphan_br_items = count(
+        "SELECT COUNT(*) FROM br_items i
+          WHERE NOT EXISTS (SELECT 1 FROM br_master m
+                             WHERE m.br_no = i.br_no AND m.br_date = i.br_date)");
+    let orphan_dr_items = count(
+        "SELECT COUNT(*) FROM dr_items i
+          WHERE NOT EXISTS (SELECT 1 FROM dr_master m
+                             WHERE m.dr_no = i.dr_no AND m.dr_date = i.dr_date)");
+    let orphan_os_items = count(
+        "SELECT COUNT(*) FROM cops_items i
+          WHERE NOT EXISTS (SELECT 1 FROM cops_master m
+                             WHERE m.os_no = i.os_no AND m.os_year = i.os_year)");
+    // A case that recorded a detention receipt which is no longer in the register.
+    let cases_missing_dr = count(
+        "SELECT COUNT(*) FROM cops_master c
+          WHERE c.entry_deleted='N'
+            AND c.post_adj_dr_no IS NOT NULL AND TRIM(c.post_adj_dr_no) != ''
+            AND NOT EXISTS (SELECT 1 FROM dr_master d
+                             WHERE CAST(d.dr_no AS TEXT) = TRIM(c.post_adj_dr_no))");
+
+    let total = [orphan_br_items, orphan_dr_items, orphan_os_items, cases_missing_dr]
+        .iter().filter(|n| **n > 0).count();
+
+    Ok(Json(json!({
+        "clean": total == 0,
+        "orphaned_baggage_items":   orphan_br_items,
+        "orphaned_detention_items": orphan_dr_items,
+        "orphaned_case_items":      orphan_os_items,
+        "cases_naming_a_missing_detention_receipt": cases_missing_dr,
+        "note": if total == 0 {
+            "Nothing references a record that is missing."
+        } else {
+            "Some records point at something that is no longer present. \
+             This is what an unscoped purge leaves behind."
+        },
+    })))
+}

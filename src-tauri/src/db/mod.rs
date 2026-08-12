@@ -162,10 +162,21 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
 /// CREATE UNIQUE INDEX that fails on existing duplicates would abort the whole
 /// migration and take the application down with it.
 fn dedupe_and_protect_items(conn: &rusqlite::Connection) {
+    // The revenue tables are restored with INSERT OR IGNORE too, and had no
+    // constraint either — so a second restore would have doubled every session's
+    // figures. They are keyed on the session and the row's position within it,
+    // which is what makes one line of a shift's sheet distinct from the next.
+    // Caught while the module still has no data in it, which is the only
+    // comfortable time to find this.
     for (table, keys) in [
-        ("cops_items", "os_no, os_year, items_sno"),
-        ("br_items",   "br_no, br_date, items_sno"),
-        ("dr_items",   "dr_no, dr_date, items_sno"),
+        ("cops_items",     "os_no, os_year, items_sno"),
+        ("br_items",       "br_no, br_date, items_sno"),
+        ("dr_items",       "dr_no, dr_date, items_sno"),
+        ("dcr_entries",    "session_id, sort_order"),
+        ("dcr_dr_entries", "session_id, sort_order"),
+        ("dcr_os_entries", "session_id, sort_order"),
+        ("dcr_tariffs",    "effective_from"),
+        ("dcr_item_types", "name"),
     ] {
         let idx = format!("uq_{table}_active");
 
@@ -181,13 +192,21 @@ fn dedupe_and_protect_items(conn: &rusqlite::Connection) {
         ).unwrap_or(0);
         if already > 0 { continue; }
 
+        // Only the case/receipt item tables carry entry_deleted; the revenue
+        // tables have no such column, so the predicate has to be dropped for
+        // them or every statement below is a syntax error.
+        let soft = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='entry_deleted'"),
+                [], |r| r.get::<_, i64>(0),
+            ).unwrap_or(0) > 0;
+        let live = if soft { "WHERE entry_deleted IS NULL OR entry_deleted != 'Y'" } else { "" };
+        let also = if soft { "AND (entry_deleted IS NULL OR entry_deleted != 'Y')" } else { "" };
+
         let removed = conn.execute(
             &format!(
                 "DELETE FROM {table} WHERE rowid NOT IN (
-                     SELECT MIN(rowid) FROM {table}
-                      WHERE entry_deleted IS NULL OR entry_deleted != 'Y'
-                      GROUP BY {keys})
-                   AND (entry_deleted IS NULL OR entry_deleted != 'Y')"
+                     SELECT MIN(rowid) FROM {table} {live} GROUP BY {keys}) {also}"
             ),
             [],
         );
@@ -200,8 +219,7 @@ fn dedupe_and_protect_items(conn: &rusqlite::Connection) {
             }
         }
         if let Err(e) = conn.execute_batch(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {table} ({keys})
-              WHERE entry_deleted IS NULL OR entry_deleted != 'Y'"
+            "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {table} ({keys}) {live}"
         )) {
             tracing::error!("could not create {idx} ({e}) — duplicate items remain possible");
         }

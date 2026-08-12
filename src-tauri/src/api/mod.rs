@@ -241,6 +241,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/admin/register-device",            post(admin::register_device))
         .route("/admin/devices",                    get(admin::list_devices).post(admin::create_device))
         .route("/admin/devices/:id",               put(admin::update_device).delete(admin::delete_device))
+        .route("/admin/integrity-check",             get(admin::integrity_check))
         .route("/admin/purge-os",                   post(admin::purge_os))
 
         // ── Backup / Restore ─────────────────────────────────────────────────

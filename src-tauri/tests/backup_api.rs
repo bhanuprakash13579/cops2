@@ -2621,3 +2621,45 @@ async fn a_deleted_case_is_kept_not_destroyed() {
         a.iter().any(|x| x["os_no"] == "7001")).unwrap_or(false);
     assert!(!found, "a deleted case must not appear in the register: {list}");
 }
+
+#[tokio::test]
+async fn restoring_twice_does_not_double_a_revenue_session() {
+    // Six revenue tables were restored with INSERT OR IGNORE and no constraint
+    // to ignore against — the same defect that doubled case items, in the module
+    // that records what the office collected. A second restore would have
+    // doubled every session's figures.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    {
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO dcr_sessions (report_date, shift, created_at)
+             VALUES ('2026-08-11', 'DAY', datetime('now'))", []).unwrap();
+        let sid: i64 = c.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap();
+        for n in 1..=4 {
+            c.execute(
+                "INSERT INTO dcr_entries (session_id, sort_order, sl_no, item_desc, dutiable_value)
+                 VALUES (?,?,?,?,?)",
+                rusqlite::params![sid, n, n, format!("LINE {n}"), 1000.0 * n as f64],
+            ).unwrap();
+        }
+    }
+    let money = || -> f64 {
+        pool.get().unwrap().query_row(
+            "SELECT COALESCE(SUM(dutiable_value),0) FROM dcr_entries", [], |r| r.get(0)).unwrap_or(-1.0)
+    };
+    let rows = || -> i64 {
+        pool.get().unwrap().query_row(
+            "SELECT COUNT(*) FROM dcr_entries", [], |r| r.get(0)).unwrap_or(-1)
+    };
+    let (before_rows, before_money) = (rows(), money());
+    assert_eq!(before_rows, 4);
+
+    let archive = take_archive(&base).await;
+    for pass in 1..=2 {
+        let (st, body) = restore(&base, archive.clone(), true).await;
+        assert_eq!(st, 200, "restore {pass} failed: {body}");
+    }
+    assert_eq!(rows(), before_rows, "the shift's lines must not multiply");
+    assert!((money() - before_money).abs() < 0.001,
+            "the shift's total must be unchanged: {before_money} -> {}", money());
+}
