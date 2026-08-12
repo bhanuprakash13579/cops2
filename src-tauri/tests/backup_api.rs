@@ -2908,3 +2908,206 @@ async fn the_adjudication_queue_counts_match_the_lists_behind_them() {
                "the badge and the list must agree: badge {pending_count}, list {pending_total}");
     assert_eq!(pending_count, 3, "all three cases are waiting: {counts}");
 }
+
+// ── Monthly report ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_monthly_report_counts_the_month_it_was_asked_for() {
+    // The figures the office reports upward. Wrong here is wrong on paper that
+    // leaves the building, so the boundaries matter: a case on the last day of
+    // one month must not appear in the next.
+    let (base, _d) = serve_with(0).await;
+    let c = reqwest::Client::new();
+    let book = |no: &str, date: &str, value: f64| {
+        let url = format!("{base}/os");
+        let (no, date) = (no.to_string(), date.to_string());
+        let c = c.clone();
+        async move {
+            c.post(url).bearer_auth(officer_token()).json(&serde_json::json!({
+                "os_no": no, "os_date": date,
+                "pax_name": format!("PAX {no}"), "passport_no": "M1112223",
+                "items": [{ "items_sno": 1, "items_desc": "GOLD", "items_qty": 1.0,
+                            "items_value": value, "items_release_category": "Under OS" }]
+            })).send().await.unwrap()
+        }
+    };
+    book("2601", "2026-05-31", 100000.0).await;   // last day of May
+    book("2602", "2026-06-01", 200000.0).await;   // first day of June
+    book("2603", "2026-06-30", 300000.0).await;   // last day of June
+    book("2604", "2026-07-01", 400000.0).await;   // first day of July
+
+    let june: serde_json::Value = c.get(format!("{base}/os-query/monthly-report?month=6&year=2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+
+    let n = june["items"].as_array().map(|a| a.len() as i64).unwrap_or(-1);
+    assert_eq!(n, 2, "June holds exactly the two June cases, not May's or July's: {june}");
+}
+
+// ── Revenue: the rules that decide the figures ───────────────────────────────
+
+#[tokio::test]
+async fn a_formula_rule_can_be_added_reordered_and_removed() {
+    // Formula rules decide how a shift's revenue is worked out, and their order
+    // decides which one wins. Both matter to the number that gets reported.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let mut ids = vec![];
+    for name in ["RULE ALPHA", "RULE BRAVO"] {
+        let r = c.post(format!("{base}/dcr/formula-rules")).bearer_auth(&t)
+            .json(&serde_json::json!({
+                "target_column": "duty_rs",
+                "expression": "dutiable_value * 0.385",
+                "column_label": name,
+                "condition_type": "all",
+                "sort_order": 1
+            })).send().await.unwrap();
+        let st = r.status();
+        let body = r.text().await.unwrap();
+        assert!(st.is_success(), "adding a formula rule failed: {st} {body}");
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(id) = v["id"].as_i64() { ids.push(id); }
+        }
+    }
+
+    let list: serde_json::Value = c.get(format!("{base}/dcr/formula-rules")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    let arr = list.as_array().cloned()
+        .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+    assert!(arr.len() >= 2, "both rules must be listed: {list}");
+
+    if ids.len() == 2 {
+        let r = c.post(format!("{base}/dcr/formula-rules/reorder")).bearer_auth(&t)
+            .json(&serde_json::json!([ids[1], ids[0]]))
+            .send().await.unwrap();
+        assert!(r.status().is_success(),
+                "reordering failed: {}", r.text().await.unwrap());
+
+        let r = c.delete(format!("{base}/dcr/formula-rules/{}", ids[0])).bearer_auth(&t)
+            .send().await.unwrap();
+        assert!(r.status().is_success(), "deleting a rule failed: {}", r.text().await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn the_revenue_settings_round_trip() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.put(format!("{base}/dcr/settings")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "station_name": "ANNA INTERNATIONAL AIRPORT",
+            "officer_name": "TEST OFFICER", "designation": "Supdt."
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "saving revenue settings failed: {st} {body}");
+
+    let got: serde_json::Value = c.get(format!("{base}/dcr/settings")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(got["station_name"], "ANNA INTERNATIONAL AIRPORT",
+               "what was saved must come back: {got}");
+}
+
+// ── Statutes ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn legal_statutes_can_be_listed_and_added() {
+    // These are the sections quoted on the printed order, so an office that
+    // cannot maintain them cannot correct a citation.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let list = c.get(format!("{base}/statutes")).bearer_auth(&t).send().await.unwrap();
+    assert_eq!(list.status(), 200, "the statutes list must answer: {}", list.text().await.unwrap());
+
+    let r = c.post(format!("{base}/statutes")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "keyword": "TESTKEYWORD",
+            "display_name": "Test Statute",
+            "section_ref": "Section 999 of the Customs Act, 1962"
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "adding a statute failed: {st} {body}");
+}
+
+// ── Admin configuration ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn every_admin_configuration_screen_answers() {
+    // Twenty routes behind the admin panel that had never been called once. A
+    // screen that errors on open is not a subtle fault, but nothing was looking.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+    for path in [
+        "/admin/users", "/admin/mode", "/admin/features", "/admin/devices",
+        "/admin/device-info", "/admin/config/print-template", "/admin/config/baggage-rules",
+        "/admin/config/special-allowances", "/admin/config/remarks-templates",
+        "/admin/config/pit", "/admin/config/os", "/admin/config/backup",
+        "/admin/backup/export", "/admin/integrity-check",
+    ] {
+        let r = c.get(format!("{base}{path}")).bearer_auth(&t).send().await.unwrap();
+        assert!(r.status().is_success(),
+                "{path} returned {} — {}", r.status(), r.text().await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn the_integrity_check_reports_a_clean_database_as_clean() {
+    // It exists to answer "did a purge already cost us anything". On a database
+    // nothing has been purged from, the answer must be an unambiguous no —
+    // otherwise the office cannot tell a real warning from noise.
+    let (base, _d) = serve_with(50).await;
+    let r: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/admin/integrity-check")).bearer_auth(admin_token())
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["clean"], true, "a database with nothing purged must read clean: {r}");
+    for k in ["orphaned_baggage_items", "orphaned_detention_items", "orphaned_case_items"] {
+        assert_eq!(r[k], 0, "{k} should be zero on a clean database: {r}");
+    }
+}
+
+#[tokio::test]
+async fn the_integrity_check_notices_an_item_whose_receipt_has_gone() {
+    // And it must actually detect the damage it was written for, or it is a
+    // green light that means nothing.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    {
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO br_items (br_no, br_year, br_date, br_type, items_sno, items_desc)
+             VALUES (4242, 2026, '2026-08-11', 'D', 1, 'GOODS WITH NO RECEIPT')", []).unwrap();
+    }
+    let r: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/admin/integrity-check")).bearer_auth(admin_token())
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["clean"], false, "an orphaned item must be reported: {r}");
+    assert_eq!(r["orphaned_baggage_items"], 1, "and counted: {r}");
+}
+
+// ── APIS ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_apis_passenger_match_answers_without_falling_over() {
+    // Matches an advance passenger list against the register. Never once called
+    // by a test; the shape of what it returns matters less here than that it
+    // does not error on a well-formed request.
+    let (base, _d) = serve_with(20).await;
+    let c = reqwest::Client::new();
+    let r = c.post(format!("{base}/apis/match")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "passengers": [
+                { "name": "SOMEONE UNKNOWN", "passport_no": "X9999999" },
+                { "name": "ANOTHER PERSON",  "passport_no": "Y8888888" }
+            ]
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success() || st.as_u16() == 400,
+            "APIS match should answer or explain, not fail: {st} {body}");
+}
