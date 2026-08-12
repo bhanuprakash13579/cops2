@@ -319,6 +319,25 @@ pub async fn get_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): Pat
     Ok(Json(case))
 }
 
+
+/// The office's current working date and shift.
+///
+/// The Python app derives the case's date from this, not from the machine
+/// clock: a night shift that runs past midnight still books under the shift's
+/// own date, and the office can hold the batch open deliberately. Falls back to
+/// today and "Day" exactly as it does.
+fn current_batch(conn: &rusqlite::Connection) -> (String, String) {
+    conn.query_row(
+        "SELECT current_batch_date, current_batch_shift FROM batch_master LIMIT 1",
+        [],
+        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+    )
+    .ok()
+    .and_then(|(d, sh)| d.filter(|x| !x.trim().is_empty())
+        .map(|d| (d, sh.unwrap_or_else(|| "Day".into()))))
+    .unwrap_or_else(|| (chrono::Local::now().format("%Y-%m-%d").to_string(), "Day".into()))
+}
+
 pub async fn create_os(State(pool): Db, auth: AuthUser, Json(mut req): Json<CreateOsRequest>) -> Result<Json<Value>, Err> {
     // Who registered the case is part of the record, and a different officer
     // adjudicates it later — booked_by and adj_offr_name are the two halves of
@@ -332,24 +351,53 @@ pub async fn create_os(State(pool): Db, auth: AuthUser, Json(mut req): Json<Crea
 
     // ── Business rule validations ─────────────────────────────────────────────
     req.passport_no = normalize_passport(req.passport_no);
-    validate_flight_date(req.flight_date.as_deref())?;
-    validate_pax_dates(req.pax_date_of_birth.as_deref(), req.date_of_departure.as_deref())?;
+    let is_draft = req.is_draft.as_deref().unwrap_or("N");
+
+    // A draft is a half-finished form the officer means to come back to, so the
+    // date rules are not applied to it — the Python app skips them for drafts and
+    // COPS2 enforced them always, which made a draft impossible to save until
+    // every date was already correct.
+    if is_draft != "Y" {
+        validate_flight_date(req.flight_date.as_deref())?;
+        validate_pax_dates(req.pax_date_of_birth.as_deref(), req.date_of_departure.as_deref())?;
+    }
     validate_supdt_remarks_length(req.supdts_remarks.as_deref())?;
+
+    // The number is typed by the officer and must be digits. The lists order by
+    // CAST(os_no AS INTEGER), so anything else sorts as zero and the case hides
+    // at the top of the register for ever.
+    let os_no_trimmed = req.os_no.trim().to_string();
+    if os_no_trimmed.is_empty() {
+        return Err(e400("O.S. No. is required."));
+    }
+    if !os_no_trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(e400("O.S. No. must contain digits only."));
+    }
+    req.os_no = os_no_trimmed;
 
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
-    // Uniqueness check
+    // The date comes from the office's open batch, not the machine clock, and
+    // the year comes from THAT date. Taking os_year from the request meant a
+    // case dated 31 December could be filed under the next year — and since O.S.
+    // numbers are unique per year, that is both a misfiled case and a number
+    // free to be issued twice.
+    let (batch_date, batch_shift) = current_batch(&conn);
+    let os_date = req.os_date.clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(batch_date);
+    let os_year = os_date.get(0..4).and_then(|y| y.parse::<i64>().ok())
+        .unwrap_or_else(|| chrono::Local::now().year() as i64);
+    if req.shift.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        req.shift = Some(batch_shift);
+    }
+
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM cops_master WHERE os_no=? AND os_year=? AND entry_deleted='N'",
-        rusqlite::params![req.os_no, req.os_year.unwrap_or(chrono::Local::now().year() as i64)],
+        rusqlite::params![req.os_no, os_year],
         |r| r.get(0)
     ).unwrap_or(0);
     if exists > 0 { return Err(e400("O.S. No. already exists for this year.")); }
-
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let os_date = req.os_date.clone().unwrap_or_else(|| today.clone());
-    let os_year = req.os_year.unwrap_or_else(|| chrono::Local::now().year() as i64);
-    let is_draft = req.is_draft.as_deref().unwrap_or("N");
 
     // Wrap all writes in a single transaction — reduces N+2 individual fsyncs
     // (1 per item + master INSERT + recalc UPDATE) down to 1.

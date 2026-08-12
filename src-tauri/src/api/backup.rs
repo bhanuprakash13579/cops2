@@ -1759,7 +1759,15 @@ fn existing_os_keys(conn: &rusqlite::Connection)
 {
     let mut stmt = conn.prepare("SELECT os_no, os_year, coalesce(location_code,'') FROM cops_master")?;
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_,String>(0)?.trim().to_string(), r.get::<_,i64>(1)?, r.get::<_,String>(2)?.trim().to_string()))
+        // os_year is nullable and os_no is read as text. If either conversion
+        // fails the row mapper returns Err and the caller's filter_map discards
+        // it — the case then looks ABSENT to the restore, which inserts it again.
+        // A duplicate case produced by the very code meant to prevent duplicates.
+        Ok((
+            crate::api::col_text(r, 0)?.unwrap_or_default().trim().to_string(),
+            r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            crate::api::col_text(r, 2)?.unwrap_or_default().trim().to_string(),
+        ))
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }

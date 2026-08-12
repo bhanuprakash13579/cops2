@@ -2091,3 +2091,116 @@ async fn the_duplicate_cleanup_runs_once_and_not_on_every_launch() {
     assert_eq!(n, 1, "with the guard gone, the next launch cleans and restores it");
     assert_eq!(guard_exists(&pool), 1, "and the guard is back");
 }
+
+#[tokio::test]
+async fn a_case_is_filed_under_the_year_of_its_own_date() {
+    // O.S. numbers are unique per year, so the year a case is filed under
+    // decides which number is free. It was taken from the request body and
+    // defaulted to the current year, so a case dated 31 December could land in
+    // the wrong year — a misfiled case AND a number free to be issued twice.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    let r = c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "3101", "os_date": "2025-12-31", "os_year": 2026,   // year disagrees
+            "pax_name": "YEAR TEST", "passport_no": "Y1112223",
+            "items": [{ "items_sno": 1, "items_desc": "WATCH", "items_qty": 1.0,
+                        "items_value": 1000.0, "items_release_category": "Under OS" }]
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "booking failed: {}", r.text().await.unwrap());
+
+    // It must be filed under 2025, the year of its own date.
+    let ok = c.get(format!("{base}/os/3101/2025")).bearer_auth(officer_token())
+        .send().await.unwrap();
+    assert_eq!(ok.status(), 200, "the case should be filed under 2025, the year of its date");
+    let wrong = c.get(format!("{base}/os/3101/2026")).bearer_auth(officer_token())
+        .send().await.unwrap();
+    assert_eq!(wrong.status(), 404, "and must not appear under the year that was merely asked for");
+}
+
+#[tokio::test]
+async fn an_os_number_must_be_digits_and_a_draft_may_be_incomplete() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let post = |body: serde_json::Value| {
+        let url = format!("{base}/os");
+        let c = c.clone();
+        async move { c.post(url).bearer_auth(officer_token()).json(&body).send().await.unwrap() }
+    };
+
+    // The lists sort by CAST(os_no AS INTEGER); a non-numeric number sorts as
+    // zero and the case hides at the top of the register for ever.
+    for bad in ["ABC", "12A", " ", ""] {
+        let r = post(serde_json::json!({
+            "os_no": bad, "os_date": "2026-08-11",
+            "pax_name": "BAD NUMBER", "passport_no": "B1112223"
+        })).await;
+        assert_eq!(r.status(), 400, "'{bad}' is not a valid O.S. number");
+    }
+
+    // A draft is a half-finished form, so the date rules do not apply to it yet.
+    let r = post(serde_json::json!({
+        "os_no": "3201", "os_date": "2026-08-11", "is_draft": "Y",
+        "pax_name": "HALF DONE", "passport_no": "H1112223",
+        "flight_date": "2099-01-01"          // nonsense a finished case would refuse
+    })).await;
+    assert!(r.status().is_success(),
+            "a draft must save while still incomplete: {}", r.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn the_query_module_returns_register_rows_instead_of_silently_dropping_them() {
+    // br_no and dr_no are INTEGER in the schema and were read as String here, so
+    // the row mapper failed and filter_map threw every row away. The search
+    // reported nothing and looked like an empty register rather than a fault.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    {
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO br_master (br_no, br_year, br_date, br_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (6501, 2026, '2026-08-11', 'D', 'QUERY REGISTER TEST', 'Q1112223', 'N')",
+            []).unwrap();
+        c.execute(
+            "INSERT INTO dr_master (dr_no, dr_year, dr_date, dr_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (6502, 2026, '2026-08-11', 'GOODS', 'QUERY REGISTER TEST', 'Q1112223', 'N')",
+            []).unwrap();
+    }
+    let r: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/queries/search?passport=Q1112223"))
+        .bearer_auth(officer_token())
+        .send().await.unwrap().json().await.unwrap();
+
+    let br = r["br"].as_array().or(r["br_cases"].as_array()).map(|a| a.len()).unwrap_or(0);
+    let dr = r["dr"].as_array().or(r["dr_cases"].as_array()).map(|a| a.len()).unwrap_or(0);
+    assert_eq!(br, 1, "the baggage receipt must come back from the query module: {r}");
+    assert_eq!(dr, 1, "and the detention receipt too: {r}");
+}
+
+#[tokio::test]
+async fn a_case_with_no_year_is_still_seen_by_the_restore_guard() {
+    // The restore builds a set of cases already present so it can skip them.
+    // os_year is nullable, and it was read as a plain i64 — a case with no year
+    // failed the conversion, was discarded by filter_map, looked ABSENT, and was
+    // inserted a second time. A duplicate produced by the duplicate guard itself.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    {
+        let c = pool.get().unwrap();
+        c.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, entry_deleted, is_draft)
+             VALUES ('6601', NULL, '2026-08-11', 'NO YEAR CASE', 'N', 'N')", []).unwrap();
+    }
+    let before: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM cops_master WHERE os_no='6601'", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, 1);
+
+    let archive = take_archive(&base).await;
+    let (st, body) = restore(&base, archive, true).await;
+    assert_eq!(st, 200, "{body}");
+
+    let after: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM cops_master WHERE os_no='6601'", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, 1, "a case with no year must not be duplicated by a restore");
+}

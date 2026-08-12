@@ -76,8 +76,8 @@ pub async fn cross_reference(
 
     let br_rows: Vec<Value> = br_stmt.query_map(rusqlite::params_from_iter(like_params.iter()), |r| {
         Ok(json!({
-            "br_no":         r.get::<_, String>(0)?,
-            "br_year":       r.get::<_, i64>(1)?,
+            "br_no":         crate::api::col_text(r, 0)?.unwrap_or_default(),
+            "br_year":       r.get::<_, Option<i64>>(1)?,
             "br_date":       r.get::<_, Option<String>>(2)?,
             "pax_name":      r.get::<_, Option<String>>(3)?,
             "passport_no":   r.get::<_, Option<String>>(4)?,
@@ -97,8 +97,8 @@ pub async fn cross_reference(
 
     let dr_rows: Vec<Value> = dr_stmt.query_map(rusqlite::params_from_iter(like_params.iter()), |r| {
         Ok(json!({
-            "dr_no":             r.get::<_, String>(0)?,
-            "dr_year":           r.get::<_, i64>(1)?,
+            "dr_no":             crate::api::col_text(r, 0)?.unwrap_or_default(),
+            "dr_year":           r.get::<_, Option<i64>>(1)?,
             "dr_date":           r.get::<_, Option<String>>(2)?,
             "pax_name":          r.get::<_, Option<String>>(3)?,
             "passport_no":       r.get::<_, Option<String>>(4)?,
