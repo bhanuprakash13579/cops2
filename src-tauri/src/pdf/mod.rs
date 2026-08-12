@@ -142,8 +142,21 @@ fn esc(s: &str) -> String {
     out
 }
 
+/// A field as text, whatever JSON type it arrived as.
+///
+/// Columns like dr_no and br_no are INTEGER, so `SELECT *` hands them over as
+/// JSON numbers and an as_str() lookup returned "" — the field simply vanished
+/// from the printed receipt. On the detention form that also broke the document:
+/// the template writes `*{dr_no}/{dr_year}*`, an empty number left `*/`, and
+/// Typst reads `*/` as the end of a block comment it never saw opened. The whole
+/// print failed with a syntax error whose cause was a missing value.
 fn str_val(v: &Value, k: &str) -> String {
-    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    match v.get(k) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b))   => b.to_string(),
+        _ => String::new(),
+    }
 }
 fn f64_val(v: &Value, k: &str) -> f64 {
     v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)

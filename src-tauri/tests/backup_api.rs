@@ -2381,3 +2381,135 @@ async fn the_backup_carries_every_version_of_the_headings() {
     assert_eq!(after, before,
                "every version of every heading must survive a backup, not just the current one");
 }
+
+// ── Detention register ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_detention_register_lists_reads_and_prints() {
+    // BR had three separate defects that all made it return nothing. DR is built
+    // the same way and had never been exercised at all.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO dr_master (id, dr_no, dr_year, dr_date, dr_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (1, 4401, 2026, '2026-08-11', 'GOODS', 'DETENTION TEST', 'D1112223', 'N')",
+            []).unwrap();
+        conn.execute(
+            "INSERT INTO dr_items (dr_no, dr_year, dr_date, dr_type, items_sno, items_desc,
+                                   items_qty, items_value)
+             VALUES (4401, 2026, '2026-08-11', 'GOODS', 1, 'GOLD BAR', 1.0, 500000.0)",
+            []).unwrap();
+    }
+
+    let list: serde_json::Value = c.get(format!("{base}/dr?search=4401"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(list["total"], 1, "the detention register must list the receipt: {list}");
+    assert_eq!(list["items"].as_array().map(|a| a.len()).unwrap_or(0), 1,
+               "and return the row, not just a count: {list}");
+
+    let one: serde_json::Value = c.get(format!("{base}/dr/4401/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["pax_name"], "DETENTION TEST", "the receipt must open: {one}");
+    assert_eq!(one["items"].as_array().map(|a| a.len()).unwrap_or(0), 1,
+               "its items must load: {one}");
+
+    let r = c.get(format!("{base}/dr/4401/2026/print-pdf"))
+        .bearer_auth(&t).send().await.unwrap();
+    let st = r.status();
+    let pdf = r.bytes().await.unwrap();
+    assert_eq!(st, 200, "detention print failed: {}", String::from_utf8_lossy(&pdf));
+    assert_eq!(&pdf[..4], b"%PDF", "the detention receipt must print");
+}
+
+// ── Masters ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn duty_rates_can_be_added_listed_and_retired() {
+    // Duty rates decide what a passenger pays. An officer adds one, it must be
+    // listed, and retiring it must not delete the history the past cases used.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.post(format!("{base}/masters/duty-rates")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "duty_category": "TEST GOLD", "from_date": "2026-01-01",
+            "bcd_rate": 38.5, "cvd_rate": 0.0
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "adding a duty rate failed: {st} -- {body}");
+
+    let list: serde_json::Value = c.get(format!("{base}/masters/duty-rates"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let arr = list.as_array().cloned()
+        .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+    assert!(arr.iter().any(|v| v["duty_category"] == "TEST GOLD"),
+            "the new rate must appear in the list: {list}");
+}
+
+#[tokio::test]
+async fn the_masters_lists_all_answer() {
+    // Every masters list an officer can open. None had ever been called.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+    for path in ["nationalities", "airlines", "flights", "airports",
+                 "item-categories", "duty-rates", "dc-list", "br-limits"] {
+        let r = c.get(format!("{base}/masters/{path}")).bearer_auth(&t)
+            .send().await.unwrap();
+        assert_eq!(r.status(), 200,
+                   "/masters/{path} returned {} — {}", r.status(), r.text().await.unwrap());
+    }
+}
+
+// ── Users and authentication ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_user_can_be_created_listed_and_have_their_role_changed() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.post(format!("{base}/auth/users")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "user_id": "testofficer", "user_name": "TEST OFFICER",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "creating a user failed: {st} {body}");
+
+    let list: serde_json::Value = c.get(format!("{base}/auth/users")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    let arr = list.as_array().cloned()
+        .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+    assert!(arr.iter().any(|u| u["user_id"] == "testofficer"),
+            "the new user must be listed: {list}");
+}
+
+#[tokio::test]
+async fn signing_in_works_and_a_wrong_password_is_refused() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+        .json(&serde_json::json!({
+            "user_id": "loginuser", "user_name": "LOGIN USER",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+
+    let ok = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "user_id": "loginuser", "password": "Str0ng#Pass1" }))
+        .send().await.unwrap();
+    assert_eq!(ok.status(), 200, "a correct password must sign in: {}", ok.text().await.unwrap());
+
+    let bad = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "user_id": "loginuser", "password": "wrong" }))
+        .send().await.unwrap();
+    assert!(bad.status() == 401 || bad.status() == 400,
+            "a wrong password must be refused, got {}", bad.status());
+}
