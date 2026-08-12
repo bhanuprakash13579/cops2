@@ -1,40 +1,11 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ClipboardEdit, Gavel, ArrowRight, Search, ScanLine, ExternalLink, Mail, ClipboardList, Download } from 'lucide-react';
+import { ClipboardEdit, Gavel, ArrowRight, Search, ScanLine, ExternalLink, Mail, ClipboardList } from 'lucide-react';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import api from '@/lib/api';
 
 export default function ModuleSelection() {
   const navigate = useNavigate();
-  // A backup any signed-in officer can take, from the screen they land on. It
-  // used to be several clicks inside the admin panel, which is where a monthly
-  // task goes to be forgotten. This moves the button, not the permission: the
-  // endpoint still requires a session and the archive is still encrypted.
-  const [savingBackup, setSavingBackup] = useState(false);
-  const [backupMsg, setBackupMsg] = useState('');
-  const downloadBackup = async () => {
-    setSavingBackup(true); setBackupMsg('');
-    try {
-      const token = localStorage.getItem('cops_token');
-      const res = await fetch(`${api.defaults.baseURL}/backup/archive/download`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
-      document.body.appendChild(a); a.click(); a.remove();
-      URL.revokeObjectURL(url);
-      setBackupMsg('Saved — one file, the whole register. Copy it to a drive kept outside this room.');
-    } catch {
-      setBackupMsg('Could not prepare the backup. Try Admin \u2192 Backup.');
-    } finally {
-      setSavingBackup(false);
-    }
-  };
-
   const [secretClicks, setSecretClicks] = useState(0);
   const [apisEnabled, setApisEnabled] = useState(() => localStorage.getItem('cops_apis_enabled') === 'true');
   const [dcrEnabled, setDcrEnabled] = useState(() => localStorage.getItem('cops_dcr_enabled') === 'true');
@@ -265,28 +236,6 @@ export default function ModuleSelection() {
         </div>
       </div>
 
-      <div className="mt-6 flex flex-col items-center gap-2">
-        <button
-          type="button"
-          onClick={downloadBackup}
-          disabled={savingBackup}
-          title="One file containing every record from the first case to today"
-          className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold
-                     bg-white/10 text-white/80 hover:bg-white/20 hover:text-white
-                     border border-white/15 disabled:opacity-60 transition-colors"
-        >
-          <Download size={14} />
-          {savingBackup ? 'Preparing backup…' : 'Download backup'}
-        </button>
-        <p className="text-[11px] text-white/40 max-w-md text-center leading-relaxed">
-          One file, the complete register from the first case to today — not an
-          addition to earlier files. Keep the newest on a drive stored away from
-          this room.
-        </p>
-        {backupMsg && (
-          <p className="text-[11px] text-white/70 max-w-md text-center">{backupMsg}</p>
-        )}
-      </div>
 
     </div>
   );

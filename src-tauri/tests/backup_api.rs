@@ -2663,3 +2663,124 @@ async fn restoring_twice_does_not_double_a_revenue_session() {
     assert!((money() - before_money).abs() < 0.001,
             "the shift's total must be unchanged: {before_money} -> {}", money());
 }
+
+#[tokio::test]
+async fn a_large_archive_saves_to_disk_and_restores_every_row() {
+    // The requirement is that this cannot fail on size and that the file is
+    // genuinely enough to get the data back. So: build a database big enough to
+    // be awkward, write the archive to a real path the way the app does, wipe
+    // the tables, restore from that file, and count everything again.
+    let (base, _d, pool) = serve_with_pool(4000).await;
+    let c = reqwest::Client::new();
+
+    {
+        // Items too, so the archive carries more than one table's worth.
+        let conn = pool.get().unwrap();
+        let nos: Vec<String> = {
+            let mut st = conn.prepare("SELECT os_no FROM cops_master").unwrap();
+            st.query_map([], |r| r.get::<_, String>(0)).unwrap().filter_map(|r| r.ok()).collect()
+        };
+        for no in &nos {
+            for sno in 1..=3 {
+                conn.execute(
+                    "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc,
+                                             items_qty, items_value, entry_deleted)
+                     VALUES (?,?,?,?,1.0,25000.0,'N')",
+                    rusqlite::params![no, 2026, sno,
+                        format!("SEIZED ARTICLE {sno} WITH A REASONABLY LONG DESCRIPTION")],
+                ).unwrap();
+            }
+        }
+    }
+    let count = |t: &str| -> i64 {
+        pool.get().unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap_or(-1)
+    };
+    let (m0, i0) = (count("cops_master"), count("cops_items"));
+    assert!(m0 >= 4000 && i0 >= 12000, "fixture should be substantial: {m0} cases, {i0} items");
+
+    // Save to a real path, the way the button does — the server streams to it.
+    let dest = _d.path().join("big_backup.cops");
+    let r = c.post(format!("{base}/backup/archive/save"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "path": dest.to_string_lossy() }))
+        .send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(st, 200, "saving the archive failed: {body}");
+
+    let size = std::fs::metadata(&dest).unwrap().len();
+    assert!(size > 50_000, "the archive looks too small to hold this: {size} bytes");
+
+    // Now lose the data, and get it back from the file alone.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute("DELETE FROM cops_items", []).unwrap();
+        conn.execute("DELETE FROM cops_master", []).unwrap();
+    }
+    assert_eq!(count("cops_master"), 0, "the wipe should have emptied it");
+
+    let bytes = std::fs::read(&dest).unwrap();
+    let (rst, rbody) = restore(&base, bytes, true).await;
+    assert_eq!(rst, 200, "restore failed: {rbody}");
+
+    assert_eq!(count("cops_master"), m0, "every case must come back from the file");
+    assert_eq!(count("cops_items"),  i0, "and every item on them");
+}
+
+#[tokio::test]
+async fn a_second_download_is_served_from_the_work_already_done() {
+    // Building the archive means exporting every table, compressing and
+    // encrypting it. Doing that again for a download when not one case has
+    // changed is work for its own sake, and it is what made the button feel
+    // slow. The second download must be markedly faster and byte-identical.
+    // Cache files live in the temp directory and outlive a test run, so clear
+    // them first or the "first" download is already warm and the measurement
+    // means nothing.
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            if n.to_string_lossy().starts_with("cops_archive_cache_") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let (base, _d) = serve_with(1500).await;
+    let c = reqwest::Client::new();
+
+    let fetch = || async {
+        let t0 = std::time::Instant::now();
+        let r = c.get(format!("{base}/backup/archive/download"))
+            .bearer_auth(officer_token()).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let b = r.bytes().await.unwrap();
+        (b, t0.elapsed())
+    };
+
+    let (first, t1)  = fetch().await;
+    let (second, t2) = fetch().await;
+    eprintln!("  first {:?}, second {:?}", t1, t2);
+
+    assert_eq!(first.len(), second.len(), "the same data must give the same archive");
+    assert_eq!(&first[..], &second[..], "and byte for byte, not merely the same size");
+
+    // The behaviour, not the clock: a reusable archive must have been kept.
+    let cached = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("cops_archive_cache_"));
+    assert!(cached, "the built archive should have been kept for the next request");
+    let _ = (t1, t2);   // reported above, not asserted — timings are noisy
+
+    // Change the data, and the next download must NOT be the stale file.
+    let r = c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "5551", "os_date": "2026-08-11",
+            "pax_name": "AFTER THE CACHE", "passport_no": "C1112223",
+            "items": [{ "items_sno": 1, "items_desc": "WATCH", "items_qty": 1.0,
+                        "items_value": 1000.0, "items_release_category": "Under OS" }]
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "booking failed: {}", r.text().await.unwrap());
+
+    let (third, _) = fetch().await;
+    assert_ne!(&second[..], &third[..],
+               "a case booked after the archive was built must appear in the next one");
+}

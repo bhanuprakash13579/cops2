@@ -1996,7 +1996,87 @@ pub async fn archive_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Val
 /// is survivable at 44 MB and is not at 10 GB — and reading a file into memory
 /// to hand it straight to a socket is the failure mode that broke the download
 /// in the sibling project.
+
+/// Stream an archive file to the caller without loading it into memory.
+async fn stream_archive(path: &std::path::Path, known_len: Option<u64>)
+    -> Result<axum::response::Response, Err>
+{
+    use axum::response::IntoResponse;
+    let len = match known_len {
+        Some(n) => n,
+        None => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+    };
+    let file = tokio::fs::File::open(path).await.map_err(|e| e500(&e.to_string()))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let filename = format!("cops_backup_{today}.cops");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
+    ).into_response())
+}
+
+/// A cheap answer to "has anything changed since the last archive was built".
+///
+/// data_revision is bumped by an AFTER UPDATE trigger on each case table, so it
+/// catches corrections that add and remove nothing. Row counts and MAX(id) catch
+/// inserts and deletes. All of it is index reads, so this stays in the low
+/// milliseconds even on the office's register — which is the point, since it
+/// runs before every download.
+fn archive_fingerprint(pool: &crate::db::DbPool) -> String {
+    use sha2::{Digest, Sha256};
+    let Ok(conn) = pool.get() else { return "unknown".into() };
+    let mut h = Sha256::new();
+    let rev: i64 = conn
+        .query_row("SELECT n FROM data_revision WHERE id = 1", [], |r| r.get(0))
+        .unwrap_or(-1);
+    h.update(rev.to_le_bytes());
+    for t in ["cops_master", "cops_items", "br_master", "br_items",
+              "dr_master", "dr_items", "dcr_sessions", "dcr_entries"] {
+        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+            .unwrap_or(-1);
+        let mx: i64 = conn.query_row(&format!("SELECT COALESCE(MAX(id),0) FROM \"{t}\""), [], |r| r.get(0))
+            .unwrap_or(-1);
+        h.update(t.as_bytes());
+        h.update(n.to_le_bytes());
+        h.update(mx.to_le_bytes());
+    }
+    format!("{:x}", h.finalize())[..16].to_string()
+}
+
 pub async fn archive_download(State(pool): Db, _auth: AuthUser) -> Result<axum::response::Response, Err> {
+    // Building the archive means exporting every table, compressing it and
+    // encrypting the result — seconds on the office's register, every time,
+    // even when not one case has changed since the last download. The work is
+    // reused instead: an archive built for a given state of the data is still
+    // exactly right until the data moves, so the second download and every one
+    // after it is a file read.
+    //
+    // The cache lives in the temp directory under the cops_archive_ prefix the
+    // sweeper already knows about, so a stale one cannot accumulate.
+    let fp = {
+        let p = pool.clone();
+        tokio::task::spawn_blocking(move || archive_fingerprint(&p))
+            .await
+            .unwrap_or_else(|_| "unknown".into())
+    };
+    let cached = std::env::temp_dir().join(format!("cops_archive_cache_{fp}.cops"));
+    if let Ok(meta) = std::fs::metadata(&cached) {
+        if meta.len() > 0 {
+            tracing::debug!("serving the cached archive for {fp}");
+            // Record it here too. Returning early from the cached path skipped
+            // this and the officer's backup stopped counting as taken, so the
+            // monthly reminder kept asking for a file they had already saved.
+            let _ = set_setting(&pool, "archive_last_downloaded",
+                                &chrono::Local::now().to_rfc3339());
+            return stream_archive(&cached, Some(meta.len())).await;
+        }
+    }
+
     let tmp = std::env::temp_dir()
         .join(format!("cops_archive_{}.cops", uuid::Uuid::new_v4()));
 
@@ -2006,6 +2086,10 @@ pub async fn archive_download(State(pool): Db, _auth: AuthUser) -> Result<axum::
         .await
         .map_err(|e| e500(&e.to_string()))?
         .map_err(|e| e500(&format!("could not build the archive: {e}")))?;
+
+    // Keep it for the next request. A failed rename is not a failure of the
+    // download — the file it was going to cache is the one being sent.
+    let _ = std::fs::copy(&tmp, &cached);
 
     let file = tokio::fs::File::open(&tmp).await.map_err(|e| e500(&e.to_string()))?;
     let stream = tokio_util::io::ReaderStream::new(file);

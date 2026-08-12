@@ -15,13 +15,19 @@ import api from '@/lib/api';
  * with the work. Now it appears once a month, as a dialog that has to be
  * answered, and then stays quiet:
  *
- *   - shown on the 1st of a month, or the first time the app is opened after it
- *   - dismissed, or a backup taken, and it does not return until the next month
+ *   - shown the first time the app is opened in a new month, whether or not
+ *     anyone has booked a case: it runs on launch, not on any piece of work
+ *   - taking the backup settles the month, and it stays quiet until the next one
+ *   - "Not now" only defers it for three days
  *
- * The month it was last settled is kept in localStorage, so closing the app
- * does not bring it back.
+ * That last distinction matters. Dismissing used to silence it for the whole
+ * month, so an officer who was busy on the 1st simply never saw it again and the
+ * backup never happened — the reminder quietly defeated itself. Deferring now
+ * brings it back, and only actually saving a file stops it.
  */
-const SEEN_KEY = 'cops_archive_reminder_month';
+const DONE_KEY   = 'cops_archive_reminder_done_month';   // month a backup was taken
+const SNOOZE_KEY = 'cops_archive_reminder_snoozed_until'; // ms timestamp
+const SNOOZE_DAYS = 3;
 const monthKey = (d = new Date()) => `${d.getFullYear()}-${d.getMonth() + 1}`;
 
 export default function ArchiveReminder() {
@@ -40,7 +46,11 @@ export default function ArchiveReminder() {
     const check = async () => {
       const token = localStorage.getItem('cops_token');
       if (!token) return;                                  // nobody signed in
-      if (localStorage.getItem(SEEN_KEY) === monthKey()) return;   // already settled this month
+      // Settled for this month only by actually taking a backup.
+      if (localStorage.getItem(DONE_KEY) === monthKey()) return;
+      // Otherwise honour a short deferral, so it returns rather than vanishing.
+      const until = Number(localStorage.getItem(SNOOZE_KEY) || 0);
+      if (until && Date.now() < until) return;
       try {
         const res = await fetch(`${api.defaults.baseURL}/backup/archive/status`, {
           headers: { Authorization: `Bearer ${token}` },
@@ -63,9 +73,9 @@ export default function ArchiveReminder() {
     return () => { cancelled = true; clearTimeout(first); };
   }, [location.pathname]);
 
-  /** Settle it for this month, however the officer chose to settle it. */
-  const settle = () => {
-    localStorage.setItem(SEEN_KEY, monthKey());
+  /** Defer, not dismiss — it comes back in a few days if no backup is taken. */
+  const notNow = () => {
+    localStorage.setItem(SNOOZE_KEY, String(Date.now() + SNOOZE_DAYS * 86400_000));
     setOpen(false);
   };
 
@@ -87,8 +97,9 @@ export default function ArchiveReminder() {
       a.remove();
       URL.revokeObjectURL(url);
       setSaved(true);
-      // Taking the backup settles the month too — that was the point of asking.
-      localStorage.setItem(SEEN_KEY, monthKey());
+      // Only this settles the month — the file actually exists now.
+      localStorage.setItem(DONE_KEY, monthKey());
+      localStorage.removeItem(SNOOZE_KEY);
       setTimeout(() => setOpen(false), 1500);
     } catch {
       setSaved(false);
@@ -142,7 +153,7 @@ export default function ArchiveReminder() {
         <div className="flex items-center justify-end gap-2 px-5 py-3 bg-slate-50 border-t border-slate-100">
           <button
             type="button"
-            onClick={settle}
+            onClick={notNow}
             className="flex items-center gap-1.5 px-3 py-2 text-xs rounded-lg text-slate-600 hover:bg-slate-100 font-medium"
           >
             <X size={14} /> Not now
@@ -158,7 +169,8 @@ export default function ArchiveReminder() {
         </div>
 
         <p className="px-5 pb-4 text-[11px] text-slate-400">
-          You will not be asked again until next month.
+          Save the file and you will not be asked again this month. Choose
+          &ldquo;Not now&rdquo; and it will ask again in a few days.
         </p>
       </div>
     </div>

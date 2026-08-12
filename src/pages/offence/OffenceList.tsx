@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useOsList } from '@/hooks/useOsList';
 import { useDebounce } from '@/hooks/useDebounce';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Search, Filter, AlertCircle, AlertTriangle, RefreshCw, Trash2, X, FileText, CreditCard, ChevronDown, ChevronUp, Clock, Edit } from 'lucide-react';
+import { Plus, Search, Filter, AlertCircle, AlertTriangle, RefreshCw, Trash2, X, FileText, CreditCard, ChevronDown, ChevronUp, Clock, Edit, Download } from 'lucide-react';
 
 /** Returns true if the 24-hour post-adjudication modification window is still open. */
 const isWithin24hWindow = (adjudicationTime: string | null | undefined): boolean => {
@@ -12,6 +12,7 @@ const isWithin24hWindow = (adjudicationTime: string | null | undefined): boolean
 };
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
+import { showDownloadToast } from '@/components/DownloadToast';
 import DatePicker from '@/components/DatePicker';
 
 const PER_PAGE = 20;
@@ -290,6 +291,59 @@ const AddOutcomePanel = memo(function AddOutcomePanel({
 });
 
 export default function OffenceList() {
+  // One encrypted file with the whole register, saved wherever the officer
+  // chooses. Not an addition to earlier files — the newest replaces them, which
+  // the confirmation says so nobody keeps twelve a year believing they must.
+  const [savingBackup, setSavingBackup] = useState(false);
+  const downloadBackup = async () => {
+    setSavingBackup(true);
+    try {
+      // Ask where to put it, then have the backend write there directly. The
+      // obvious approach — fetch the file and hand the browser a blob — holds
+      // the whole archive in webview memory, which is fine at 44 MB and is
+      // exactly how a download starts failing once the register grows. This way
+      // nothing larger than a buffer is ever in memory: the server streams to
+      // the chosen path and the size stops mattering.
+      let savePath: string | null = null;
+      try {
+        const { save } = await import('@tauri-apps/plugin-dialog');
+        savePath = await save({
+          defaultPath: `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`,
+          filters: [{ name: 'COPS backup', extensions: ['cops'] }],
+        });
+      } catch { /* not running under Tauri — fall through */ }
+
+      if (savePath) {
+        await api.post('/backup/archive/save', { path: savePath }, { timeout: 0 });
+        showDownloadToast(
+          'Backup saved — one file with every record from the first case to today. ' +
+          'Keep it on a drive stored away from this room; it replaces any earlier file.'
+        );
+      } else {
+        // No dialog available: fall back to a normal download.
+        const token = localStorage.getItem('cops_token');
+        const res = await fetch(`${api.defaults.baseURL}/backup/archive/download`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) throw new Error(String(res.status));
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        showDownloadToast('Backup saved — one file with every record from the first case to today.');
+      }
+    } catch (e: any) {
+      showDownloadToast(
+        `Backup failed: ${e?.response?.data?.detail || e?.message || 'unknown error'}. Nothing was written.`
+      );
+    } finally {
+      setSavingBackup(false);
+    }
+  };
+
   const navigate = useNavigate();
   const { token: _token } = useAuth();
 
@@ -411,6 +465,19 @@ export default function OffenceList() {
             {total > 0 ? `${total.toLocaleString()} total cases` : 'Track passenger interceptions, seizures, and adjudications.'}
           </p>
         </div>
+        <div className="flex items-center gap-3">
+        {/* Taking a copy out of the office is a monthly job and it belongs where
+            the officers already are, rather than several clicks inside the admin
+            panel. One file, the whole register. */}
+        <button
+          onClick={downloadBackup}
+          disabled={savingBackup}
+          title="One encrypted file holding every record from the first case to today"
+          className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-60 transition-colors"
+        >
+          <Download size={16} />
+          {savingBackup ? 'Preparing…' : 'Download Backup'}
+        </button>
         <button
           onClick={() => navigate('/sdo/offence/new')}
           className="flex items-center px-5 py-2.5 bg-brand-600 text-white font-medium rounded-lg hover:bg-brand-700 transition-colors"
@@ -418,6 +485,7 @@ export default function OffenceList() {
           <Plus size={18} className="mr-2" />
           Register New O.S.
         </button>
+        </div>
       </div>
 
       {/* Search + actions */}
