@@ -1903,3 +1903,78 @@ async fn the_sdo_excel_import_adds_rows_and_refuses_the_bad_ones() {
     assert_eq!(first["pax_name"], "BULK ONE",
                "a duplicate row must not overwrite the case already there: {first}");
 }
+
+#[tokio::test]
+async fn restoring_the_same_archive_twice_does_not_duplicate_items() {
+    // cops_items had no unique constraint, and the restore inserts with
+    // INSERT OR IGNORE — which ignores nothing when there is nothing to violate.
+    // A second restore therefore appended another copy of every item on every
+    // case, and the officer saw each item listed twice.
+    let (base, _d, pool) = serve_with_pool(30).await;
+    {
+        // Seed items against the cases the fixture made — the fixture creates
+        // masters only, and this test is about their items.
+        let c = pool.get().unwrap();
+        let nos: Vec<String> = {
+            let mut st = c.prepare("SELECT os_no FROM cops_master LIMIT 10").unwrap();
+            let v = st.query_map([], |r| r.get::<_, String>(0)).unwrap()
+                .filter_map(|r| r.ok()).collect();
+            v
+        };
+        for no in nos {
+            for sno in 1..=3 {
+                c.execute(
+                    "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc,
+                                             items_qty, items_value, entry_deleted)
+                     VALUES (?,?,?,?,1.0,1000.0,'N')",
+                    rusqlite::params![no, 2026, sno, format!("ITEM {sno}")],
+                ).unwrap();
+            }
+        }
+    }
+
+    let count = |p: &std::sync::Arc<db::DbPool>| -> i64 {
+        p.get().unwrap()
+            .query_row("SELECT COUNT(*) FROM cops_items WHERE entry_deleted != 'Y'", [], |r| r.get(0))
+            .unwrap_or(-1)
+    };
+    let before = count(&pool);
+    assert!(before > 0, "there should be items to begin with");
+
+    let archive = take_archive(&base).await;
+    let (s1, b1) = restore(&base, archive.clone(), true).await;
+    assert_eq!(s1, 200, "{b1}");
+    let after_one = count(&pool);
+    assert_eq!(after_one, before, "one restore must not change the count: {before} -> {after_one}");
+
+    // The second restore is the one that used to double everything.
+    let (s2, b2) = restore(&base, archive, true).await;
+    assert_eq!(s2, 200, "{b2}");
+    let after_two = count(&pool);
+    assert_eq!(after_two, before,
+               "a repeat restore must not duplicate items: {before} -> {after_two}");
+}
+
+#[tokio::test]
+async fn a_case_cannot_hold_two_items_with_the_same_serial_number() {
+    // The guard behind the fix above: the partial unique index. It is partial so
+    // that a deleted case can have its number reused without its old items
+    // blocking the new case's first item.
+    let (base, _d, pool) = serve_with_pool(5).await;
+    let _ = base;
+    let c = pool.get().unwrap();
+    c.execute(
+        "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+         VALUES ('8801', 2026, 1, 'FIRST', 'N')", []).unwrap();
+    let dup = c.execute(
+        "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+         VALUES ('8801', 2026, 1, 'SECOND', 'N')", []);
+    assert!(dup.is_err(), "a second active item with the same serial must be refused");
+
+    // But a soft-deleted one may coexist, so a reused case number still works.
+    c.execute("UPDATE cops_items SET entry_deleted='Y' WHERE os_no='8801'", []).unwrap();
+    let reuse = c.execute(
+        "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+         VALUES ('8801', 2026, 1, 'REUSED', 'N')", []);
+    assert!(reuse.is_ok(), "a reused case number must still accept its own items: {reuse:?}");
+}

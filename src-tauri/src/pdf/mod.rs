@@ -842,10 +842,8 @@ pub fn compile_typst(source_text: &str) -> Result<Vec<u8>> {
 /// at 9pt, the old fixed size, so a three-item case could never grow into the
 /// space it had and printed small with most of the page empty. The Python app
 /// searches from 11pt for the same reason.
-const OS_SIZE_LADDER: &[(f64, f64)] = &[
-    (11.0, 9.8), (10.5, 9.3), (10.0, 8.9), (9.5, 8.4),
-    (9.0,  8.0), (8.5,  7.6), (8.0,  7.1), (7.5, 6.7),
-    (7.0,  6.2), (6.5,  5.8), (6.0,  5.3), (5.5, 4.9),
+const OS_SIZE_LADDER: &[f64] = &[
+    11.0, 10.5, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5,
 ];
 
 /// Generate a 2-page legal-size OS PDF using Typst.
@@ -863,53 +861,68 @@ const OS_SIZE_LADDER: &[(f64, f64)] = &[
 /// compiled document, so the search never exports a PDF it is going to throw
 /// away.
 pub fn generate_os_pdf(case: &Value) -> Result<Vec<u8>> {
-    let compile = |p1: f64, p2: f64| -> Result<typst::layout::PagedDocument> {
-        let world = OsWorld::new(build_typst_source(case, p1, p2));
+    let compile_src = |src: String| -> Result<typst::layout::PagedDocument> {
+        let world = OsWorld::new(src);
         typst::compile(&world).output
             .map_err(|errors| anyhow::anyhow!("Typst compile error(s): {errors:?}"))
     };
 
-    let (p1, p2) = OS_SIZE_LADDER[0];
-    let full = compile(p1, p2)?;
-    let mut doc = (full.pages.len() <= 2).then_some(full);
-
-    if doc.is_none() {
-        // Fitting is monotonic down the ladder: once a size fits, every
-        // smaller one does too. Keep the largest that does.
-        let (mut lo, mut hi) = (1usize, OS_SIZE_LADDER.len() - 1);
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let (p1, p2) = OS_SIZE_LADDER[mid];
-            let d = compile(p1, p2)?;
-            if d.pages.len() <= 2 {
-                doc = Some(d);
-                if mid == 0 { break; }
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
+    // Each page is measured on its own, exactly as the Python app does it: the
+    // booking page and the order page hold different content and there is no
+    // reason for one to be shrunk because the other is full. An earlier version
+    // tied page 2 to a fixed fraction of page 1, which made it permanently
+    // smaller than it needed to be.
+    let fit = |page_no: u8| -> Result<f64> {
+        for &size in OS_SIZE_LADDER {
+            let (p1, p2) = if page_no == 1 { (size, size) } else { (size, size) };
+            let src = only_page(&build_typst_source(case, p1, p2), page_no);
+            if compile_src(src)?.pages.len() <= 1 {
+                return Ok(size);
             }
         }
-    }
-
-    // Nothing on the ladder fit — take the smallest and say so. Three pages of
-    // a real case beats refusing to print it, but this should never happen
-    // quietly.
-    let doc = match doc {
-        Some(d) => d,
-        None => {
-            let (p1, p2) = OS_SIZE_LADDER[OS_SIZE_LADDER.len() - 1];
-            let d = compile(p1, p2)?;
-            tracing::error!(
-                "OS print overflowed two pages even at the smallest size ({p1}pt/{p2}pt) \
-                 — produced {} pages; the case has more content than the form can hold",
-                d.pages.len()
-            );
-            d
-        }
+        Ok(*OS_SIZE_LADDER.last().unwrap())
     };
+    let mut p1 = fit(1)?;
+    let mut p2 = fit(2)?;
+
+    // Each page fit alone; the combined document is checked and stepped down if
+    // the pair still overflows, up to three times, as the Python app does.
+    let step = |v: f64| -> f64 {
+        let i = OS_SIZE_LADDER.iter().position(|x| (*x - v).abs() < f64::EPSILON).unwrap_or(0);
+        OS_SIZE_LADDER[(i + 1).min(OS_SIZE_LADDER.len() - 1)]
+    };
+    let mut doc = compile_src(build_typst_source(case, p1, p2))?;
+    for _ in 0..3 {
+        if doc.pages.len() <= 2 { break; }
+        p1 = step(p1);
+        p2 = step(p2);
+        doc = compile_src(build_typst_source(case, p1, p2))?;
+    }
+    if doc.pages.len() > 2 {
+        tracing::error!(
+            "OS print still {} pages at {p1}pt/{p2}pt — more content than the form holds",
+            doc.pages.len()
+        );
+    }
 
     typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default())
         .map_err(|e| anyhow::anyhow!("Typst PDF export failed: {e:?}"))
+}
+
+/// Keep only one page of the document, so a page can be measured on its own.
+/// The Python template takes an `only_page` flag; the Typst source is a single
+/// string split by `#pagebreak()`, so the same thing is done by slicing it.
+fn only_page(src: &str, page_no: u8) -> String {
+    let Some(cut) = src.find("#pagebreak()") else { return src.to_string() };
+    if page_no == 1 {
+        src[..cut].to_string()
+    } else {
+        // Page 2 needs the document preamble — the page geometry and the base
+        // text rules — or it would be measured against Typst's defaults instead
+        // of the form's own margins.
+        let preamble_end = src.find("// \u{2550}").unwrap_or_else(|| src.find("#rect(").unwrap_or(0));
+        format!("{}\n{}", &src[..preamble_end], &src[cut + "#pagebreak()".len()..])
+    }
 }
 
 /// Generate a BR (Baggage Receipt) PDF.

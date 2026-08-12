@@ -137,9 +137,62 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
     // Seed DCR initial data (idempotent)
     seed_dcr_defaults(&conn)?;
 
+    dedupe_and_protect_items(&conn);
     backfill_search_indexes(&conn);
 
     Ok(())
+}
+
+
+/// Remove duplicate item rows, then make them impossible.
+///
+/// cops_items had no unique constraint of any kind, and the restore inserts with
+/// INSERT OR IGNORE — which ignores nothing when there is no constraint to
+/// violate. Restoring the same archive twice therefore appended a second copy of
+/// every item on every case, and a third restore a third copy. The master rows
+/// were safe because they are deduplicated in code; the items were not
+/// deduplicated anywhere.
+///
+/// The index is PARTIAL, on active rows only, exactly as cops_master's is. A
+/// deleted case may have its number reused, and the old soft-deleted items stay
+/// behind — a plain unique index would refuse the new case's first item.
+///
+/// The cleanup has to run before the index can be created, and the index cannot
+/// live in migrations.sql for the same reason: that file runs as one batch, so a
+/// CREATE UNIQUE INDEX that fails on existing duplicates would abort the whole
+/// migration and take the application down with it.
+fn dedupe_and_protect_items(conn: &rusqlite::Connection) {
+    for (table, keys) in [
+        ("cops_items", "os_no, os_year, items_sno"),
+        ("br_items",   "br_no, br_date, items_sno"),
+        ("dr_items",   "dr_no, dr_date, items_sno"),
+    ] {
+        let removed = conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE rowid NOT IN (
+                     SELECT MIN(rowid) FROM {table}
+                      WHERE entry_deleted IS NULL OR entry_deleted != 'Y'
+                      GROUP BY {keys})
+                   AND (entry_deleted IS NULL OR entry_deleted != 'Y')"
+            ),
+            [],
+        );
+        match removed {
+            Ok(n) if n > 0 => tracing::warn!("removed {n} duplicate rows from {table}"),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("could not clean duplicates from {table}: {e}");
+                continue;   // do not attempt the index over rows we failed to clean
+            }
+        }
+        let idx = format!("uq_{table}_active");
+        if let Err(e) = conn.execute_batch(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {table} ({keys})
+              WHERE entry_deleted IS NULL OR entry_deleted != 'Y'"
+        )) {
+            tracing::error!("could not create {idx} ({e}) — duplicate items remain possible");
+        }
+    }
 }
 
 /// Populate the full-text indexes on a database that already holds registers.
