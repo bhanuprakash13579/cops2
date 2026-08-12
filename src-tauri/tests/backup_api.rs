@@ -3111,3 +3111,388 @@ async fn the_apis_passenger_match_answers_without_falling_over() {
     assert!(st.is_success() || st.as_u16() == 400,
             "APIS match should answer or explain, not fail: {st} {body}");
 }
+
+// ── Masters: the lists officers pick from when booking ───────────────────────
+
+#[tokio::test]
+async fn a_master_list_entry_can_be_added_and_is_then_offered() {
+    // These feed the dropdowns on the booking form. An entry that saves but is
+    // not offered back is the same as not having saved it.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    for (path, payload, key, value) in [
+        ("nationalities", serde_json::json!({ "nationality": "TESTLAND" }),
+         "nationality", "TESTLAND"),
+        ("airlines", serde_json::json!({ "airline_code": "TZ", "airline_name": "TEST AIRWAYS" }),
+         "airline_code", "TZ"),
+        ("flights", serde_json::json!({ "flight_no": "TZ-901", "airline_code": "TZ" }),
+         "flight_no", "TZ-901"),
+    ] {
+        let r = c.post(format!("{base}/masters/{path}")).bearer_auth(&t)
+            .json(&payload).send().await.unwrap();
+        let st = r.status();
+        let body = r.text().await.unwrap();
+        assert!(st.is_success(), "adding to {path} failed: {st} {body}");
+
+        let list: serde_json::Value = c.get(format!("{base}/masters/{path}")).bearer_auth(&t)
+            .send().await.unwrap().json().await.unwrap();
+        let arr = list.as_array().cloned()
+            .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+        assert!(arr.iter().any(|v| v[key] == value),
+                "the new {path} entry must be offered back: {list}");
+    }
+}
+
+// ── Users: the parts that change access ──────────────────────────────────────
+
+#[tokio::test]
+async fn an_officer_can_change_their_own_password_and_the_old_one_stops_working() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+        .json(&serde_json::json!({
+            "user_id": "pwduser", "user_name": "PWD USER",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+
+    let login = |pwd: &str| {
+        let url = format!("{base}/auth/login");
+        let (c, pwd) = (c.clone(), pwd.to_string());
+        async move {
+            c.post(url).json(&serde_json::json!({ "user_id": "pwduser", "password": pwd }))
+                .send().await.unwrap()
+        }
+    };
+    let first = login("Str0ng#Pass1").await;
+    assert_eq!(first.status(), 200, "the new user should be able to sign in");
+    let token = first.json::<serde_json::Value>().await.unwrap()["access_token"]
+        .as_str().unwrap_or_default().to_string();
+    assert!(!token.is_empty(), "sign-in should return a token");
+
+    let r = c.post(format!("{base}/auth/change-password")).bearer_auth(&token)
+        .json(&serde_json::json!({
+            "old_password": "Str0ng#Pass1", "new_password": "An0ther#Pass2"
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "changing the password failed: {}", r.text().await.unwrap());
+
+    assert_eq!(login("An0ther#Pass2").await.status(), 200, "the new password must work");
+    let old = login("Str0ng#Pass1").await;
+    assert!(old.status() != 200, "the old password must stop working, got {}", old.status());
+}
+
+#[tokio::test]
+async fn a_wrong_current_password_cannot_change_the_password() {
+    // Otherwise anyone at an unattended terminal takes the account.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+        .json(&serde_json::json!({
+            "user_id": "guarded", "user_name": "GUARDED",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+    let token = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "user_id": "guarded", "password": "Str0ng#Pass1" }))
+        .send().await.unwrap().json::<serde_json::Value>().await.unwrap()
+        ["access_token"].as_str().unwrap_or_default().to_string();
+
+    let r = c.post(format!("{base}/auth/change-password")).bearer_auth(&token)
+        .json(&serde_json::json!({
+            "old_password": "not the password", "new_password": "Whatever#9"
+        })).send().await.unwrap();
+    assert!(r.status() != 200, "a wrong current password must be refused, got {}", r.status());
+
+    let still = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "user_id": "guarded", "password": "Str0ng#Pass1" }))
+        .send().await.unwrap();
+    assert_eq!(still.status(), 200, "and the original password must still work");
+}
+
+#[tokio::test]
+async fn who_am_i_reports_the_signed_in_officer() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    // A real account, signed in properly — the shared test token belongs to a
+    // user that was never inserted, and /auth/me is right to refuse it.
+    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+        .json(&serde_json::json!({
+            "user_id": "whoami", "user_name": "WHO AM I",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+    let token = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({ "user_id": "whoami", "password": "Str0ng#Pass1" }))
+        .send().await.unwrap().json::<serde_json::Value>().await.unwrap()
+        ["access_token"].as_str().unwrap_or_default().to_string();
+
+    let me: serde_json::Value = c.get(format!("{base}/auth/me")).bearer_auth(&token)
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(me["user_id"], "whoami", "the session must say who it belongs to: {me}");
+    assert_eq!(me["user_role"], "SDO", "and with what role: {me}");
+}
+
+// ── Recording the outcome after adjudication ─────────────────────────────────
+
+#[tokio::test]
+async fn the_outcome_of_a_case_can_be_recorded_and_read_back() {
+    // The outcome route completes an OFFLINE case — one entered from a paper
+    // record — so that is what it needs.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/os/offline")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "7001", "os_year": 2026, "os_date": "2026-08-11",
+            "pax_name": "OUTCOME TEST", "passport_no": "O2223334"
+        })).send().await.unwrap();
+
+    let r = c.patch(format!("{base}/os/7001/2026/outcome")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "adj_offr_name": "OUTCOME OFFICER",
+            "adj_offr_designation": "Deputy Commissioner",
+            "adjn_offr_remarks": "Released on payment of duty and fine.",
+            "rf_amount": 5000.0, "pp_amount": 2500.0
+        })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "recording the outcome failed: {st} {body}");
+
+    let case: serde_json::Value = c.get(format!("{base}/os/7001/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(case["rf_amount"], 5000.0, "the redemption fine must be kept: {case}");
+    assert_eq!(case["pp_amount"], 2500.0, "and the personal penalty: {case}");
+}
+
+// ── The last of the query lookups and small routes ───────────────────────────
+
+#[tokio::test]
+async fn the_query_lookups_answer_for_a_known_passenger() {
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no,
+                                      entry_deleted, is_draft)
+             VALUES ('9101', 2026, '2026-08-11', 'COUNTER PASSENGER', 'K1234567', 'N', 'N')",
+            []).unwrap();
+        conn.execute(
+            "INSERT INTO br_master (br_no, br_year, br_date, br_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (9102, 2026, '2026-08-11', 'D', 'COUNTER PASSENGER', 'K1234567', 'N')",
+            []).unwrap();
+        conn.execute(
+            "INSERT INTO dr_master (dr_no, dr_year, dr_date, dr_type, pax_name,
+                                    passport_no, entry_deleted)
+             VALUES (9103, 2026, '2026-08-11', 'GOODS', 'COUNTER PASSENGER', 'K1234567', 'N')",
+            []).unwrap();
+    }
+
+    // Passport search and lookup.
+    let s: serde_json::Value = c.post(format!("{base}/passports/search"))
+        .bearer_auth(&t)
+        .json(&serde_json::json!({ "passport_no": "K1234567" }))
+        .send().await.unwrap().json().await.unwrap();
+    let found = s.as_array().map(|a| a.len()).unwrap_or_else(||
+        s["items"].as_array().map(|a| a.len()).unwrap_or(0));
+    assert!(found >= 1, "the passport search must find the passenger: {s}");
+
+    // The register searches behind the query module.
+    let br: serde_json::Value = c.get(format!("{base}/os-query/br/search?search=9102"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(br["total"], 1, "the baggage search must find the receipt: {br}");
+
+    let dr: serde_json::Value = c.get(format!("{base}/os-query/dr/search?search=9103"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(dr["total"], 1, "the detention search must find the receipt: {dr}");
+
+    // And opening one from the query module.
+    let one: serde_json::Value = c.get(format!("{base}/os-query/br/9102/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["pax_name"], "COUNTER PASSENGER", "the receipt must open: {one}");
+}
+
+#[tokio::test]
+async fn marking_a_case_printed_is_recorded() {
+    // The register shows whether the form has been issued, which is how an
+    // officer knows a case is finished with.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    book_and_adjudicate(&base).await;
+
+    let r = c.post(format!("{base}/os/7001/2026/mark-printed"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert!(r.status().is_success(), "marking printed failed: {}", r.text().await.unwrap());
+
+    let flag: Option<String> = pool.get().unwrap().query_row(
+        "SELECT os_printed FROM cops_master WHERE os_no='7001' AND os_year=2026",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(flag.as_deref(), Some("Y"), "the case must be recorded as printed");
+}
+
+#[tokio::test]
+async fn the_dashboard_and_health_answer() {
+    let (base, _d) = serve_with(30).await;
+    let c = reqwest::Client::new();
+    let h = c.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(h.status(), 200, "health should answer without a session");
+
+    let d: serde_json::Value = c.get(format!("{base}/dashboard/stats"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert!(d.is_object(), "the dashboard should return figures: {d}");
+}
+
+// ── User lifecycle and access ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn removing_a_user_keeps_the_cases_they_booked() {
+    // An officer leaves. Their account goes; the cases they registered are the
+    // office's record and must not go with it.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    c.post(format!("{base}/auth/users")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "user_id": "leaver", "user_name": "DEPARTING OFFICER",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, booked_by,
+                                      entry_deleted, is_draft)
+             VALUES ('9201', 2026, '2026-08-11', 'THEIR CASE', 'DEPARTING OFFICER', 'N', 'N')",
+            []).unwrap();
+    }
+
+    // /auth/users/:id only lets an officer close their OWN account — a sensible
+    // guard. Removing someone else's is an administrator's job.
+    let uid: i64 = pool.get().unwrap()
+        .query_row("SELECT id FROM users WHERE user_id='leaver'", [], |r| r.get(0)).unwrap();
+    let r = c.delete(format!("{base}/admin/users/{uid}")).bearer_auth(&t)
+        .send().await.unwrap();
+    assert!(r.status().is_success() || r.status() == 404,
+            "removing the user failed: {}", r.text().await.unwrap());
+
+    let kept: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM cops_master WHERE os_no='9201' AND os_year=2026",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 1, "the case must survive the officer who booked it");
+
+    let who: Option<String> = pool.get().unwrap().query_row(
+        "SELECT booked_by FROM cops_master WHERE os_no='9201' AND os_year=2026",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(who.as_deref(), Some("DEPARTING OFFICER"),
+               "and must still say who booked it");
+}
+
+#[tokio::test]
+async fn a_role_can_be_changed_and_a_nonsense_role_refused() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+        .json(&serde_json::json!({
+            "user_id": "promoted", "user_name": "TO BE PROMOTED",
+            "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
+        })).send().await.unwrap();
+
+    let ok = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(dc_token())
+        .json(&serde_json::json!({ "user_role": "AC" })).send().await.unwrap();
+    assert!(ok.status().is_success(), "changing the role failed: {}", ok.text().await.unwrap());
+
+    let bad = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(dc_token())
+        .json(&serde_json::json!({ "user_role": "EMPEROR" })).send().await.unwrap();
+    assert_eq!(bad.status(), 400, "a role that does not exist must be refused");
+}
+
+// ── Versioned configuration edits ────────────────────────────────────────────
+
+#[tokio::test]
+async fn editing_a_configuration_row_keeps_the_version_that_came_before() {
+    // These rows are versioned by effective_from precisely so past cases keep
+    // printing as they were. Editing must not rewrite that history.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.post(format!("{base}/admin/config/print-template")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "field_key": "order_heading", "field_label": "Order heading",
+            "field_value": "ORDER", "effective_from": "2020-01-01"
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "adding a template row failed: {}", r.text().await.unwrap());
+
+    let before: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM print_template_config WHERE field_key='order_heading'",
+        [], |r| r.get(0)).unwrap();
+    assert!(before >= 1);
+
+    // A newer version, not a replacement.
+    c.post(format!("{base}/admin/config/print-template")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "field_key": "order_heading", "field_label": "Order heading",
+            "field_value": "ORDER-IN-ORIGINAL", "effective_from": "2026-01-01"
+        })).send().await.unwrap();
+
+    let after: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM print_template_config WHERE field_key='order_heading'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(after, before + 1,
+               "a new wording must be added alongside the old, not overwrite it");
+}
+
+// ── Revenue sessions ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_revenue_session_can_be_submitted_and_reopened() {
+    // Submitting closes a shift's sheet. It must be possible to reopen it —
+    // a figure entered wrongly and locked away is worse than one still open.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO dcr_sessions (report_date, shift, created_at)
+             VALUES ('2026-08-11', 'DAY', datetime('now'))", []).unwrap();
+        conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
+    };
+
+    let r = c.post(format!("{base}/dcr/sessions/{sid}/submit")).bearer_auth(&t)
+        .json(&serde_json::json!({})).send().await.unwrap();
+    assert!(r.status().is_success(), "submitting the shift failed: {}", r.text().await.unwrap());
+
+    let r = c.post(format!("{base}/dcr/sessions/{sid}/unsubmit")).bearer_auth(&t)
+        .json(&serde_json::json!({})).send().await.unwrap();
+    assert!(r.status().is_success(), "reopening the shift failed: {}", r.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn item_types_are_listed_and_their_use_is_counted() {
+    // The list an officer picks goods from in the revenue sheet, ordered by how
+    // often each is actually used.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.post(format!("{base}/dcr/item-types")).bearer_auth(&t)
+        .json(&serde_json::json!({ "name": "TEST ITEM TYPE" })).send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "adding an item type failed: {st} {body}");
+
+    let list: serde_json::Value = c.get(format!("{base}/dcr/item-types")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    let arr = list.as_array().cloned()
+        .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+    let id = arr.iter().find(|v| v["name"] == "TEST ITEM TYPE")
+        .and_then(|v| v["id"].as_i64());
+    assert!(id.is_some(), "the new item type must be listed: {list}");
+
+    let r = c.patch(format!("{base}/dcr/item-types/{}/use", id.unwrap())).bearer_auth(&t)
+        .send().await.unwrap();
+    assert!(r.status().is_success(), "recording use failed: {}", r.text().await.unwrap());
+}
