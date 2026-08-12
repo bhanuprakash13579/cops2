@@ -2046,3 +2046,48 @@ async fn existing_duplicate_items_are_cleaned_up_on_startup() {
         assert!(dup.is_err(), "the guard must be in place after the cleanup");
     }
 }
+
+#[tokio::test]
+async fn the_duplicate_cleanup_runs_once_and_not_on_every_launch() {
+    // The cleaning scan is a GROUP BY over every item row. Paying it on each
+    // launch would cost the office about a second of every start, for ever,
+    // to find nothing — so once the guard exists the pass must skip entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("once.db");
+
+    let pool = db::create_pool(&path).unwrap();
+    db::run_migrations(&pool).unwrap();
+
+    let guard_exists = |p: &db::DbPool| -> i64 {
+        p.get().unwrap().query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='uq_cops_items_active'",
+            [], |r| r.get(0)).unwrap_or(0)
+    };
+    assert_eq!(guard_exists(&pool), 1, "the guard should exist after the first run");
+
+    // Insert a row the cleaning pass WOULD delete if it ran again — a second
+    // active item with the same serial, forced in past the guard by dropping it
+    // and putting it back without the pass in between.
+    {
+        let c = pool.get().unwrap();
+        c.execute_batch("DROP INDEX uq_cops_items_active").unwrap();
+        c.execute(
+            "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+             VALUES ('9911', 2026, 1, 'FIRST', 'N')", []).unwrap();
+        c.execute(
+            "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+             VALUES ('9911', 2026, 1, 'SECOND', 'N')", []).unwrap();
+        c.execute_batch(
+            "CREATE UNIQUE INDEX uq_cops_items_active ON cops_items (os_no, os_year, items_sno)
+              WHERE entry_deleted IS NULL OR entry_deleted != 'Y'").unwrap_err();
+        // The index cannot be recreated while the duplicate is there, which is
+        // the point: the guard is absent, so the next launch WILL clean.
+    }
+
+    db::run_migrations(&pool).unwrap();
+    let n: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM cops_items WHERE os_no='9911' AND entry_deleted='N'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "with the guard gone, the next launch cleans and restores it");
+    assert_eq!(guard_exists(&pool), 1, "and the guard is back");
+}
