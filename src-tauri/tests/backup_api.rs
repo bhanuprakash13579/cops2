@@ -3028,7 +3028,7 @@ async fn legal_statutes_can_be_listed_and_added() {
         .json(&serde_json::json!({
             "keyword": "TESTKEYWORD",
             "display_name": "Test Statute",
-            "section_ref": "Section 999 of the Customs Act, 1962"
+            "legal_reference": "Section 999 of the Customs Act, 1962"
         })).send().await.unwrap();
     let st = r.status();
     let body = r.text().await.unwrap();
@@ -3495,4 +3495,269 @@ async fn item_types_are_listed_and_their_use_is_counted() {
     let r = c.patch(format!("{base}/dcr/item-types/{}/use", id.unwrap())).bearer_auth(&t)
         .send().await.unwrap();
     assert!(r.status().is_success(), "recording use failed: {}", r.text().await.unwrap());
+}
+
+// ── Admin: devices, masters retirement, statutes ─────────────────────────────
+
+#[tokio::test]
+async fn a_device_can_be_registered_disabled_and_removed() {
+    // The list of machines allowed to run the app. Disabling must be reversible;
+    // removing must not take the record of the others with it.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    for label in ["COUNTER PC ONE", "COUNTER PC TWO"] {
+        let r = c.post(format!("{base}/admin/devices")).bearer_auth(&t)
+            .json(&serde_json::json!({ "label": label, "hostname": label }))
+            .send().await.unwrap();
+        assert!(r.status().is_success(), "adding {label} failed: {}", r.text().await.unwrap());
+    }
+
+    let list: serde_json::Value = c.get(format!("{base}/admin/devices")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    let arr = list.as_array().cloned()
+        .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+    assert!(arr.len() >= 2, "both machines must be listed: {list}");
+    let id = arr[0]["id"].as_i64().expect("device id");
+
+    let r = c.put(format!("{base}/admin/devices/{id}")).bearer_auth(&t)
+        .json(&serde_json::json!({ "is_active": 0 })).send().await.unwrap();
+    assert!(r.status().is_success(), "disabling failed: {}", r.text().await.unwrap());
+
+    let r = c.delete(format!("{base}/admin/devices/{id}")).bearer_auth(&t)
+        .send().await.unwrap();
+    assert!(r.status().is_success(), "removing failed: {}", r.text().await.unwrap());
+
+    let after: serde_json::Value = c.get(format!("{base}/admin/devices")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    let left = after.as_array().cloned()
+        .or_else(|| after["items"].as_array().cloned()).unwrap_or_default();
+    assert!(!left.is_empty(), "removing one machine must leave the other: {after}");
+}
+
+#[tokio::test]
+async fn retiring_a_duty_rate_hides_it_without_erasing_what_it_was() {
+    // Past cases were charged at the old rate. Retiring it must stop it being
+    // offered, not remove the reason a past figure is what it is.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    c.post(format!("{base}/masters/duty-rates")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "duty_category": "RETIRING RATE", "from_date": "2020-01-01",
+            "bcd_rate": 35.0, "cvd_rate": 0.0
+        })).send().await.unwrap();
+
+    let id: i64 = pool.get().unwrap().query_row(
+        "SELECT id FROM duty_rate_master WHERE duty_category='RETIRING RATE'",
+        [], |r| r.get(0)).unwrap();
+
+    let r = c.put(format!("{base}/masters/duty-rates/{id}")).bearer_auth(&t)
+        .json(&serde_json::json!({})).send().await.unwrap();
+    assert!(r.status().is_success(), "retiring the rate failed: {}", r.text().await.unwrap());
+
+    let still: i64 = pool.get().unwrap().query_row(
+        "SELECT COUNT(*) FROM duty_rate_master WHERE duty_category='RETIRING RATE'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(still, 1, "the row must remain — a past case was charged at it");
+
+    let list: serde_json::Value = c.get(format!("{base}/masters/duty-rates")).bearer_auth(&t)
+        .send().await.unwrap().json().await.unwrap();
+    let arr = list.as_array().cloned()
+        .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
+    assert!(!arr.iter().any(|v| v["duty_category"] == "RETIRING RATE"),
+            "but it must stop being offered: {list}");
+}
+
+#[tokio::test]
+async fn a_statute_can_be_corrected_after_it_was_entered() {
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    c.post(format!("{base}/statutes")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "keyword": "FIXME", "display_name": "Wrong At First",
+            "legal_reference": "Section 000"
+        })).send().await.unwrap();
+    let id: i64 = pool.get().unwrap().query_row(
+        "SELECT id FROM legal_statutes WHERE keyword='FIXME'", [], |r| r.get(0)).unwrap();
+
+    let r = c.put(format!("{base}/statutes/{id}")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "keyword": "FIXME", "display_name": "Corrected",
+            "legal_reference": "Section 111(d) of the Customs Act, 1962"
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "correcting the statute failed: {}", r.text().await.unwrap());
+
+    let got: Option<String> = pool.get().unwrap().query_row(
+        "SELECT legal_reference FROM legal_statutes WHERE keyword='FIXME'", [], |r| r.get(0)).unwrap();
+    assert!(got.unwrap_or_default().contains("111(d)"), "the correction must stick");
+}
+
+// ── Remaining backup routes ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_backup_folder_can_be_tested_before_it_is_trusted() {
+    // An officer points the automatic backup at a network share. Finding out it
+    // is unwritable a week later, when it matters, is the failure this prevents.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+    let dir = tempfile::tempdir().unwrap();
+
+    let ok = c.post(format!("{base}/admin/backup/auto/test-folder")).bearer_auth(&t)
+        .json(&serde_json::json!({ "path": dir.path().to_string_lossy() }))
+        .send().await.unwrap();
+    assert_eq!(ok.status(), 200, "a writable folder must pass: {}", ok.text().await.unwrap());
+
+    let bad = c.post(format!("{base}/admin/backup/auto/test-folder")).bearer_auth(&t)
+        .json(&serde_json::json!({ "path": "/definitely/not/a/real/place" }))
+        .send().await.unwrap();
+    let bad_st = bad.status();
+    let body = bad.text().await.unwrap();
+    assert!(bad_st != 200 || body.contains("false") || body.to_lowercase().contains("error"),
+            "an unusable folder must be reported, not silently accepted: {body}");
+}
+
+#[tokio::test]
+async fn the_csv_export_returns_the_register_as_text() {
+    let (base, _d) = serve_with(25).await;
+    let r = reqwest::Client::new()
+        .get(format!("{base}/backup/export/csv")).bearer_auth(officer_token())
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200, "the CSV export must answer");
+    let body = r.text().await.unwrap();
+    assert!(body.len() > 50, "and contain the register, not an empty file");
+    assert!(body.contains(','), "a CSV should have columns: {}", &body[..body.len().min(120)]);
+}
+
+#[tokio::test]
+async fn the_adjudication_summary_pdf_is_produced() {
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    book_and_adjudicate(&base).await;
+    let r = c.post(format!("{base}/backup/adjudication-summary-pdf"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "from_date": "2026-01-01", "to_date": "2026-12-31" }))
+        .send().await.unwrap();
+    let st = r.status();
+    let bytes = r.bytes().await.unwrap();
+    assert_eq!(st, 200, "the summary failed: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(&bytes[..4], b"%PDF", "it must be a PDF");
+}
+
+// ── The last of the configuration and lookup routes ──────────────────────────
+
+#[tokio::test]
+async fn baggage_rules_and_allowances_can_be_set_and_read_back() {
+    // The free-allowance figures that decide how much duty a passenger pays.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    let r = c.post(format!("{base}/admin/config/baggage-rules")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "rule_key": "TEST_FREE_ALLOWANCE", "rule_label": "Test allowance",
+            "rule_value": 50000.0, "rule_uqc": "INR", "effective_from": "2026-01-01"
+        })).send().await.unwrap();
+    assert!(r.status().is_success(), "adding a baggage rule failed: {}", r.text().await.unwrap());
+
+    let rules: serde_json::Value = c.get(format!("{base}/admin/config/baggage-rules"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let arr = rules.as_array().cloned()
+        .or_else(|| rules["items"].as_array().cloned()).unwrap_or_default();
+    assert!(arr.iter().any(|v| v["rule_key"] == "TEST_FREE_ALLOWANCE"),
+            "the rule must be readable back: {rules}");
+
+    let r = c.post(format!("{base}/admin/config/special-allowances")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "item_name": "TEST ALLOWANCE ITEM", "keywords": "TESTITEM",
+            "allowance_qty": 2.0, "allowance_uqc": "NOS", "effective_from": "2026-01-01"
+        })).send().await.unwrap();
+    assert!(r.status().is_success(),
+            "adding a special allowance failed: {}", r.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_missing_required_field_is_named_rather_than_reported_as_a_database_error() {
+    // The class that produced "NOT NULL constraint failed: allowed_devices.label"
+    // on screen. An officer cannot act on that; they can act on a field name.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    let t = admin_token();
+
+    for (path, payload) in [
+        ("/admin/config/baggage-rules",
+         serde_json::json!({ "rule_key": "NO_VALUE", "effective_from": "2026-01-01" })),
+        ("/admin/config/special-allowances",
+         serde_json::json!({ "keywords": "NONAME", "effective_from": "2026-01-01" })),
+    ] {
+        let r = c.post(format!("{base}{path}")).bearer_auth(&t)
+            .json(&payload).send().await.unwrap();
+        let st = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(st, 400, "{path} should refuse this politely, got {st}: {body}");
+        assert!(!body.contains("NOT NULL") && !body.contains("constraint"),
+                "the officer should be told which field is missing, not shown a \
+                 database error: {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_item_description_suggestions_come_from_cases_already_booked() {
+    // Autocomplete on the booking form. It should offer what this office has
+    // actually seized, not a fixed list.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+    c.post(format!("{base}/os")).bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "os_no": "9301", "os_date": "2026-08-11",
+            "pax_name": "SUGGESTION SOURCE", "passport_no": "S1112223",
+            "items": [{ "items_sno": 1, "items_desc": "DISTINCTIVE ARTICLE XYZZY",
+                        "items_qty": 1.0, "items_value": 1000.0,
+                        "items_release_category": "Under OS" }]
+        })).send().await.unwrap();
+
+    let r = c.get(format!("{base}/os/item-descriptions")).bearer_auth(officer_token())
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200, "the suggestions must answer");
+    let body = r.text().await.unwrap();
+    assert!(body.contains("XYZZY"),
+            "a description just booked should be offered back: {}", &body[..body.len().min(200)]);
+}
+
+#[tokio::test]
+async fn a_passport_lookup_returns_the_passengers_earlier_details() {
+    // Fills the form from a previous visit, so an officer does not retype a
+    // name and risk spelling it differently the second time.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no,
+                                      pax_nationality, entry_deleted, is_draft)
+             VALUES ('9401', 2026, '2026-08-11', 'RETURNING PASSENGER', 'R9998887',
+                     'INDIAN', 'N', 'N')", []).unwrap();
+    }
+    let r: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/passports/lookup")).bearer_auth(officer_token())
+        .json(&serde_json::json!({ "passport_no": "R9998887" }))
+        .send().await.unwrap().json().await.unwrap();
+    let txt = r.to_string();
+    assert!(txt.contains("RETURNING PASSENGER"),
+            "the earlier details should come back: {r}");
+}
+
+#[tokio::test]
+async fn the_report_generator_answers_for_a_range() {
+    let (base, _d) = serve_with(40).await;
+    let r = reqwest::Client::new()
+        .get(format!("{base}/reports/generate?from_date=2026-01-01&to_date=2026-12-31"))
+        .bearer_auth(officer_token()).send().await.unwrap();
+    assert!(r.status().is_success() || r.status() == 400,
+            "the report generator should answer or explain: {} {}",
+            r.status(), r.text().await.unwrap());
 }
