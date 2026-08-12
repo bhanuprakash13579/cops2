@@ -1978,3 +1978,71 @@ async fn a_case_cannot_hold_two_items_with_the_same_serial_number() {
          VALUES ('8801', 2026, 1, 'REUSED', 'N')", []);
     assert!(reuse.is_ok(), "a reused case number must still accept its own items: {reuse:?}");
 }
+
+#[tokio::test]
+async fn existing_duplicate_items_are_cleaned_up_on_startup() {
+    // The office's database already has duplicates — the damage is done and the
+    // rows are sitting there. Preventing new ones is only half the fix; the
+    // startup pass has to remove what is already in the file, keeping one copy
+    // of each item, without touching anything else.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dupes.db");
+
+    // Build a database the way an unlucky office has one: items duplicated
+    // three times over, as three restores of the same archive would leave it.
+    {
+        let pool = db::create_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let c = pool.get().unwrap();
+        // Drop the guard so we can recreate the damage it now prevents.
+        c.execute_batch("DROP INDEX IF EXISTS uq_cops_items_active").unwrap();
+        for copy in 0..3 {
+            for sno in 1..=4 {
+                c.execute(
+                    "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc,
+                                             items_qty, items_value, entry_deleted)
+                     VALUES ('7700', 2026, ?, ?, 1.0, 500.0, 'N')",
+                    rusqlite::params![sno, format!("ITEM {sno}")],
+                ).unwrap();
+            }
+            let _ = copy;
+        }
+        // A soft-deleted row from an earlier life of this case number must survive.
+        c.execute(
+            "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+             VALUES ('7700', 2026, 1, 'OLD DELETED ITEM', 'Y')", []).unwrap();
+
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM cops_items WHERE entry_deleted='N'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 12, "the fixture should have 3 copies of 4 items");
+    }
+
+    // Reopening the database is what an officer does by launching the app.
+    {
+        let pool = db::create_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let c = pool.get().unwrap();
+
+        let active: i64 = c.query_row(
+            "SELECT COUNT(*) FROM cops_items WHERE entry_deleted='N'", [], |r| r.get(0)).unwrap();
+        assert_eq!(active, 4, "one copy of each of the four items should remain, got {active}");
+
+        let deleted: i64 = c.query_row(
+            "SELECT COUNT(*) FROM cops_items WHERE entry_deleted='Y'", [], |r| r.get(0)).unwrap();
+        assert_eq!(deleted, 1, "the soft-deleted row must be left alone");
+
+        // Nothing was lost: every serial number still has its item.
+        let snos: Vec<i64> = {
+            let mut st = c.prepare(
+                "SELECT items_sno FROM cops_items WHERE entry_deleted='N' ORDER BY items_sno").unwrap();
+            st.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+        };
+        assert_eq!(snos, vec![1, 2, 3, 4], "all four items must survive, not just one");
+
+        // And the guard is back, so it cannot happen again.
+        let dup = c.execute(
+            "INSERT INTO cops_items (os_no, os_year, items_sno, items_desc, entry_deleted)
+             VALUES ('7700', 2026, 1, 'ANOTHER', 'N')", []);
+        assert!(dup.is_err(), "the guard must be in place after the cleanup");
+    }
+}
