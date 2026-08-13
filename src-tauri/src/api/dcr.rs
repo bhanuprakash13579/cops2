@@ -116,6 +116,8 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
             "redemption_fine":  r.get::<_, f64>(19)?,
             "reexport_fine":    r.get::<_, f64>(20)?,
             "personal_penalty": r.get::<_, f64>(21)?,
+            // Derived, never stored: correct a penalty and this corrects itself.
+            "status": entry_status(r.get::<_, f64>(21)?),
             "other_charges":    r.get::<_, f64>(22)?,
             "fuel_duty":        r.get::<_, f64>(23)?,
             "total_duty":       r.get::<_, f64>(24)?,
@@ -1156,4 +1158,86 @@ pub async fn update_settings(
     ).map_err(|e| e500(&e.to_string()))?;
 
     Ok(Json(row))
+}
+
+// ── Receipts for a case, so the revenue sheet does not have to be told twice ──
+
+/// The baggage receipts belonging to an O.S., for an officer who has typed its
+/// number into the revenue sheet.
+///
+/// The association already exists: the case records its receipts when the
+/// adjudication is completed. Asking an officer to re-enter them during a shift
+/// change is asking them to copy something the register already knows, which is
+/// how the column ends up blank. Nothing is written here — the sheet fills a
+/// field the officer left empty and never touches one they typed in.
+///
+/// Accepts "520/2026" or "520" with a separate year.
+pub async fn receipts_for_os(
+    State(pool): Db,
+    _auth: AuthUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, Err> {
+    let raw = params.get("os_ref").map(|s| s.trim()).unwrap_or("");
+    if raw.is_empty() {
+        return Ok(Json(json!({ "br_numbers": [], "dr_numbers": [] })));
+    }
+    let (os_no, os_year) = match raw.split_once('/') {
+        Some((n, y)) => (n.trim().to_string(), y.trim().parse::<i64>().ok()),
+        None => (
+            raw.to_string(),
+            params.get("os_year").and_then(|y| y.trim().parse::<i64>().ok()),
+        ),
+    };
+    let Some(os_year) = os_year else {
+        return Ok(Json(json!({ "br_numbers": [], "dr_numbers": [] })));
+    };
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let collect = |table: &str, col: &str| -> Vec<String> {
+        let sql = format!(
+            "SELECT DISTINCT {col} FROM {table}
+              WHERE os_no = ?1 AND os_year = ?2 AND entry_deleted = 'N'
+              ORDER BY {col}"
+        );
+        let Ok(mut st) = conn.prepare(&sql) else { return Vec::new() };
+        st.query_map(rusqlite::params![os_no, os_year], |r| {
+            Ok(crate::api::col_text(r, 0)?.unwrap_or_default())
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).filter(|s| !s.trim().is_empty()).collect())
+        .unwrap_or_default()
+    };
+
+    let br = collect("br_master", "br_no");
+    let dr = collect("dr_master", "dr_no");
+
+    // The case may also carry them as free text from the adjudication screen.
+    let from_case: String = conn
+        .query_row(
+            "SELECT COALESCE(post_adj_br_entries,'') FROM cops_master
+              WHERE os_no = ?1 AND os_year = ?2 AND entry_deleted = 'N'",
+            rusqlite::params![os_no, os_year],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+
+    Ok(Json(json!({
+        "os_no": os_no,
+        "os_year": os_year,
+        "br_numbers": br,
+        "dr_numbers": dr,
+        "post_adj_br_entries": from_case,
+    })))
+}
+
+/// Whether a revenue line is settled.
+///
+/// The personal penalty is mandatory: unpaid, the case is still open whatever
+/// else was collected. Paid, the case is settled — on an absolute confiscation
+/// the penalty is the whole of it, and on a normal confiscation it accompanies
+/// the redemption fine and the duty.
+///
+/// Derived on read rather than stored, so it cannot drift away from the figures
+/// it describes: correct a penalty and the status corrects itself.
+pub fn entry_status(personal_penalty: f64) -> &'static str {
+    if personal_penalty > 0.0 { "CLOSED" } else { "OPEN" }
 }

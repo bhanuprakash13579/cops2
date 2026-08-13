@@ -3885,3 +3885,115 @@ async fn an_old_case_reprinted_today_shows_only_what_was_known_then() {
     assert!(!txt.contains("12/2026"),
             "nor one under another passport booked after this one");
 }
+
+// ── Revenue sheet: receipts by case, and whether a line is settled ───────────
+
+#[tokio::test]
+async fn the_revenue_sheet_can_look_up_the_receipts_for_a_case() {
+    // An officer types the O.S. number during a shift change. The register
+    // already knows which receipts belong to it; asking them to copy it across
+    // by hand is how the column ends up empty.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name,
+                                      post_adj_br_entries, entry_deleted, is_draft)
+             VALUES ('520', 2026, '2026-08-11', 'REVENUE CASE', '901/2026', 'N','N')",
+            []).unwrap();
+        for br in [901i64, 902] {
+            conn.execute(
+                "INSERT INTO br_master (br_no, br_year, br_date, br_type, pax_name,
+                                        os_no, os_year, entry_deleted)
+                 VALUES (?,2026,'2026-08-11','D','REVENUE CASE','520',2026,'N')",
+                rusqlite::params![br]).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO dr_master (dr_no, dr_year, dr_date, dr_type, pax_name,
+                                    os_no, os_year, entry_deleted)
+             VALUES (701,2026,'2026-08-11','GOODS','REVENUE CASE','520',2026,'N')",
+            []).unwrap();
+    }
+
+    // Written the way an officer types it.
+    let r: serde_json::Value = c.get(format!("{base}/dcr/receipts-for-os?os_ref=520/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let brs = r["br_numbers"].as_array().cloned().unwrap_or_default();
+    assert_eq!(brs.len(), 2, "both receipts on the case must come back: {r}");
+    assert_eq!(r["dr_numbers"].as_array().map(|a| a.len()).unwrap_or(0), 1,
+               "the detention receipt too: {r}");
+
+    // A number with the year given separately works the same way.
+    let r2: serde_json::Value = c.get(format!("{base}/dcr/receipts-for-os?os_ref=520&os_year=2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r2["br_numbers"].as_array().map(|a| a.len()).unwrap_or(0), 2,
+               "the same case, written the other way: {r2}");
+
+    // Nothing typed, nothing claimed.
+    let empty: serde_json::Value = c.get(format!("{base}/dcr/receipts-for-os?os_ref="))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(empty["br_numbers"].as_array().map(|a| a.len()).unwrap_or(9), 0,
+               "an empty reference must return nothing rather than guess: {empty}");
+
+    // A case that does not exist is not an error, just no receipts.
+    let none: serde_json::Value = c.get(format!("{base}/dcr/receipts-for-os?os_ref=9999/2026"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    assert_eq!(none["br_numbers"].as_array().map(|a| a.len()).unwrap_or(9), 0,
+               "an unknown case returns nothing: {none}");
+}
+
+#[tokio::test]
+async fn a_line_is_open_until_the_personal_penalty_is_paid() {
+    // The penalty is mandatory. Unpaid, the case is still open whatever else was
+    // collected; paid, it is settled — on an absolute confiscation the penalty is
+    // the whole of it, and on a normal one it accompanies the fine and the duty.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO dcr_sessions (report_date, shift, created_at)
+             VALUES ('2026-08-11','DAY',datetime('now'))", []).unwrap();
+        conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
+    };
+    {
+        let conn = pool.get().unwrap();
+        // duty and a fine collected, but no penalty — still open
+        conn.execute(
+            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
+                                      total_duty, redemption_fine, personal_penalty)
+             VALUES (?,1,1,'520/2026', 40000, 10000, 0)",
+            rusqlite::params![sid]).unwrap();
+        // absolute confiscation: the penalty is the whole of it
+        conn.execute(
+            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
+                                      total_duty, redemption_fine, personal_penalty)
+             VALUES (?,2,2,'521/2026', 0, 0, 5000)",
+            rusqlite::params![sid]).unwrap();
+        // normal confiscation: fine and duty alongside the penalty
+        conn.execute(
+            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
+                                      total_duty, redemption_fine, personal_penalty)
+             VALUES (?,3,3,'522/2026', 40000, 10000, 2500)",
+            rusqlite::params![sid]).unwrap();
+    }
+
+    let s: serde_json::Value = c.get(format!("{base}/dcr/sessions/{sid}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let entries = s["entries"].as_array().cloned()
+        .or_else(|| s["items"].as_array().cloned())
+        .unwrap_or_default();
+    assert_eq!(entries.len(), 3, "all three lines must come back: {s}");
+
+    let status_of = |sl: i64| -> String {
+        entries.iter().find(|e| e["sl_no"] == sl)
+            .and_then(|e| e["status"].as_str()).unwrap_or("").to_string()
+    };
+    assert_eq!(status_of(1), "OPEN",
+               "duty and a fine without the penalty leaves the case open");
+    assert_eq!(status_of(2), "CLOSED",
+               "an absolute confiscation is settled by the penalty alone");
+    assert_eq!(status_of(3), "CLOSED",
+               "penalty with fine and duty settles a normal confiscation");
+}

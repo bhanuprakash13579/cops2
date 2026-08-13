@@ -236,6 +236,28 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
     setItemTypes(prev => [...prev, res.data]);
   }, []);
 
+  /**
+   * An officer typed an O.S. number. The register already records which receipts
+   * belong to that case, so fill the receipt column from it rather than ask them
+   * to copy it across during a shift change.
+   *
+   * Deliberately timid: it fills the field only when empty, never overwrites what
+   * someone typed, and stays silent when the case is unknown or the lookup fails.
+   * A blank column is a normal outcome and must not interrupt the sheet.
+   */
+  const handleOsRefBlur = useCallback((idx: number) => {
+    const entry = entries[idx];
+    const ref = (entry?.os_ref || '').trim();
+    if (!ref) return;
+    if ((entry.br_no || '').trim()) return;   // never touch what was typed
+    api.get('/dcr/receipts-for-os', { params: { os_ref: ref } })
+      .then(res => {
+        const brs: string[] = res.data?.br_numbers ?? [];
+        if (brs.length > 0) updateEntry(idx, 'br_no', brs.join(', '));
+      })
+      .catch(() => { /* unknown case, or offline — the officer types it as before */ });
+  }, [entries, updateEntry]);
+
   const handleItemBlur = useCallback((idx: number) => {
     // Increment usage count in background
     const entry = entries[idx];
@@ -596,6 +618,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                           onChange={e => updateEntry(rowIdx, fieldKey, e.target.value)}
                           onKeyDown={e => handleCellKeyDown(e, rowIdx, colIdx)}
                           onFocus={() => setFocusCell([rowIdx, colIdx])}
+                          onBlur={fieldKey === 'os_ref' ? () => handleOsRefBlur(rowIdx) : undefined}
                           className={`w-full px-1 py-1 text-xs bg-transparent focus:outline-none focus:bg-blue-100 rounded
                             ${isBrNoCell && isOffline ? 'text-red-600 font-bold' : ''}
                           `}

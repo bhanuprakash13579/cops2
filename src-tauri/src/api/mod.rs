@@ -313,6 +313,7 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/dcr/formula-rules/:id",                put(dcr::update_rule).delete(dcr::delete_rule))
         .route("/dcr/item-types",                        get(dcr::list_item_types).post(dcr::create_item_type))
         .route("/dcr/item-types/:id/use",               patch(dcr::use_item_type))
+        .route("/dcr/receipts-for-os",                  get(dcr::receipts_for_os))
         .route("/dcr/settings",                          get(dcr::get_settings).put(dcr::update_settings))
 
         // ── Health ────────────────────────────────────────────────────────────
