@@ -117,7 +117,11 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
             "reexport_fine":    r.get::<_, f64>(20)?,
             "personal_penalty": r.get::<_, f64>(21)?,
             // Derived, never stored: correct a penalty and this corrects itself.
-            "status": entry_status(r.get::<_, f64>(21)?),
+            "status": entry_status(
+                r.get::<_, f64>(21)?,   // personal_penalty
+                r.get::<_, f64>(19)?,   // redemption_fine
+                r.get::<_, f64>(24)?,   // total_duty
+            ),
             "other_charges":    r.get::<_, f64>(22)?,
             "fuel_duty":        r.get::<_, f64>(23)?,
             "total_duty":       r.get::<_, f64>(24)?,
@@ -539,8 +543,14 @@ pub async fn bulk_save_entries(
         Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
+    // The sheet knows which receipt settled which case. Carry that across to the
+    // register, which otherwise never learns it. Outside the transaction above:
+    // a failure to link must not cost the office the shift's figures.
+    let linked = link_receipts_to_cases(&conn, id);
+
     let session = load_full_session(&conn, id)?
         .ok_or_else(|| e500("Failed to reload session after save"))?;
+    let _ = linked;
 
     Ok(Json(session))
 }
@@ -1231,13 +1241,114 @@ pub async fn receipts_for_os(
 
 /// Whether a revenue line is settled.
 ///
-/// The personal penalty is mandatory: unpaid, the case is still open whatever
-/// else was collected. Paid, the case is settled — on an absolute confiscation
-/// the penalty is the whole of it, and on a normal confiscation it accompanies
-/// the redemption fine and the duty.
+/// Two shapes, and they settle differently:
+///
+///   * Absolute confiscation — the goods are gone and only a personal penalty
+///     is due. The penalty alone settles it.
+///   * Confiscation with redemption — the passenger may take the goods back, so
+///     a redemption fine and the duty on them fall due as well as the penalty.
+///     All three are needed; two out of three is a case still owing money.
+///
+/// A redemption fine on the line is what distinguishes the second from the
+/// first: nobody is charged one unless redemption was offered.
+///
+/// The penalty is mandatory either way, so a line without it is open whatever
+/// else was collected — which is the case this rule exists to catch.
 ///
 /// Derived on read rather than stored, so it cannot drift away from the figures
 /// it describes: correct a penalty and the status corrects itself.
-pub fn entry_status(personal_penalty: f64) -> &'static str {
-    if personal_penalty > 0.0 { "CLOSED" } else { "OPEN" }
+pub fn entry_status(personal_penalty: f64, redemption_fine: f64, duty: f64) -> &'static str {
+    if personal_penalty <= 0.0 { return "OPEN"; }
+    if redemption_fine > 0.0 {
+        // Redemption was offered: the duty on the goods being taken back is due.
+        if duty > 0.0 { "CLOSED" } else { "OPEN" }
+    } else {
+        // Absolute confiscation: the penalty is the whole of it.
+        "CLOSED"
+    }
+}
+
+// ── Carrying the BR ↔ O.S. linkage back to the register ─────────────────────
+
+/// Record, on the O.S. case, the baggage receipts named against it in a shift's
+/// revenue sheet.
+///
+/// The sheet is filled every day and carries both numbers on the same line: the
+/// receipt, and the case it belongs to. The case itself is supposed to get that
+/// association through the adjudication screen, and during a shift change nobody
+/// has time to go back and open it — so the register ends up not knowing which
+/// receipt settled which case, while the revenue sheet has known all along.
+///
+/// This reads that linkage and writes it across. The receipt's date is the date
+/// of the report it appeared on, which is the day it was collected.
+///
+/// It only ever adds. An entry already on the case is left exactly as it is,
+/// including one an officer typed by hand with an amount on it — the sheet is a
+/// second source for the association, not the authority on it.
+fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize {
+    let report_date: String = conn
+        .query_row("SELECT report_date FROM dcr_sessions WHERE id = ?1", [session_id], |r| r.get(0))
+        .unwrap_or_default();
+    if report_date.trim().is_empty() { return 0; }
+
+    let pairs: Vec<(String, String)> = {
+        let Ok(mut st) = conn.prepare(
+            "SELECT br_no, os_ref FROM dcr_entries
+              WHERE session_id = ?1 AND TRIM(br_no) != '' AND TRIM(os_ref) != ''"
+        ) else { return 0 };
+        st.query_map([session_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+
+    let mut linked = 0usize;
+    for (br_no, os_ref) in pairs {
+        // "520/2026", or a bare number that cannot be placed in a year.
+        let Some((os_no, year_txt)) = os_ref.split_once('/') else { continue };
+        let (os_no, Ok(os_year)) = (os_no.trim(), year_txt.trim().parse::<i64>()) else { continue };
+        if os_no.is_empty() { continue; }
+
+        // One revenue cell may name several receipts.
+        let numbers: Vec<String> = br_no
+            .split(|c| c == ',' || c == ';' || c == '/')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if numbers.is_empty() { continue; }
+
+        let existing: String = match conn.query_row(
+            "SELECT COALESCE(post_adj_br_entries,'') FROM cops_master
+              WHERE os_no = ?1 AND os_year = ?2 AND entry_deleted = 'N'",
+            rusqlite::params![os_no, os_year], |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(_) => continue,          // no such case; the sheet may name a typo
+        };
+
+        let mut list: Vec<Value> = serde_json::from_str(&existing).unwrap_or_default();
+        let mut added = false;
+        for n in numbers {
+            let already = list.iter().any(|e| {
+                e.get("br_no").and_then(|v| v.as_str()).map(str::trim) == Some(n.as_str())
+            });
+            if already { continue; }
+            list.push(json!({ "br_no": n, "br_date": report_date, "br_amount": "" }));
+            added = true;
+        }
+        if !added { continue; }
+
+        if let Ok(encoded) = serde_json::to_string(&list) {
+            if conn.execute(
+                "UPDATE cops_master SET post_adj_br_entries = ?1
+                  WHERE os_no = ?2 AND os_year = ?3 AND entry_deleted = 'N'",
+                rusqlite::params![encoded, os_no, os_year],
+            ).is_ok() {
+                linked += 1;
+            }
+        }
+    }
+    if linked > 0 {
+        tracing::info!("revenue sheet supplied receipt links for {linked} case(s)");
+    }
+    linked
 }

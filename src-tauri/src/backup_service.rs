@@ -818,6 +818,22 @@ mod tests {
         let _ = f.set_modified(when);
     }
 
+    /// Only one test may be inside `run_once` at a time.
+    ///
+    /// The service takes `RUN_LOCK` with `try_lock`, so a second caller is turned
+    /// away with "a backup is already running" rather than made to wait — which is
+    /// what production wants and what the tests were tripping over. Cargo runs them
+    /// in parallel, so whichever test lost the race was told its backup was skipped
+    /// and failed on an assertion about the service, not about itself. A different
+    /// handful failed on every run.
+    ///
+    /// The guard is recovered after a panic (`into_inner`): one failing test should
+    /// report its own failure, not poison the rest into failing with it.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn count_backups(dir: &Path) -> usize {
         std::fs::read_dir(dir).map(|es| es.flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("cops_auto_"))
@@ -826,6 +842,7 @@ mod tests {
 
     #[test]
     fn an_edited_record_still_produces_a_backup() {
+        let _serial = one_at_a_time();
         // The change detector compared row counts and MAX(id). An UPDATE changes
         // neither, so adjudicating a case — or correcting a name, or recording an
         // outcome — left the fingerprint identical and the run was skipped. The
@@ -853,6 +870,7 @@ mod tests {
 
     #[test]
     fn writes_then_skips_when_unchanged_then_writes_again_on_change() {
+        let _serial = one_at_a_time();
         let dir = tmpdir("cycle");
         let dest = dir.join("d1");
         std::fs::create_dir_all(&dest).unwrap();
@@ -874,6 +892,7 @@ mod tests {
 
     #[test]
     fn retention_is_bounded_so_a_folder_cannot_fill_a_disk() {
+        let _serial = one_at_a_time();
         let dir = tmpdir("retain");
         let dest = dir.join("d1");
         std::fs::create_dir_all(&dest).unwrap();
@@ -894,6 +913,7 @@ mod tests {
 
     #[test]
     fn an_unreachable_folder_is_skipped_and_does_not_fail_the_run() {
+        let _serial = one_at_a_time();
         let dir = tmpdir("offline");
         let good = dir.join("good");
         std::fs::create_dir_all(&good).unwrap();
@@ -914,6 +934,7 @@ mod tests {
     /// empty.
     #[test]
     fn an_emptied_database_cannot_overwrite_good_backups() {
+        let _serial = one_at_a_time();
         let dir = tmpdir("floor");
         let dest = dir.join("d1");
         std::fs::create_dir_all(&dest).unwrap();
@@ -941,6 +962,7 @@ mod tests {
     /// lets an emptied database through — which is exactly what happened once.
     #[test]
     fn backups_that_have_all_become_unreadable_are_reported_not_ignored() {
+        let _serial = one_at_a_time();
         // What ransomware leaves behind: the files are still there, none opens.
         // The floor has nothing to measure against, so without this it would
         // wave everything through — failing silently at the one moment it is
@@ -972,6 +994,7 @@ mod tests {
 
     #[test]
     fn an_empty_folder_is_not_mistaken_for_ransomware() {
+        let _serial = one_at_a_time();
         // The ordinary first run must not be reported as an attack.
         let dir = tmpdir("firstrun");
         let dest = dir.join("d1");
@@ -985,6 +1008,7 @@ mod tests {
 
     #[test]
     fn one_machine_never_prunes_another_machines_backups() {
+        let _serial = one_at_a_time();
         // Three PCs will point at the same share. Retention keeps the newest few
         // and deletes the rest, so without a machine name in the file each PC
         // prunes the others: three machines leave two backups between them
@@ -1033,6 +1057,7 @@ mod tests {
 
     #[test]
     fn losing_a_table_outside_the_verify_list_is_still_refused() {
+        let _serial = one_at_a_time();
         // The floor used to compare only VERIFY_TABLES, so any other table could
         // be emptied and the backup would proceed, overwriting the copy that
         // still held the rows. valuables_master is deliberately NOT in that list.
@@ -1065,6 +1090,7 @@ mod tests {
 
     #[test]
     fn a_junk_file_in_the_folder_cannot_defeat_the_safety_floor() {
+        let _serial = one_at_a_time();
         let dir = tmpdir("junk");
         let dest = dir.join("d1");
         std::fs::create_dir_all(&dest).unwrap();

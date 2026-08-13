@@ -3997,3 +3997,118 @@ async fn a_line_is_open_until_the_personal_penalty_is_paid() {
     assert_eq!(status_of(3), "CLOSED",
                "penalty with fine and duty settles a normal confiscation");
 }
+
+#[tokio::test]
+async fn the_revenue_sheet_teaches_the_register_which_receipt_settled_which_case() {
+    // The sheet is filled every day and carries the receipt and the case on the
+    // same line. The case is supposed to learn that through the adjudication
+    // screen, and during a shift change nobody goes back to open it — so the
+    // register never finds out. This reads the linkage and writes it across.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO dcr_sessions (report_date, shift, created_at)
+             VALUES ('2026-08-11','DAY',datetime('now'))", []).unwrap();
+        // A case with nothing recorded against it, and one an officer already
+        // filled in by hand.
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, entry_deleted, is_draft)
+             VALUES ('520', 2026, '2026-08-11', 'NEEDS LINKING', 'N','N')", []).unwrap();
+        conn.execute(
+            "INSERT INTO cops_master (os_no, os_year, os_date, pax_name,
+                                      post_adj_br_entries, entry_deleted, is_draft)
+             VALUES ('521', 2026, '2026-08-11', 'ALREADY DONE',
+                     '[{\"br_no\":\"777\",\"br_date\":\"2026-08-01\",\"br_amount\":\"5000\"}]', 'N','N')",
+            []).unwrap();
+        conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
+    };
+
+    let r = c.put(format!("{base}/dcr/sessions/{sid}/entries"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({
+            "entries": [
+                { "sort_order": 1, "sl_no": 1, "br_no": "901", "os_ref": "520/2026",
+                  "personal_penalty": 2500.0, "redemption_fine": 10000.0, "total_duty": 40000.0 },
+                // two receipts on one line
+                { "sort_order": 2, "sl_no": 2, "br_no": "902, 903", "os_ref": "520/2026",
+                  "personal_penalty": 0.0 },
+                // a case that already has an entry — must not be disturbed
+                { "sort_order": 3, "sl_no": 3, "br_no": "777", "os_ref": "521/2026",
+                  "personal_penalty": 1000.0 },
+                // a case that does not exist — must be ignored quietly
+                { "sort_order": 4, "sl_no": 4, "br_no": "999", "os_ref": "9999/2026",
+                  "personal_penalty": 0.0 }
+            ]
+        }))
+        .send().await.unwrap();
+    let st = r.status();
+    let body = r.text().await.unwrap();
+    assert!(st.is_success(), "saving the shift failed: {st} {body}");
+
+    let conn = pool.get().unwrap();
+    let entries_of = |no: &str| -> String {
+        conn.query_row(
+            "SELECT COALESCE(post_adj_br_entries,'') FROM cops_master
+              WHERE os_no = ?1 AND os_year = 2026", [no], |r| r.get(0)).unwrap_or_default()
+    };
+
+    let linked = entries_of("520");
+    for br in ["901", "902", "903"] {
+        assert!(linked.contains(br),
+                "receipt {br} named against 520/2026 must reach the case: {linked}");
+    }
+    assert!(linked.contains("2026-08-11"),
+            "the receipt carries the date of the report it appeared on: {linked}");
+
+    // The hand-entered one is untouched, amount and all.
+    let untouched = entries_of("521");
+    assert!(untouched.contains("5000"),
+            "an entry already on the case must be left exactly as it was: {untouched}");
+    assert_eq!(untouched.matches("777").count(), 1,
+               "and must not be duplicated: {untouched}");
+}
+
+#[tokio::test]
+async fn a_redemption_case_stays_open_until_the_duty_is_paid_too() {
+    // Absolute confiscation is settled by the penalty alone. Where redemption was
+    // offered, the passenger takes the goods back, so the duty on them falls due
+    // as well — two of the three is a case still owing money.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO dcr_sessions (report_date, shift, created_at)
+             VALUES ('2026-08-11','DAY',datetime('now'))", []).unwrap();
+        conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
+    };
+    {
+        let conn = pool.get().unwrap();
+        for (sl, pp, rf, duty) in [
+            (1, 5000.0, 0.0,     0.0),      // absolute: penalty is the whole of it
+            (2, 2500.0, 10000.0, 40000.0),  // redemption: penalty, fine and duty
+            (3, 2500.0, 10000.0, 0.0),      // redemption, duty not paid
+            (4, 0.0,    10000.0, 40000.0),  // no penalty at all
+        ] {
+            conn.execute(
+                "INSERT INTO dcr_entries (session_id, sort_order, sl_no,
+                                          personal_penalty, redemption_fine, total_duty)
+                 VALUES (?,?,?,?,?,?)",
+                rusqlite::params![sid, sl, sl, pp, rf, duty]).unwrap();
+        }
+    }
+    let s: serde_json::Value = c.get(format!("{base}/dcr/sessions/{sid}"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let entries = s["entries"].as_array().cloned()
+        .or_else(|| s["items"].as_array().cloned()).unwrap_or_default();
+    let status_of = |sl: i64| -> String {
+        entries.iter().find(|e| e["sl_no"] == sl)
+            .and_then(|e| e["status"].as_str()).unwrap_or("").to_string()
+    };
+    assert_eq!(status_of(1), "CLOSED", "absolute confiscation: the penalty settles it");
+    assert_eq!(status_of(2), "CLOSED", "redemption with fine and duty paid");
+    assert_eq!(status_of(3), "OPEN",   "redemption offered but the duty is unpaid");
+    assert_eq!(status_of(4), "OPEN",   "no personal penalty, so nothing is settled");
+}
