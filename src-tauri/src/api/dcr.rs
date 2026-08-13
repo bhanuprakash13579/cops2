@@ -1301,7 +1301,8 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
             .unwrap_or_default()
     };
 
-    let mut linked = 0usize;
+    let mut added_total = 0usize;
+    let mut cases: std::collections::HashSet<(String, i64)> = Default::default();
     for (br_no, os_ref) in pairs {
         // "520/2026", or a bare number that cannot be placed in a year.
         let Some((os_no, year_txt)) = os_ref.split_once('/') else { continue };
@@ -1326,16 +1327,19 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
         };
 
         let mut list: Vec<Value> = serde_json::from_str(&existing).unwrap_or_default();
-        let mut added = false;
+        let mut added = 0usize;
         for n in numbers {
             let already = list.iter().any(|e| {
-                e.get("br_no").and_then(|v| v.as_str()).map(str::trim) == Some(n.as_str())
+                // `{"no": ..., "date": ...}` — the shape the adjudication screen
+                // writes and the printed form and the query both read back.
+                e.get("no").or_else(|| e.get("br_no"))
+                    .and_then(|v| v.as_str()).map(str::trim) == Some(n.as_str())
             });
             if already { continue; }
-            list.push(json!({ "br_no": n, "br_date": report_date, "br_amount": "" }));
-            added = true;
+            list.push(json!({ "no": n, "date": report_date }));
+            added += 1;
         }
-        if !added { continue; }
+        if added == 0 { continue; }
 
         if let Ok(encoded) = serde_json::to_string(&list) {
             if conn.execute(
@@ -1343,12 +1347,13 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
                   WHERE os_no = ?2 AND os_year = ?3 AND entry_deleted = 'N'",
                 rusqlite::params![encoded, os_no, os_year],
             ).is_ok() {
-                linked += 1;
+                added_total += added;
+                cases.insert((os_no.to_string(), os_year));
             }
         }
     }
-    if linked > 0 {
-        tracing::info!("revenue sheet supplied receipt links for {linked} case(s)");
+    if added_total > 0 {
+        tracing::info!("revenue sheet supplied {added_total} receipt(s) to {} case(s)", cases.len());
     }
-    linked
+    cases.len()
 }

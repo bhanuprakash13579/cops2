@@ -4020,7 +4020,7 @@ async fn the_revenue_sheet_teaches_the_register_which_receipt_settled_which_case
             "INSERT INTO cops_master (os_no, os_year, os_date, pax_name,
                                       post_adj_br_entries, entry_deleted, is_draft)
              VALUES ('521', 2026, '2026-08-11', 'ALREADY DONE',
-                     '[{\"br_no\":\"777\",\"br_date\":\"2026-08-01\",\"br_amount\":\"5000\"}]', 'N','N')",
+                     '[{\"no\":\"777\",\"date\":\"2026-08-01\",\"amount\":\"5000\"}]', 'N','N')",
             []).unwrap();
         conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
     };
@@ -4061,6 +4061,12 @@ async fn the_revenue_sheet_teaches_the_register_which_receipt_settled_which_case
     }
     assert!(linked.contains("2026-08-11"),
             "the receipt carries the date of the report it appeared on: {linked}");
+    // The shape matters as much as the content: the printed form, the offence
+    // list and the case query all read `no`/`date`, and an entry written under
+    // any other key is stored but never seen.
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&linked).expect("valid JSON");
+    assert!(parsed.iter().all(|e| e.get("no").is_some() && e.get("date").is_some()),
+            "every entry must use the keys the rest of the app reads: {linked}");
 
     // The hand-entered one is untouched, amount and all.
     let untouched = entries_of("521");

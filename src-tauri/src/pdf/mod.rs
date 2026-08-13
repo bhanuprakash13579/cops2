@@ -284,19 +284,41 @@ fn eff_fa(item_value: f64, item: &Value) -> f64 {
     }
 }
 
+/// The baggage receipts recorded against an adjudicated case, as they appear on
+/// the printed form.
+///
+/// The stored shape is `[{"no": "901", "date": "2026-08-11"}]` — that is what the
+/// adjudication screen writes, what the offence list reads back for editing, and
+/// what the case query displays. This function was reading `br_no` and `br_date`
+/// instead, keys that nothing in either program has ever written, so the receipt
+/// line on the printed order came out blank on every case that had one. The
+/// number was in the register and on the screen, and simply absent from the paper
+/// the officer signed.
+///
+/// Both spellings are accepted now. A field with two names in one program is a
+/// trap laid for the next person to touch it, and reading either costs nothing.
 fn fmt_br_entries(raw: &str) -> String {
     if raw.is_empty() { return String::new(); }
+    let pick = |e: &Value, a: &str, b: &str| -> String {
+        e.get(a).or_else(|| e.get(b))
+            .and_then(|x| x.as_str().map(str::to_string).or_else(|| {
+                // a number typed into the field arrives unquoted
+                x.as_i64().map(|n| n.to_string())
+            }))
+            .unwrap_or_default().trim().to_string()
+    };
     if let Ok(arr) = serde_json::from_str::<Vec<Value>>(raw) {
         arr.iter().map(|e| {
             let mut parts = Vec::new();
-            let br_no  = e.get("br_no").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let br_date= e.get("br_date").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let br_amt = e.get("br_amount").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let br_no   = pick(e, "no", "br_no");
+            let br_date = pick(e, "date", "br_date");
+            let br_amt  = pick(e, "amount", "br_amount");
             if !br_no.is_empty()   { parts.push(format!("BR No. {br_no}")); }
-            if !br_date.is_empty() { parts.push(format!("Dt. {br_date}")); }
+            // dd/mm/yyyy, like every other date on the form
+            if !br_date.is_empty() { parts.push(format!("Dt. {}", fmt_date(&br_date))); }
             if !br_amt.is_empty()  { parts.push(format!("Rs. {br_amt}")); }
             parts.join(" / ")
-        }).collect::<Vec<_>>().join("\n")
+        }).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
     } else { raw.to_string() }
 }
 
@@ -1100,4 +1122,36 @@ fn build_dr_typst_source(case: &Value) -> String {
 #v(0.5em)
 *Total Value of Detained Goods:* Rs.#h(0.3em){total_v}
 "##)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_printed_form_shows_the_receipts_the_app_actually_stored() {
+        // The adjudication screen stores `{"no": …, "date": …}`. The printer was
+        // looking for `br_no`/`br_date`, so the receipt line came out blank on
+        // every case that had one — present in the register, absent from the
+        // paper the officer signs.
+        let out = fmt_br_entries(r#"[{"no":"901","date":"2026-08-11"}]"#);
+        assert!(out.contains("BR No. 901"), "the number must reach the form: {out}");
+        assert!(out.contains("11/08/2026"), "and its date, written as dates are elsewhere: {out}");
+
+        // A receipt typed straight into the field arrives as a number.
+        assert!(fmt_br_entries(r#"[{"no":902,"date":"2026-08-11"}]"#).contains("BR No. 902"));
+
+        // Several receipts against one case, one to a line.
+        let many = fmt_br_entries(
+            r#"[{"no":"901","date":"2026-08-11"},{"no":"902","date":"2026-08-12"}]"#);
+        assert_eq!(many.lines().count(), 2, "one receipt to a line: {many}");
+
+        // Nothing recorded prints nothing, rather than an empty "BR No. /".
+        assert_eq!(fmt_br_entries("[]"), "");
+        assert_eq!(fmt_br_entries(r#"[{"no":"","date":""}]"#), "");
+
+        // An amount, where an officer entered one.
+        assert!(fmt_br_entries(r#"[{"no":"901","date":"2026-08-11","amount":"5000"}]"#)
+                .contains("Rs. 5000"));
+    }
 }
