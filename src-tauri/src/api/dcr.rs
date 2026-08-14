@@ -116,12 +116,6 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
             "redemption_fine":  r.get::<_, f64>(19)?,
             "reexport_fine":    r.get::<_, f64>(20)?,
             "personal_penalty": r.get::<_, f64>(21)?,
-            // Derived, never stored: correct a penalty and this corrects itself.
-            "status": entry_status(
-                r.get::<_, f64>(21)?,   // personal_penalty
-                r.get::<_, f64>(19)?,   // redemption_fine
-                r.get::<_, f64>(24)?,   // total_duty
-            ),
             "other_charges":    r.get::<_, f64>(22)?,
             "fuel_duty":        r.get::<_, f64>(23)?,
             "total_duty":       r.get::<_, f64>(24)?,
@@ -134,6 +128,8 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
             "cess_on_cig":      r.get::<_, f64>(29)?,
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+
+    let entries = settle_cases(entries);
 
     // Load DR entries
     let mut stmt2 = conn.prepare(
@@ -1191,13 +1187,18 @@ pub async fn receipts_for_os(
     if raw.is_empty() {
         return Ok(Json(json!({ "br_numbers": [], "dr_numbers": [] })));
     }
-    let (os_no, os_year) = match raw.split_once('/') {
-        Some((n, y)) => (n.trim().to_string(), y.trim().parse::<i64>().ok()),
+    // The same reading as the write-back uses, so what the sheet fills in and
+    // what the register learns can never disagree about which case was meant.
+    let (os_no, os_year) = match parse_os_ref(raw) {
+        Some((n, y)) => (n, Some(y)),
         None => (
-            raw.to_string(),
+            raw.trim().trim_start_matches('0').to_string(),
             params.get("os_year").and_then(|y| y.trim().parse::<i64>().ok()),
         ),
     };
+    if os_no.is_empty() || !os_no.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(Json(json!({ "br_numbers": [], "dr_numbers": [] })));
+    }
     let Some(os_year) = os_year else {
         return Ok(Json(json!({ "br_numbers": [], "dr_numbers": [] })));
     };
@@ -1239,6 +1240,77 @@ pub async fn receipts_for_os(
     })))
 }
 
+/// The duty proper, out of a line's grand total.
+///
+/// The "Total Duty" column is the sum of every money column, the fine and the
+/// penalty among them — the sheet's own `SUM(G:V)`. Passing it in as the duty
+/// made the duty test true whenever anything at all had been paid, so a
+/// redemption case with no duty on it still read as settled. This takes the
+/// charges back out and leaves what was actually charged as duty.
+fn duty_of(e: &Value) -> f64 {
+    let f = |k: &str| e.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    (f("total_duty") - f("redemption_fine") - f("reexport_fine")
+        - f("personal_penalty") - f("other_charges")).max(0.0)
+}
+
+/// Mark each line of the sheet with the standing of the case it names.
+///
+/// A case is very often settled across more than one receipt on the same shift:
+/// the penalty on one, the fine and the duty on another, sometimes on an SBI
+/// challan rather than a baggage receipt. Judging each line on its own called
+/// the second of those OPEN — the fine had been paid but no penalty appeared on
+/// that line — while the case was in fact fully settled. Eleven per cent of this
+/// month's linked lines read wrongly that way.
+///
+/// So the money is added up per case first, and every line naming that case
+/// carries the same verdict. A line that names no case carries none at all: an
+/// ordinary duty receipt is not an offence awaiting payment, and marking it OPEN
+/// was noise on nearly every row of the sheet.
+///
+/// Receipts against the same case on a different day are not in hand here. A
+/// case settled across two shifts still shows OPEN on the first of them, which
+/// is what the officer sees on the day and is true when they see it.
+fn settle_cases(entries: Vec<Value>) -> Vec<Value> {
+    use std::collections::HashMap;
+    let text = |e: &Value, k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+
+    // A receipt whose goods run over several lines names its case once, on the
+    // first of them. The lines below carry the same receipt number, so that is
+    // what ties them to the case.
+    let mut by_receipt: HashMap<String, (String, i64)> = HashMap::new();
+    for e in &entries {
+        let (br, Some(case)) = (text(e, "br_no"), parse_os_ref(&text(e, "os_ref"))) else { continue };
+        if br.is_empty() { continue; }
+        by_receipt.entry(br).or_insert(case);
+    }
+    let case_of = |e: &Value| -> Option<(String, i64)> {
+        parse_os_ref(&text(e, "os_ref"))
+            .or_else(|| by_receipt.get(&text(e, "br_no")).cloned())
+    };
+
+    let mut totals: HashMap<(String, i64), (f64, f64, f64)> = HashMap::new();
+    for e in &entries {
+        let Some(case) = case_of(e) else { continue };
+        let g = |k: &str| e.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let t = totals.entry(case).or_insert((0.0, 0.0, 0.0));
+        t.0 += g("personal_penalty");
+        t.1 += g("redemption_fine");
+        t.2 += duty_of(e);
+    }
+
+    entries.into_iter().map(|mut e| {
+        let verdict = case_of(&e).and_then(|c| totals.get(&c))
+            .map(|&(pp, rf, duty)| entry_status(pp, rf, duty));
+        if let Some(obj) = e.as_object_mut() {
+            obj.insert("status".into(), match verdict {
+                Some(v) => json!(v),
+                None    => Value::Null,
+            });
+        }
+        e
+    }).collect()
+}
+
 /// Whether a revenue line is settled.
 ///
 /// Two shapes, and they settle differently:
@@ -1269,6 +1341,61 @@ pub fn entry_status(personal_penalty: f64, redemption_fine: f64, duty: f64) -> &
 }
 
 // ── Carrying the BR ↔ O.S. linkage back to the register ─────────────────────
+
+/// The case a revenue line names, read out of whatever the officer typed.
+///
+/// Almost every line carries a bare `481/2026`, but the column is free text and
+/// the month's reports also hold `OS No. 501/2026` and
+/// `OS 527/2025 DATED 22.07.2025` — an older case settled now, with the date of
+/// the original order written alongside. Splitting on the first slash finds the
+/// year in one of those and nothing usable in the other, so both were passed
+/// over in silence.
+///
+/// A short year is taken as this century — `520/26` is case 520 of 2026, which
+/// is the only thing anyone typing it means. Nothing is settled on the strength
+/// of that reading alone: the case still has to exist in the register, and a
+/// number that matches nothing is passed over.
+///
+/// The trap this guards against is a date. `22/07/2025` in the case column would
+/// otherwise be read as case 7 of 2025 and quietly settle somebody else's case,
+/// so a number that follows a slash, dot or dash — as the middle of a date does
+/// — is not a case number.
+pub fn parse_os_ref(raw: &str) -> Option<(String, i64)> {
+    let c: Vec<char> = raw.chars().collect();
+    for (i, ch) in c.iter().enumerate() {
+        if *ch != '/' { continue; }
+
+        // the digits before the slash
+        let mut e = i;
+        while e > 0 && c[e - 1].is_whitespace() { e -= 1; }
+        let mut b = e;
+        while b > 0 && c[b - 1].is_ascii_digit() { b -= 1; }
+        if b == e || e - b > 5 { continue; }
+        // part of a date, or of something longer
+        if b > 0 && matches!(c[b - 1], '/' | '.' | '-') { continue; }
+
+        // and the four-digit year after it
+        let mut k = i + 1;
+        while k < c.len() && c[k].is_whitespace() { k += 1; }
+        let ys = k;
+        while k < c.len() && c[k].is_ascii_digit() { k += 1; }
+        let digits = k - ys;
+        if digits != 4 && digits != 2 { continue; }
+        if k < c.len() && matches!(c[k], '/' | '.' | '-') && c.get(k + 1).is_some_and(|x| x.is_ascii_digit()) {
+            continue;                                   // a date carries on
+        }
+
+        let mut year: i64 = c[ys..k].iter().collect::<String>().parse().ok()?;
+        if digits == 2 { year += 2000; }                // "26" is this century
+        if !(2000..=2100).contains(&year) { continue; }
+
+        let no: String = c[b..e].iter().collect();
+        let no = no.trim_start_matches('0');
+        if no.is_empty() { continue; }
+        return Some((no.to_string(), year));
+    }
+    None
+}
 
 /// Record, on the O.S. case, the baggage receipts named against it in a shift's
 /// revenue sheet.
@@ -1304,10 +1431,8 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
     let mut added_total = 0usize;
     let mut cases: std::collections::HashSet<(String, i64)> = Default::default();
     for (br_no, os_ref) in pairs {
-        // "520/2026", or a bare number that cannot be placed in a year.
-        let Some((os_no, year_txt)) = os_ref.split_once('/') else { continue };
-        let (os_no, Ok(os_year)) = (os_no.trim(), year_txt.trim().parse::<i64>()) else { continue };
-        if os_no.is_empty() { continue; }
+        let Some((os_no, os_year)) = parse_os_ref(&os_ref) else { continue };
+        let os_no = os_no.as_str();
 
         // One revenue cell may name several receipts.
         let numbers: Vec<String> = br_no
@@ -1356,4 +1481,40 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
         tracing::info!("revenue sheet supplied {added_total} receipt(s) to {} case(s)", cases.len());
     }
     cases.len()
+}
+
+#[cfg(test)]
+mod os_ref_tests {
+    use super::parse_os_ref;
+
+    #[test]
+    fn the_case_number_is_read_out_of_what_the_officer_actually_typed() {
+        // Every form the column takes in this month's reports.
+        assert_eq!(parse_os_ref("481/2026"),          Some(("481".into(), 2026)));
+        assert_eq!(parse_os_ref("OS No. 501/2026"),   Some(("501".into(), 2026)));
+        assert_eq!(parse_os_ref("OS 527/2025 DATED 22.07.2025"),
+                                                      Some(("527".into(), 2025)));
+        // An old case settled now is read as its own year, not the year it was paid.
+        assert_eq!(parse_os_ref("OS 527/2025 DATED 22.07.2025").unwrap().1, 2025);
+
+        // Spacing and leading zeros as they get typed.
+        assert_eq!(parse_os_ref(" 520 / 2026 "),      Some(("520".into(), 2026)));
+        assert_eq!(parse_os_ref("0520/2026"),         Some(("520".into(), 2026)));
+
+        // A date in the case column must never be read as a case. This one would
+        // otherwise settle case 7 of 2025 — somebody else's case entirely.
+        assert_eq!(parse_os_ref("22/07/2025"), None);
+        assert_eq!(parse_os_ref("PAID ON 1/8/2026"), None);
+
+        // A year written short is this century.
+        assert_eq!(parse_os_ref("520/26"), Some(("520".into(), 2026)));
+        // But a date is still a date, whichever way the year is written.
+        assert_eq!(parse_os_ref("22/07/25"), None);
+        assert_eq!(parse_os_ref("PAID 1/8/26"), None);
+
+        // Notes and empty cells name no case.
+        assert_eq!(parse_os_ref("* 4 BRS CONTAIN MULTIPLE ITEMS"), None);
+        assert_eq!(parse_os_ref("520"), None);
+        assert_eq!(parse_os_ref(""), None);
+    }
 }

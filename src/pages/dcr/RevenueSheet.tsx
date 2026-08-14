@@ -65,6 +65,12 @@ function safeParseOverrides(raw: string | null | undefined): string[] {
   try { return JSON.parse(raw || '[]'); } catch { return []; }
 }
 
+/** Re-add the row, unless the officer has written the total in themselves. */
+function retotal(entry: DrEntry) {
+  if (safeParseOverrides(entry.overrides).includes('total_duty')) return;
+  entry.total_duty = computeTotal(entry);
+}
+
 export default function RevenueSheet({ session: initialSession, rules, onMessage, onConfig }: Props) {
   const [session, setSession] = useState<DrSession>(initialSession);
   const [entries, setEntries] = useState<DrEntry[]>(
@@ -176,7 +182,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
             if (!(col in computed)) (entry as Record<string, unknown>)[col] = 0;
           }
           Object.assign(entry, computed);
-          entry.total_duty = computeTotal(entry);
+          retotal(entry);
           // clear overrides for auto-fields when item changes
           const autoFields = getAutoFields(rules, rawValue as string);
           const overrides = safeParseOverrides(entry.overrides);
@@ -191,7 +197,25 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
           for (const [k, v] of Object.entries(computed)) {
             if (!overrides.includes(k)) (entry as Record<string, unknown>)[k] = v;
           }
+          retotal(entry);
+        }
+      } else if (field === 'total_duty') {
+        // The total is the sum of every money column, and an officer who can see
+        // that it is wrong should be able to say so. A figure typed here stands:
+        // the columns underneath are left exactly as they are, and no later edit
+        // on the row recomputes it away — today or when the sheet is reopened.
+        //
+        // Emptying the cell hands it back to the formula. An override has to be
+        // undoable, or one slip of the keyboard is permanent.
+        const overrides = safeParseOverrides(entry.overrides);
+        if (String(rawValue).trim() === '') {
+          entry.overrides = JSON.stringify(overrides.filter(f => f !== 'total_duty'));
           entry.total_duty = computeTotal(entry);
+        } else {
+          entry.total_duty = Number(rawValue) || 0;
+          if (!overrides.includes('total_duty')) {
+            entry.overrides = JSON.stringify([...overrides, 'total_duty']);
+          }
         }
       } else if (ENTRY_COLS.find(c => c.key === field)?.type === 'num') {
         const numVal = Number(rawValue) || 0;
@@ -204,7 +228,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
           if (!overrides.includes(field)) overrides.push(field);
           entry.overrides = JSON.stringify(overrides);
         }
-        entry.total_duty = computeTotal(entry);
+        retotal(entry);
       } else {
         (entry as Record<string, unknown>)[field] = rawValue;
       }
@@ -226,6 +250,83 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
     scheduleAutoSave();
   }, [scheduleAutoSave]);
 
+  /**
+   * Another item on the same receipt.
+   *
+   * One BR often covers several things — a laptop, a bottle, a phone — and each
+   * gets its own line so its duty is worked out on its own. Officers were doing
+   * that by adding a row and typing the receipt number again, which is where a
+   * digit gets dropped and the items end up on two different receipts.
+   *
+   * This puts the line in directly below, with the receipt number and the flight
+   * already on it, and drops the cursor on the item. Nothing else is copied: the
+   * value and the duty belong to the item, not to the receipt.
+   */
+  const addItemToBr = useCallback((idx: number) => {
+    setEntries(prev => {
+      const from = prev[idx];
+      if (!from) return prev;
+      const next = [...prev];
+      next.splice(idx + 1, 0, {
+        ...blankEntry(next.length),
+        br_no: from.br_no,
+        flight_no: from.flight_no,
+        is_offline_br: from.is_offline_br,
+        is_sbi_challan: from.is_sbi_challan,
+      });
+      return next;
+    });
+    scheduleAutoSave();
+    // onto the item description of the line just made
+    const itemCol = ENTRY_COLS.findIndex(c => c.key === 'item_desc');
+    setTimeout(() => cellRefs.current.get(`${idx + 1}-${itemCol}`)?.focus(), 0);
+  }, [scheduleAutoSave]);
+
+  /**
+   * The right-click menu on a row of the sheet.
+   *
+   * The row's own actions sit behind a hover, which is fine once you know they
+   * are there. A right-click is where anyone looks first, and it can say which
+   * receipt it is about — "Add item to BR 49773" rather than an unlabelled plus,
+   * so nobody has to work out which row the cursor was on.
+   */
+  const [rowMenu, setRowMenu] = useState<{ x: number; y: number; row: number } | null>(null);
+
+  useEffect(() => {
+    if (!rowMenu) return;
+    const close = () => setRowMenu(null);
+    const onKey = (ev: KeyboardEvent) => { if (ev.key === 'Escape') close(); };
+    // capture: a click anywhere dismisses it, including inside the sheet
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('resize', close);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', close);
+    };
+  }, [rowMenu]);
+
+  /**
+   * The same thing again, on the next receipt.
+   *
+   * A shift is full of near-identical lines — four passengers off the same
+   * flight with the same phone, at the same value. Everything is carried over
+   * except what must differ: the receipt number and any O.S. it was linked to.
+   */
+  const duplicateRow = useCallback((idx: number) => {
+    setEntries(prev => {
+      const from = prev[idx];
+      if (!from) return prev;
+      const next = [...prev];
+      next.splice(idx + 1, 0, { ...from, id: undefined, br_no: '', os_ref: '' });
+      return next;
+    });
+    scheduleAutoSave();
+    const brCol = ENTRY_COLS.findIndex(c => c.key === 'br_no');
+    setTimeout(() => cellRefs.current.get(`${idx + 1}-${brCol}`)?.focus(), 0);
+  }, [scheduleAutoSave]);
+
   const deleteRow = useCallback((idx: number) => {
     setEntries(prev => prev.length <= 1 ? [blankEntry(0)] : prev.filter((_, i) => i !== idx));
     scheduleAutoSave();
@@ -245,6 +346,20 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
    * someone typed, and stays silent when the case is unknown or the lookup fails.
    * A blank column is a normal outcome and must not interrupt the sheet.
    */
+  // What the hand-set totals come to, against what the columns say. The report's
+  // consolidated sheet adds the columns up head by head, so any difference here
+  // is one the officer will see between the two sheets. It is shown rather than
+  // quietly corrected: the figure they typed is the one they meant.
+  const handTotalled = useMemo(() => {
+    let count = 0, delta = 0;
+    for (const e of entries) {
+      if (!safeParseOverrides(e.overrides).includes('total_duty')) continue;
+      count += 1;
+      delta += (e.total_duty || 0) - computeTotal(e);
+    }
+    return { count, delta };
+  }, [entries]);
+
   const handleOsRefBlur = useCallback((idx: number) => {
     const entry = entries[idx];
     const ref = (entry?.os_ref || '').trim();
@@ -499,7 +614,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                   {col.label}{col.key === 'gold_weight_gms' ? <span className="text-red-400 ml-0.5">*</span> : null}
                 </th>
               ))}
-              <th className="w-8 px-1" />
+              <th className="w-14 px-1" />
             </tr>
           </thead>
 
@@ -509,7 +624,12 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
               const rowBg = isSbi ? 'bg-red-50' : rowIdx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
 
               return (
-                <tr key={rowIdx} className={`${rowBg} hover:bg-blue-50/50 group border-b border-slate-200`}>
+                <tr key={rowIdx} className={`${rowBg} hover:bg-blue-50/50 group border-b border-slate-200`}
+                  onContextMenu={ev => {
+                    ev.preventDefault();
+                    setRowMenu({ x: ev.clientX, y: ev.clientY, row: rowIdx });
+                  }}
+                >
                   {/* Row number */}
                   <td className="text-center text-[10px] text-slate-400 px-1 border-r border-slate-200 w-8">
                     {rowIdx + 1}
@@ -596,9 +716,9 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                             onChange={e => updateEntry(rowIdx, fieldKey, e.target.value)}
                             onKeyDown={e => handleCellKeyDown(e, rowIdx, colIdx)}
                             onFocus={() => setFocusCell([rowIdx, colIdx])}
-                            readOnly={col.key === 'total_duty'}
+
                             className={`w-full px-1 py-1 text-right focus:outline-none focus:bg-blue-100 rounded text-xs
-                              ${col.key === 'total_duty' ? 'font-bold cursor-default' : ''}
+                              ${col.key === 'total_duty' ? 'font-bold' : ''}
                               ${hasError ? 'bg-red-100 text-red-700 placeholder-red-400 font-semibold' : 'bg-transparent ' + (isAutoField && !isOverridden ? 'text-blue-700' : 'text-slate-800')}
                             `}
                             ref={el => { if (el) cellRefs.current.set(`${rowIdx}-${colIdx}`, el); }}
@@ -628,10 +748,19 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                     );
                   })}
 
-                  {/* Delete button */}
-                  <td className="w-8 border-r border-slate-200 text-center">
+                  {/* Row actions */}
+                  <td className="w-14 border-r border-slate-200 text-center whitespace-nowrap">
+                    <button
+                      onClick={() => addItemToBr(rowIdx)}
+                      title="Add another item to this BR"
+                      disabled={!entry.br_no}
+                      className="opacity-0 group-hover:opacity-100 text-blue-500 hover:text-blue-700 disabled:text-slate-300 p-0.5 transition-opacity"
+                    >
+                      <Plus size={12} />
+                    </button>
                     <button
                       onClick={() => deleteRow(rowIdx)}
+                      title="Delete this row"
                       className="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 p-0.5 transition-opacity"
                     >
                       <Trash2 size={12} />
@@ -858,9 +987,64 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
         )}
       </div>
 
+      {/* The row's right-click menu, named for the receipt it acts on. */}
+      {rowMenu && (() => {
+        const row = entries[rowMenu.row];
+        if (!row) return null;
+        const br = (row.br_no || '').trim();
+        const item = (label: string, onPick: () => void, disabled = false) => (
+          <button
+            key={label}
+            disabled={disabled}
+            onMouseDown={ev => { ev.stopPropagation(); }}
+            onClick={() => { onPick(); setRowMenu(null); }}
+            className="w-full text-left px-3 py-1.5 text-xs text-slate-700 hover:bg-blue-50
+                       disabled:text-slate-300 disabled:hover:bg-transparent whitespace-nowrap"
+          >
+            {label}
+          </button>
+        );
+        return (
+          <div
+            style={{
+              // kept inside the window when the click lands near an edge
+              left: Math.min(rowMenu.x, window.innerWidth - 240),
+              top: Math.min(rowMenu.y, window.innerHeight - 150),
+            }}
+            className="fixed z-[9990] min-w-[13rem] py-1 bg-white rounded-lg shadow-xl border border-slate-200"
+          >
+            <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-slate-400 border-b border-slate-100">
+              {br ? `BR ${br}` : 'This row'}
+            </div>
+            {item(br ? `Add item to BR ${br}` : 'Add item to this BR',
+                  () => addItemToBr(rowMenu.row), !br)}
+            {item('Duplicate, without the receipt number', () => duplicateRow(rowMenu.row))}
+            {item('Insert an empty row below', () => addRow(rowMenu.row))}
+            {safeParseOverrides(row.overrides).includes('total_duty') &&
+              item('Put the total back on the formula',
+                   () => updateEntry(rowMenu.row, 'total_duty', ''))}
+            {item('Delete this row', () => deleteRow(rowMenu.row))}
+          </div>
+        );
+      })()}
+
       {/* Footer status */}
       <div className="px-4 py-1.5 bg-slate-800 text-slate-300 text-[11px] flex items-center gap-4 shrink-0">
         <span>{entries.filter(e => e.br_no || e.item_desc).length} entries</span>
+        {handTotalled.count > 0 && (
+          <span
+            className="text-amber-300"
+            title={'The consolidated sheet adds the duty, fine and penalty columns up head by head, '
+                 + 'so it will not match a total that was set by hand. Empty the cell to put a row '
+                 + 'back on the formula.'}
+          >
+            {handTotalled.count} total{handTotalled.count > 1 ? 's' : ''} set by hand
+            {Math.round(handTotalled.delta) !== 0 && (
+              <> — ₹{Math.abs(Math.round(handTotalled.delta)).toLocaleString('en-IN')}
+                {handTotalled.delta > 0 ? ' above' : ' below'} the columns</>
+            )}
+          </span>
+        )}
         <span>Total Duty: <strong className="text-white">₹{Math.round(totals['total_duty'] || 0).toLocaleString('en-IN')}</strong></span>
         <span>DR: <strong className="text-white">₹{Math.round(drEntries.reduce((s, e) => s + e.amount, 0)).toLocaleString('en-IN')}</strong></span>
         <span>OS: <strong className="text-white">₹{Math.round(osEntries.reduce((s, e) => s + e.amount, 0)).toLocaleString('en-IN')}</strong></span>

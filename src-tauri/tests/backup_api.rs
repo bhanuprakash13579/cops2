@@ -4077,44 +4077,65 @@ async fn the_revenue_sheet_teaches_the_register_which_receipt_settled_which_case
 }
 
 #[tokio::test]
-async fn a_redemption_case_stays_open_until_the_duty_is_paid_too() {
+async fn a_case_is_settled_across_all_the_receipts_that_paid_it() {
+    // Every figure below is taken from a real shift this month.
+    //
     // Absolute confiscation is settled by the penalty alone. Where redemption was
-    // offered, the passenger takes the goods back, so the duty on them falls due
-    // as well — two of the three is a case still owing money.
+    // allowed the passenger takes the goods back, so the duty falls due as well,
+    // and a case with the fine paid but no duty on it is still owing.
+    //
+    // The catch the reports showed: a case is very often paid on two receipts —
+    // the penalty on one, the fine and duty on another, often an SBI challan.
+    // Judged line by line, the second read OPEN while the case was fully settled.
     let (base, _d, pool) = serve_with_pool(0).await;
     let c = reqwest::Client::new();
     let sid: i64 = {
         let conn = pool.get().unwrap();
         conn.execute(
             "INSERT INTO dcr_sessions (report_date, shift, created_at)
-             VALUES ('2026-08-11','DAY',datetime('now'))", []).unwrap();
+             VALUES ('2026-08-10','DAY',datetime('now'))", []).unwrap();
         conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
     };
     {
         let conn = pool.get().unwrap();
-        for (sl, pp, rf, duty) in [
-            (1, 5000.0, 0.0,     0.0),      // absolute: penalty is the whole of it
-            (2, 2500.0, 10000.0, 40000.0),  // redemption: penalty, fine and duty
-            (3, 2500.0, 10000.0, 0.0),      // redemption, duty not paid
-            (4, 0.0,    10000.0, 40000.0),  // no penalty at all
+        // (sl, os_ref, rf, reexport, pp, other, total) — total is SUM(G:V), the
+        // sheet's own grand total, fine and penalty included.
+        for (sl, os_ref, rf, rex, pp, oth, total) in [
+            (1, "484/2026",  0.0,      0.0, 5000.0,  0.0,   5000.0),  // confiscation
+            (2, "481/2026",  5000.0,   0.0, 5000.0,  0.0,  24700.0),  // redemption, duty paid
+            (3, "516/2026",  75000.0,  0.0, 10000.0, 20.0, 85020.0),  // no duty on it
+            (4, "517/2026",  0.0,      0.0, 5000.0,  0.0,   5000.0),  // penalty receipt
+            (5, "517/2026",  1500.0,   0.0, 0.0,     0.0,  23375.0),  // SBI challan
+            (6, "OS 527/2025 DATED 22.07.2025",
+                             30000.0, 600000.0, 0.0, 0.0, 761373.0),  // no penalty
+            (7, "",          0.0,      0.0, 0.0,     0.0,   8750.0),  // ordinary duty
         ] {
             conn.execute(
-                "INSERT INTO dcr_entries (session_id, sort_order, sl_no,
-                                          personal_penalty, redemption_fine, total_duty)
-                 VALUES (?,?,?,?,?,?)",
-                rusqlite::params![sid, sl, sl, pp, rf, duty]).unwrap();
+                "INSERT INTO dcr_entries (session_id, sort_order, sl_no, br_no, os_ref,
+                     redemption_fine, reexport_fine, personal_penalty, other_charges, total_duty)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![sid, sl, sl, format!("4{sl}000"), os_ref,
+                                  rf, rex, pp, oth, total]).unwrap();
         }
     }
+
     let s: serde_json::Value = c.get(format!("{base}/dcr/sessions/{sid}"))
         .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
     let entries = s["entries"].as_array().cloned()
         .or_else(|| s["items"].as_array().cloned()).unwrap_or_default();
-    let status_of = |sl: i64| -> String {
-        entries.iter().find(|e| e["sl_no"] == sl)
-            .and_then(|e| e["status"].as_str()).unwrap_or("").to_string()
+    let at = |sl: i64| -> serde_json::Value {
+        entries.iter().find(|e| e["sl_no"] == sl).cloned().unwrap_or(serde_json::Value::Null)
     };
-    assert_eq!(status_of(1), "CLOSED", "absolute confiscation: the penalty settles it");
-    assert_eq!(status_of(2), "CLOSED", "redemption with fine and duty paid");
-    assert_eq!(status_of(3), "OPEN",   "redemption offered but the duty is unpaid");
-    assert_eq!(status_of(4), "OPEN",   "no personal penalty, so nothing is settled");
+
+    assert_eq!(at(1)["status"], "CLOSED", "confiscation: the penalty is the whole of it");
+    assert_eq!(at(2)["status"], "CLOSED", "redemption with the duty paid");
+    assert_eq!(at(3)["status"], "OPEN",
+               "the fine was paid and no duty was — the goods went back untaxed");
+    assert_eq!(at(4)["status"], "CLOSED", "penalty receipt of a case paid on two");
+    assert_eq!(at(5)["status"], "CLOSED",
+               "and the challan that paid its fine and duty — judged alone it read OPEN");
+    assert_eq!(at(6)["status"], "OPEN", "no personal penalty was collected at all");
+    assert!(at(7)["status"].is_null(),
+            "an ordinary duty receipt names no case and awaits nothing: {}", at(7)["status"]);
 }
+
