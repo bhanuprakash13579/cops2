@@ -123,6 +123,26 @@ function fitColumns(rows: unknown[][], headerRow = 0, minW = 7, maxW = 26) {
     (_, i) => ({ wch: Math.max(minW, Math.min(maxW, (widest[i] ?? 0) + 2)) }));
 }
 
+/**
+ * What an officer typed stays text, whatever it looks like.
+ *
+ * An item written "=SUM(A1:A9)" — or anything else starting with an equals sign
+ * — is a description, not a formula. Written as one it would show a number, or
+ * an error, in place of the words, and it is the shape a spreadsheet is tricked
+ * with. The cell is marked as a string so it is read as what was written.
+ */
+function keepTextAsText(XLSX: typeof XLSXTypes, ws: XLSXTypes.WorkSheet) {
+  const range = XLSX.utils.decode_range(ws['!ref'] ?? 'A1');
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const cell = ws[XLSX.utils.encode_cell({ r, c })] as XLSXTypes.CellObject | undefined;
+      if (!cell || typeof cell.v !== 'string') continue;
+      cell.t = 's';
+      delete (cell as { f?: string }).f;
+    }
+  }
+}
+
 /** Let the long columns wrap instead of running under their neighbour. */
 function wrapColumns(XLSX: typeof XLSXTypes, ws: XLSXTypes.WorkSheet, columns: number[]) {
   const range = XLSX.utils.decode_range(ws['!ref'] ?? 'A1');
@@ -227,7 +247,11 @@ function makeRevenueSheet(
   let srNo = 0, runStart = 1;
   entries.forEach((e, i) => {
     const prev = i > 0 ? entries[i - 1] : null;
-    const isSubRow = !!(e.br_no && prev && e.br_no === prev.br_no);
+    // Compared with the spacing taken off: a receipt typed "46552" on one row
+    // and "46552 " on the next is one receipt, and reading it as two splits the
+    // group, gives it two serial numbers and leaves the pair unmerged.
+    const key = (x: DrEntry | null) => (x?.br_no || '').trim();
+    const isSubRow = !!(key(e) && prev && key(e) === key(prev));
     if (!isSubRow) {
       if (i > 0 && rows.length - 1 > runStart) {
         // close the group that just ended: club its serial and receipt number
@@ -276,6 +300,7 @@ function makeRevenueSheet(
   rows.push(foot);
 
   const ws = XLSX.utils.aoa_to_sheet(rows);
+  keepTextAsText(XLSX, ws);
   ws['!cols'] = fitColumns(rows);
   // the item description, and the item name in the table below it
   wrapColumns(XLSX, ws, [3, SUB_ITEM]);

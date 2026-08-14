@@ -346,6 +346,48 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
    * someone typed, and stays silent when the case is unknown or the lookup fails.
    * A blank column is a normal outcome and must not interrupt the sheet.
    */
+  /**
+   * Receipts whose items are not all together.
+   *
+   * A shift is busy and a receipt sometimes gets typed twice — once here, once
+   * fifteen rows down — either because the officer lost their place or because
+   * a second item was added later. Both readings are trouble: if it is the same
+   * item twice the shift is over-counted, and if it is a second item the two
+   * will not club, so the receipt is written as though it were two.
+   *
+   * The arithmetic cannot tell which it is, and neither can we. It is marked so
+   * the officer can look, and nothing is changed for them.
+   */
+  const splitReceipts = useMemo(() => {
+    const runs = new Map<string, number>();
+    let prev = '';
+    for (const e of entries) {
+      const br = (e.br_no || '').trim();
+      if (br && br !== prev) runs.set(br, (runs.get(br) ?? 0) + 1);
+      prev = br;
+    }
+    return new Set([...runs].filter(([, n]) => n > 1).map(([br]) => br));
+  }, [entries]);
+
+  /**
+   * What the receipt under the cursor comes to, all its items together.
+   *
+   * One BR is one receipt for one amount, but its items are written a row each,
+   * so the figure the officer has to check against the paper in their hand is
+   * never on the screen — they add the rows up themselves. This puts it in the
+   * status bar, the way a spreadsheet shows the sum of what you have selected.
+   * It appears only for a receipt that actually spans rows; on an ordinary
+   * one-item line the row total is already the receipt total.
+   */
+  const focusedReceipt = useMemo(() => {
+    if (!focusCell) return null;
+    const br = (entries[focusCell[0]]?.br_no || '').trim();
+    if (!br) return null;
+    const group = entries.filter(e => (e.br_no || '').trim() === br);
+    if (group.length < 2) return null;
+    return { br, count: group.length, total: group.reduce((t, e) => t + (e.total_duty || 0), 0) };
+  }, [focusCell, entries]);
+
   // What the hand-set totals come to, against what the columns say. The report's
   // consolidated sheet adds the columns up head by head, so any difference here
   // is one the officer will see between the two sheets. It is shown rather than
@@ -730,8 +772,15 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                     // text — BR No. turns red+bold when is_offline_br is true
                     const isBrNoCell = col.key === 'br_no';
                     const isOffline = entry.is_offline_br;
+                    const isSplit = isBrNoCell && splitReceipts.has((entry.br_no || '').trim());
                     return (
-                      <td key={col.key} style={{ width: col.width }} className={`${bg} border-r border-slate-200 p-0`}>
+                      <td key={col.key} style={{ width: col.width }}
+                        title={isSplit
+                          ? 'This receipt number also appears elsewhere in the sheet. '
+                            + 'If it is the same item twice the shift is counted twice; '
+                            + 'if it is another item, move it next to the first so they stay together.'
+                          : undefined}
+                        className={`${bg} border-r border-slate-200 p-0 ${isSplit ? 'ring-1 ring-inset ring-amber-400 bg-amber-50' : ''}`}>
                         <input
                           type="text"
                           value={(val as string) || ''}
@@ -1048,6 +1097,12 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
         <span>Total Duty: <strong className="text-white">₹{Math.round(totals['total_duty'] || 0).toLocaleString('en-IN')}</strong></span>
         <span>DR: <strong className="text-white">₹{Math.round(drEntries.reduce((s, e) => s + e.amount, 0)).toLocaleString('en-IN')}</strong></span>
         <span>OS: <strong className="text-white">₹{Math.round(osEntries.reduce((s, e) => s + e.amount, 0)).toLocaleString('en-IN')}</strong></span>
+        {focusedReceipt && (
+          <span className="text-emerald-300" title="Every item on this receipt, added up">
+            BR {focusedReceipt.br} · {focusedReceipt.count} items · ₹
+            {Math.round(focusedReceipt.total).toLocaleString('en-IN')}
+          </span>
+        )}
         {focusCell && (
           <span className="ml-auto text-slate-500">
             R{focusCell[0] + 1} C{focusCell[1] + 1}
