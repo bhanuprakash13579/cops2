@@ -872,25 +872,172 @@ fn load_rule_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "expression":      r.get::<_, String>(6)?,
         "is_active":       r.get::<_, i64>(7)? != 0,
         "notes":           r.get::<_, Option<String>>(8)?,
+        // Which rule this descends from, the day it took effect, and who wrote it.
+        "lineage_id":      r.get::<_, Option<i64>>(9)?,
+        "effective_from":  r.get::<_, Option<String>>(10)?,
+        "changed_by":      r.get::<_, Option<String>>(11)?,
     }))
+}
+
+const RULE_COLS: &str = "id, sort_order, target_column, column_label,
+                         condition_type, condition_items, expression, is_active, notes,
+                         lineage_id, effective_from, changed_by";
+
+fn today() -> String { chrono::Local::now().format("%Y-%m-%d").to_string() }
+
+/// The formula rules that were in force on a given day.
+///
+/// A rule is never rewritten; changing one writes a new version carrying the
+/// same lineage and the date it takes effect. So a shift computes on the rules
+/// of its own report date — a sheet from last year, reopened and edited today,
+/// recomputes the way it did last year, and today's sheet uses today's formula.
+///
+/// Versions dated after the day in question are ignored, and of those on or
+/// before it the newest wins. A rule with no lineage recorded is one of its own:
+/// a database that predates this, or a row written by hand.
+fn rules_in_force(conn: &rusqlite::Connection, as_of: &str) -> Vec<Value> {
+    let sql = format!("SELECT {RULE_COLS} FROM dcr_formula_rules ORDER BY sort_order ASC, id ASC");
+    let Ok(mut st) = conn.prepare(&sql) else { return Vec::new() };
+    let all: Vec<Value> = st.query_map([], load_rule_row)
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    let mut newest: std::collections::HashMap<i64, Value> = Default::default();
+    for rule in all {
+        let eff = rule.get("effective_from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !eff.is_empty() && eff.as_str() > as_of { continue; }      // not yet in force
+        let id = rule.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let key = rule.get("lineage_id").and_then(|v| v.as_i64()).unwrap_or(id);
+        let better = match newest.get(&key) {
+            None => true,
+            Some(best) => eff.as_str()
+                >= best.get("effective_from").and_then(|v| v.as_str()).unwrap_or(""),
+        };
+        if better { newest.insert(key, rule); }
+    }
+
+    let mut out: Vec<Value> = newest.into_values().collect();
+    out.sort_by_key(|r| (r.get("sort_order").and_then(|v| v.as_i64()).unwrap_or(0),
+                         r.get("id").and_then(|v| v.as_i64()).unwrap_or(0)));
+    out
 }
 
 pub async fn list_rules(
     State(pool): Db,
     _auth: AuthUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, sort_order, target_column, column_label,
-                condition_type, condition_items, expression, is_active, notes
-         FROM dcr_formula_rules ORDER BY sort_order ASC",
-    ).map_err(|e| e500(&e.to_string()))?;
+    // As they stand today, or as they stood on the day asked for.
+    let as_of = params.get("as_of").map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(today);
 
-    let rows: Vec<Value> = stmt.query_map([], load_rule_row)
+    Ok(Json(json!({ "items": rules_in_force(&conn, &as_of) })))
+}
+
+/// Every version of one rule, newest first — what it was, and who changed it.
+pub async fn rule_history(
+    State(pool): Db,
+    _auth: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    let lineage: i64 = conn.query_row(
+        "SELECT COALESCE(lineage_id, id) FROM dcr_formula_rules WHERE id = ?1",
+        [id], |r| r.get(0),
+    ).map_err(|_| e400("Formula rule not found"))?;
+
+    let sql = format!(
+        "SELECT {RULE_COLS} FROM dcr_formula_rules
+          WHERE COALESCE(lineage_id, id) = ?1
+          ORDER BY effective_from DESC, id DESC");
+    let mut st = conn.prepare(&sql).map_err(|e| e500(&e.to_string()))?;
+    let items: Vec<Value> = st.query_map([lineage], load_rule_row)
         .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
+    Ok(Json(json!({ "items": items })))
+}
 
-    Ok(Json(json!({ "items": rows })))
+/// Put a new formula in force for one column, from today.
+///
+/// The officer types their own username and password again to get here. A
+/// formula decides what every passenger is charged, and a menu item one click
+/// from the sheet is one that gets clicked by accident; signing the change makes
+/// it deliberate without sending anyone to find a supervisor at two in the
+/// morning.
+///
+/// Nothing is overwritten. The old version stays in the table with its own
+/// dates, so a sheet from before today still computes the way it did.
+pub async fn revise_rule(
+    State(pool): Db,
+    auth: AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+
+    let username = req.get("username").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    if !username.eq_ignore_ascii_case(auth.0.sub.trim()) {
+        return Err(e400("Sign the change with your own username."));
+    }
+    let hash: String = conn.query_row(
+        "SELECT user_pwd FROM users WHERE user_id = ?1", [&auth.0.sub], |r| r.get(0),
+    ).map_err(|_| e400("User not found"))?;
+    if !bcrypt::verify(password, &hash).unwrap_or(false) {
+        return Err(e400("That password is not right."));
+    }
+
+    let expression = req.get("expression").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let day = today();
+
+    let (lineage, sort_order, target_column, column_label, condition_type, condition_items,
+         is_active, notes): (i64, i64, String, Option<String>, String, String, i64, Option<String>) =
+        conn.query_row(
+            "SELECT COALESCE(lineage_id, id), sort_order, target_column, column_label,
+                    condition_type, condition_items, is_active, notes
+               FROM dcr_formula_rules WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        ).map_err(|_| e400("Formula rule not found"))?;
+
+    // A second change on the same day replaces that day's version rather than
+    // stacking two rules with one date, which would leave the winner to chance.
+    let same_day: Option<i64> = conn.query_row(
+        "SELECT id FROM dcr_formula_rules
+          WHERE COALESCE(lineage_id, id) = ?1 AND effective_from = ?2 LIMIT 1",
+        rusqlite::params![lineage, day], |r| r.get(0),
+    ).ok();
+
+    let new_id = match same_day {
+        Some(existing) => {
+            conn.execute(
+                "UPDATE dcr_formula_rules SET expression = ?1, changed_by = ?2 WHERE id = ?3",
+                rusqlite::params![expression, auth.0.sub, existing],
+            ).map_err(|e| e500(&e.to_string()))?;
+            existing
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO dcr_formula_rules
+                   (sort_order, target_column, column_label, condition_type, condition_items,
+                    expression, is_active, notes, lineage_id, effective_from, changed_by)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![sort_order, target_column, column_label, condition_type,
+                                  condition_items, expression, is_active, notes,
+                                  lineage, day, auth.0.sub],
+            ).map_err(|e| e500(&e.to_string()))?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    tracing::info!("formula for {target_column} revised by {}, in force from {day}", auth.0.sub);
+
+    let sql = format!("SELECT {RULE_COLS} FROM dcr_formula_rules WHERE id = ?1");
+    let rule = conn.query_row(&sql, [new_id], load_rule_row)
+        .map_err(|e| e500(&e.to_string()))?;
+    Ok(Json(rule))
 }
 
 pub async fn create_rule(
@@ -904,11 +1051,15 @@ pub async fn create_rule(
         .ok_or_else(|| e400("target_column required"))?;
     let expression = req.get("expression").and_then(|v| v.as_str())
         .ok_or_else(|| e400("expression required"))?;
+    let effective_from = req.get("effective_from").and_then(|v| v.as_str())
+        .map(str::to_string).unwrap_or_else(today);
 
     conn.execute(
+        // A new rule begins its own line of versions, in force from today.
         "INSERT INTO dcr_formula_rules
-            (sort_order, target_column, column_label, condition_type, condition_items, expression, is_active, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sort_order, target_column, column_label, condition_type, condition_items, expression, is_active, notes,
+             effective_from)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
             req.get("sort_order").and_then(|v| v.as_i64()).unwrap_or(0),
             target_column,
@@ -918,18 +1069,20 @@ pub async fn create_rule(
             expression,
             if req.get("is_active").and_then(|v| v.as_bool()).unwrap_or(true) { 1i64 } else { 0i64 },
             req.get("notes").and_then(|v| v.as_str()),
+            effective_from,
         ],
     ).map_err(|e| e500(&e.to_string()))?;
 
     let new_id = conn.last_insert_rowid();
-
-    let row: Value = conn.query_row(
-        "SELECT id, sort_order, target_column, column_label,
-                condition_type, condition_items, expression, is_active, notes
-         FROM dcr_formula_rules WHERE id = ?",
-        rusqlite::params![new_id],
-        load_rule_row,
+    // It heads its own line of versions; a later change descends from this row.
+    conn.execute(
+        "UPDATE dcr_formula_rules SET lineage_id = ?1 WHERE id = ?1 AND lineage_id IS NULL",
+        [new_id],
     ).map_err(|e| e500(&e.to_string()))?;
+
+    let sql = format!("SELECT {RULE_COLS} FROM dcr_formula_rules WHERE id = ?");
+    let row: Value = conn.query_row(&sql, rusqlite::params![new_id], load_rule_row)
+        .map_err(|e| e500(&e.to_string()))?;
 
     Ok(Json(row))
 }
@@ -1019,16 +1172,7 @@ pub async fn reorder_rules(
         Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT id, sort_order, target_column, column_label,
-                condition_type, condition_items, expression, is_active, notes
-         FROM dcr_formula_rules ORDER BY sort_order ASC",
-    ).map_err(|e| e500(&e.to_string()))?;
-
-    let rows: Vec<Value> = stmt.query_map([], load_rule_row)
-        .map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
-
-    Ok(Json(json!({ "items": rows })))
+    Ok(Json(json!({ "items": rules_in_force(&conn, &today()) })))
 }
 
 // ── Item Types ────────────────────────────────────────────────────────────────

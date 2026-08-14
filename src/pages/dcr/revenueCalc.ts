@@ -234,10 +234,26 @@ function ruleMatchesItem(rule: DrFormulaRule, itemDesc: string): boolean {
  * given item description, using the current formula rules.
  * Used by the spreadsheet to shade auto-computed cells sky-blue.
  */
+/**
+ * The rules, whatever shape they arrived in.
+ *
+ * The endpoint answers `{ items: [...] }` and more than one caller stored the
+ * envelope rather than the list. Everything here walks the rules with `for…of`,
+ * so that turned the first item an officer typed into "rules is not iterable"
+ * and no duty was computed at all. The callers are fixed; this makes sure a
+ * future one cannot break the sheet the same way.
+ */
+function ruleList(rules: unknown): DrFormulaRule[] {
+  if (Array.isArray(rules)) return rules as DrFormulaRule[];
+  const items = (rules as { items?: unknown } | null)?.items;
+  return Array.isArray(items) ? items as DrFormulaRule[] : [];
+}
+
 export function getAutoFields(
-  rules: DrFormulaRule[],
+  rulesIn: DrFormulaRule[],
   itemDesc: string,
 ): Set<string> {
+  const rules = ruleList(rulesIn);
   if (!itemDesc.trim()) return new Set();
   const auto = new Set<string>();
   const seen = new Set<string>(); // first-match-wins per column
@@ -267,11 +283,12 @@ export function getAutoFields(
  */
 export function computeDuties(
   tariff: DrTariff,
-  rules: DrFormulaRule[],
+  rulesIn: DrFormulaRule[],
   itemDesc: string,
   dutiableValue: number,
   goldWeightGms: number = 0,
 ): Partial<DrEntry> {
+  const rules = ruleList(rulesIn);
   if (!itemDesc.trim()) return {};
   const vars = buildFormulaVars(tariff, dutiableValue, goldWeightGms);
   const result: Partial<DrEntry> = {};

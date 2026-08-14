@@ -21,6 +21,8 @@ interface Props {
   rules: DrFormulaRule[];
   onMessage: () => void;
   onConfig: () => void;   // navigate to Rates & Formulas config page
+  /** A formula was rewritten from the sheet; reload the rules for this shift. */
+  onRulesChanged?: () => void;
 }
 
 // Column definitions for the main entry table
@@ -71,7 +73,7 @@ function retotal(entry: DrEntry) {
   entry.total_duty = computeTotal(entry);
 }
 
-export default function RevenueSheet({ session: initialSession, rules, onMessage, onConfig }: Props) {
+export default function RevenueSheet({ session: initialSession, rules, onMessage, onConfig, onRulesChanged }: Props) {
   const [session, setSession] = useState<DrSession>(initialSession);
   const [entries, setEntries] = useState<DrEntry[]>(
     initialSession.entries.length > 0
@@ -290,7 +292,11 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
    * receipt it is about — "Add item to BR 49773" rather than an unlabelled plus,
    * so nobody has to work out which row the cursor was on.
    */
-  const [rowMenu, setRowMenu] = useState<{ x: number; y: number; row: number } | null>(null);
+  const [rowMenu, setRowMenu] = useState<{ x: number; y: number; row: number; col: number | null } | null>(null);
+  /** The column whose formula is being rewritten, and the officer's signature. */
+  const [formulaEdit, setFormulaEdit] = useState<
+    { rule: DrFormulaRule; expression: string; username: string; password: string;
+      busy: boolean; error: string | null } | null>(null);
 
   useEffect(() => {
     if (!rowMenu) return;
@@ -669,7 +675,10 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                 <tr key={rowIdx} className={`${rowBg} hover:bg-blue-50/50 group border-b border-slate-200`}
                   onContextMenu={ev => {
                     ev.preventDefault();
-                    setRowMenu({ x: ev.clientX, y: ev.clientY, row: rowIdx });
+                    const cell = (ev.target as HTMLElement).closest('td');
+                    const col = cell ? Number(cell.dataset.colIdx ?? '') : NaN;
+                    setRowMenu({ x: ev.clientX, y: ev.clientY, row: rowIdx,
+                                 col: Number.isFinite(col) ? col : null });
                   }}
                 >
                   {/* Row number */}
@@ -685,7 +694,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                     if (col.type === 'bool') {
                       const accentClass = col.key === 'is_offline_br' ? 'accent-orange-500' : 'accent-red-500';
                       return (
-                        <td key={col.key} style={{ width: col.width }}
+                        <td key={col.key} data-col-idx={colIdx} style={{ width: col.width }}
                           className={`${bg} border-r border-slate-200 text-center`}
                           title={col.key === 'is_offline_br' ? (val ? 'Offline BR (manual)' : 'Online BR') : undefined}
                         >
@@ -704,7 +713,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
 
                     if (col.type === 'combo') {
                       return (
-                        <td key={col.key} style={{ width: col.width }} className={`${bg} border-r border-slate-200 p-0`}>
+                        <td key={col.key} data-col-idx={colIdx} style={{ width: col.width }} className={`${bg} border-r border-slate-200 p-0`}>
                           <ItemCombobox
                             value={entry.item_desc}
                             items={itemTypes}
@@ -719,7 +728,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
 
                     if (col.type === 'int' && fieldKey === 'sl_no') {
                       return (
-                        <td key={col.key} style={{ width: col.width }} className={`${bg} border-r border-slate-200 px-1 text-center`}>
+                        <td key={col.key} data-col-idx={colIdx} style={{ width: col.width }} className={`${bg} border-r border-slate-200 px-1 text-center`}>
                           <input
                             type="number"
                             value={(val as number) ?? ''}
@@ -743,7 +752,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                       const hasError = validationErrors.has(`${rowIdx}-${fieldKey}`);
 
                       return (
-                        <td key={col.key} style={{ width: col.width }}
+                        <td key={col.key} data-col-idx={colIdx} style={{ width: col.width }}
                           className={`${hasError ? 'bg-red-100' : (isSbi ? '' : bg)} border-r ${hasError ? 'border-red-400 border-2' : 'border-slate-200'} p-0 relative`}>
                           {isOverridden && !hasError && (
                             <span className="absolute top-0 right-0 w-2 h-2 bg-amber-400 rounded-bl" title="Manually overridden" />
@@ -774,7 +783,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                     const isOffline = entry.is_offline_br;
                     const isSplit = isBrNoCell && splitReceipts.has((entry.br_no || '').trim());
                     return (
-                      <td key={col.key} style={{ width: col.width }}
+                      <td key={col.key} data-col-idx={colIdx} style={{ width: col.width }}
                         title={isSplit
                           ? 'This receipt number also appears elsewhere in the sheet. '
                             + 'If it is the same item twice the shift is counted twice; '
@@ -1036,6 +1045,97 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
         )}
       </div>
 
+      {/* Rewriting one column's formula, signed by the officer doing it. */}
+      {formulaEdit && (
+        <div className="fixed inset-0 z-[9996] flex items-center justify-center bg-slate-900/60 p-4">
+          <div className="w-full max-w-lg rounded-xl bg-white shadow-xl border border-slate-200 overflow-hidden">
+            <div className="px-5 py-3 border-b border-slate-200 bg-slate-50">
+              <h2 className="text-sm font-semibold text-slate-800">
+                Formula for {formulaEdit.rule.column_label || formulaEdit.rule.target_column}
+              </h2>
+            </div>
+            <div className="px-5 py-4 space-y-3">
+              <p className="text-xs text-slate-600 leading-relaxed">
+                The new formula applies to shifts <strong>from today onwards</strong>. Sheets
+                already written keep the figures they were given, and a sheet from an
+                earlier date reopened later still computes on the formula that was in
+                force on its own date. Only this column changes.
+              </p>
+              <label className="block">
+                <span className="text-[11px] uppercase tracking-wide text-slate-500">Formula</span>
+                <input
+                  value={formulaEdit.expression}
+                  onChange={e => setFormulaEdit(f => f && { ...f, expression: e.target.value })}
+                  spellCheck={false}
+                  className="mt-1 w-full px-2 py-1.5 text-sm font-mono border border-slate-300 rounded-lg
+                             focus:outline-none focus:ring-2 focus:ring-blue-400"
+                />
+              </label>
+              <p className="text-[11px] text-slate-500">
+                Available: <span className="font-mono">value</span>,{' '}
+                <span className="font-mono">weight</span>, and the tariff rates.
+              </p>
+              <div className="grid grid-cols-2 gap-3 pt-1">
+                <label className="block">
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500">Your username</span>
+                  <input
+                    value={formulaEdit.username} autoComplete="off"
+                    onChange={e => setFormulaEdit(f => f && { ...f, username: e.target.value })}
+                    className="mt-1 w-full px-2 py-1.5 text-sm border border-slate-300 rounded-lg
+                               focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500">Your password</span>
+                  <input
+                    type="password" value={formulaEdit.password} autoComplete="off"
+                    onChange={e => setFormulaEdit(f => f && { ...f, password: e.target.value })}
+                    className="mt-1 w-full px-2 py-1.5 text-sm border border-slate-300 rounded-lg
+                               focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </label>
+              </div>
+              {formulaEdit.error && (
+                <p className="text-xs font-medium text-red-600">{formulaEdit.error}</p>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 px-5 py-3 bg-slate-50 border-t border-slate-100">
+              <button
+                onClick={() => setFormulaEdit(null)}
+                className="px-3 py-2 text-xs rounded-lg text-slate-600 hover:bg-slate-200 font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={formulaEdit.busy || !formulaEdit.username || !formulaEdit.password}
+                onClick={async () => {
+                  setFormulaEdit(f => f && { ...f, busy: true, error: null });
+                  try {
+                    await api.post(`/dcr/formula-rules/${formulaEdit.rule.id}/revise`, {
+                      expression: formulaEdit.expression,
+                      username: formulaEdit.username,
+                      password: formulaEdit.password,
+                    });
+                    onRulesChanged?.();      // take it up without reopening the sheet
+                    setFormulaEdit(null);
+                  } catch (err: unknown) {
+                    const detail = (err as { response?: { data?: { error?: string; detail?: string } } })
+                      ?.response?.data?.error
+                      || (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                      || 'Could not update the formula.';
+                    setFormulaEdit(f => f && { ...f, busy: false, error: detail });
+                  }
+                }}
+                className="px-4 py-2 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700
+                           disabled:opacity-60 font-semibold"
+              >
+                {formulaEdit.busy ? 'Saving…' : 'Update the formula'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* The row's right-click menu, named for the receipt it acts on. */}
       {rowMenu && (() => {
         const row = entries[rowMenu.row];
@@ -1067,6 +1167,15 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
             </div>
             {item(br ? `Add item to BR ${br}` : 'Add item to this BR',
                   () => addItemToBr(rowMenu.row), !br)}
+            {(() => {
+              // Only where the cursor is on a column a formula actually fills.
+              const key = rowMenu.col !== null ? ENTRY_COLS[rowMenu.col]?.key : null;
+              const rule = key ? rules.find(r => r.target_column === key && r.is_active) : undefined;
+              if (!rule) return null;
+              return item(`Update the formula for ${rule.column_label || rule.target_column}`,
+                () => setFormulaEdit({ rule, expression: rule.expression || '',
+                                       username: '', password: '', busy: false, error: null }));
+            })()}
             {item('Duplicate, without the receipt number', () => duplicateRow(rowMenu.row))}
             {item('Insert an empty row below', () => addRow(rowMenu.row))}
             {safeParseOverrides(row.overrides).includes('total_duty') &&

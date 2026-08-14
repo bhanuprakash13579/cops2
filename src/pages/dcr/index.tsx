@@ -41,13 +41,25 @@ export default function DcrModule() {
   useEffect(() => {
     loadSessions();
     api.get('/dcr/formula-rules')
-      .then(r => { setRules(r.data); setRulesLoaded(true); })
+      .then(r => { setRules(r.data.items ?? r.data); setRulesLoaded(true); })
       .catch(() => setRulesLoaded(true));
   }, []); // eslint-disable-line
+
+  /** The rules as they stood on a given day — see loadRulesFor's note. */
+  const loadRulesFor = async (reportDate?: string) => {
+    // A formula changed since then applies from the day it was changed, so a
+    // sheet reopened from last year still computes the way it did last year.
+    try {
+      const r = await api.get('/dcr/formula-rules',
+                              reportDate ? { params: { as_of: reportDate } } : undefined);
+      setRules(r.data.items ?? r.data);
+    } catch { /* keep the rules already loaded */ }
+  };
 
   const openSession = async (s: DrSession) => {
     try {
       const res = await api.get(`/dcr/sessions/${s.id}`);
+      await loadRulesFor(s.report_date);
       setSession(res.data);
       setView('sheet');
     } catch { /* silent */ }
@@ -182,6 +194,7 @@ export default function DcrModule() {
             rules={rules}
             onMessage={() => setShowMessage(true)}
             onConfig={() => setView('config')}
+            onRulesChanged={() => loadRulesFor(session?.report_date)}
           />
         </div>
 

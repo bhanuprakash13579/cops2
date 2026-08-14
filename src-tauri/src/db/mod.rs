@@ -95,6 +95,13 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         // Rates as applied, so a session stays explainable if the
         // tariff row is later edited or lost.
         ("dcr_sessions", "tariff_snapshot", "TEXT"),
+        // A formula is no longer rewritten in place; a change writes a new
+        // version dated from the day it was made. Rules already in a database
+        // become the first version of their own lineage, in force from before
+        // any shift on record, so every existing sheet keeps computing as it did.
+        ("dcr_formula_rules", "lineage_id",     "INTEGER"),
+        ("dcr_formula_rules", "effective_from", "TEXT"),
+        ("dcr_formula_rules", "changed_by",     "TEXT"),
     ];
     for (table, col, col_type) in &col_migrations {
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type);
@@ -105,6 +112,14 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
             }
         }
     }
+
+    // Every rule that predates the version history is version one of its own
+    // line, in force from before any shift on record. Done after the columns
+    // above exist, and harmless to repeat.
+    conn.execute_batch(
+        "UPDATE dcr_formula_rules SET lineage_id = id WHERE lineage_id IS NULL;
+         UPDATE dcr_formula_rules SET effective_from = '1900-01-01' WHERE effective_from IS NULL;"
+    ).ok();
 
     // Defensive index additions for existing DBs (CREATE INDEX IF NOT EXISTS is idempotent,
     // but the migrations.sql may not have run again on existing databases).

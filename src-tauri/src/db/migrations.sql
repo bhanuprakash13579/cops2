@@ -805,7 +805,14 @@ CREATE TABLE IF NOT EXISTS dcr_formula_rules (
     condition_items TEXT NOT NULL DEFAULT '',
     expression TEXT NOT NULL DEFAULT '',
     is_active INTEGER NOT NULL DEFAULT 1,
-    notes TEXT
+    notes TEXT,
+    -- A rule is never rewritten. Changing a formula writes a new row carrying
+    -- the same lineage_id and the date it takes effect from, and the old row
+    -- stays as it was, so a shift computes on the rule that was in force on its
+    -- own report date.
+    lineage_id INTEGER,
+    effective_from TEXT,
+    changed_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dcr_settings (

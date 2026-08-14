@@ -311,6 +311,10 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/dcr/formula-rules",                     get(dcr::list_rules).post(dcr::create_rule))
         .route("/dcr/formula-rules/reorder",             post(dcr::reorder_rules))
         .route("/dcr/formula-rules/:id",                put(dcr::update_rule).delete(dcr::delete_rule))
+        // A formula rewritten from the sheet, signed by the officer doing it,
+        // and every version it has had.
+        .route("/dcr/formula-rules/:id/revise",         post(dcr::revise_rule))
+        .route("/dcr/formula-rules/:id/history",        get(dcr::rule_history))
         .route("/dcr/item-types",                        get(dcr::list_item_types).post(dcr::create_item_type))
         .route("/dcr/item-types/:id/use",               patch(dcr::use_item_type))
         .route("/dcr/receipts-for-os",                  get(dcr::receipts_for_os))

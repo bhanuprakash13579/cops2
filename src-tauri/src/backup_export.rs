@@ -110,6 +110,26 @@ const NEVER_EXCLUDE: &[&str] = &[
     "legal_statutes", "dcr_tariffs", "dcr_formula_rules", "feature_flags",
 ];
 
+/// The columns a table has in both the archive and the running database.
+///
+/// Returned in the live table's own order. A column the archive does not carry
+/// is left to its default; one it carries that the table no longer has is not
+/// asked for. Either way the restore does not depend on the two schemas having
+/// stayed identical since the backup was taken.
+fn shared_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>> {
+    let names = |db: &str| -> Result<Vec<String>> {
+        let mut st = conn.prepare(&format!("PRAGMA {db}.table_info(\"{table}\")"))?;
+        let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    };
+    let live = names("main")?;
+    let archived: std::collections::HashSet<String> =
+        names("src")?.into_iter().map(|c| c.to_lowercase()).collect();
+    Ok(live.into_iter()
+        .filter(|c| archived.contains(&c.to_lowercase()))
+        .collect())
+}
+
 /// Tables the operator has chosen to leave out, minus anything protected.
 fn excluded_tables(conn: &rusqlite::Connection) -> Vec<String> {
     let raw: String = conn
@@ -635,8 +655,26 @@ pub fn restore_into(pool: &DbPool, plain_path: &Path) -> Result<RestoreReport> {
                 }
             }
             conn.execute_batch(&format!("DELETE FROM main.\"{t}\""))?;
+
+            // Column by column, not position by position.
+            //
+            // This used to be SELECT *, which lines the archive's columns up
+            // against the live table's by position and count. That holds only
+            // while the two agree exactly: the day a column is added, every
+            // archive taken before it becomes unrestorable — "table has 12
+            // columns but 9 values were supplied" — and the office discovers it
+            // at the worst possible moment.
+            //
+            // Naming the columns the two have in common restores what the
+            // archive holds and lets a column added since take its default. A
+            // column since dropped is simply not asked for.
+            let cols = shared_columns(&conn, t)?;
+            if cols.is_empty() { continue; }
+            let list = cols.iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>().join(", ");
             conn.execute_batch(&format!(
-                "INSERT INTO main.\"{t}\" SELECT * FROM src.\"{t}\""
+                "INSERT INTO main.\"{t}\" ({list}) SELECT {list} FROM src.\"{t}\""
             ))
             .map_err(|e| anyhow!("restoring {t} failed: {e}"))?;
             rows += conn
@@ -945,5 +983,83 @@ mod tests {
         assert!(rep.ratio() > 2.0,
                 "compression should be well over 2x, got {:.1}x ({} -> {} bytes)",
                 rep.ratio(), rep.plain_bytes, rep.archive_bytes);
+    }
+}
+
+#[cfg(test)]
+mod schema_drift_tests {
+    use super::*;
+
+    /// An archive taken before a column existed must still restore.
+    ///
+    /// The restore used to copy `SELECT *`, matching the archive's columns to
+    /// the live table's by position. The day a column was added, every archive
+    /// taken before it became unrestorable — which is the one moment a backup
+    /// has to work.
+    #[test]
+    fn a_backup_taken_before_a_column_existed_still_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.db");
+        let old = dir.path().join("old.db");
+
+        // The archive: the table as it was, three columns.
+        {
+            let c = rusqlite::Connection::open(&old).unwrap();
+            c.execute_batch(
+                "CREATE TABLE dcr_formula_rules (id INTEGER PRIMARY KEY, target_column TEXT, expression TEXT);
+                 INSERT INTO dcr_formula_rules VALUES (1, 'baggage_duty', 'value * 0.35');",
+            ).unwrap();
+        }
+        // The running database: the same table, since given three more columns.
+        let conn = rusqlite::Connection::open(&live).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dcr_formula_rules (id INTEGER PRIMARY KEY, target_column TEXT, expression TEXT,
+                                             lineage_id INTEGER, effective_from TEXT, changed_by TEXT);",
+        ).unwrap();
+
+        let p = old.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("ATTACH DATABASE '{p}' AS src")).unwrap();
+
+        let cols = shared_columns(&conn, "dcr_formula_rules").unwrap();
+        assert_eq!(cols, vec!["id", "target_column", "expression"],
+                   "only the columns both sides have: {cols:?}");
+
+        let list = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+        conn.execute_batch(&format!(
+            "INSERT INTO main.\"dcr_formula_rules\" ({list}) SELECT {list} FROM src.\"dcr_formula_rules\""
+        )).expect("an older archive must still restore");
+
+        let (expr, eff): (String, Option<String>) = conn.query_row(
+            "SELECT expression, effective_from FROM dcr_formula_rules WHERE id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(expr, "value * 0.35", "the archived value came through");
+        assert!(eff.is_none(), "a column added since takes its default, not a stray value");
+    }
+
+    /// And the other way: an archive holding a column the table no longer has.
+    #[test]
+    fn a_backup_holding_a_column_since_dropped_still_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.db");
+        let old = dir.path().join("old.db");
+        {
+            let c = rusqlite::Connection::open(&old).unwrap();
+            c.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, keep TEXT, gone TEXT);
+                 INSERT INTO t VALUES (1, 'kept', 'dropped');",
+            ).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&live).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, keep TEXT);").unwrap();
+        let p = old.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("ATTACH DATABASE '{p}' AS src")).unwrap();
+
+        let cols = shared_columns(&conn, "t").unwrap();
+        assert_eq!(cols, vec!["id", "keep"], "the dropped column is not asked for");
+        let list = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+        conn.execute_batch(&format!("INSERT INTO main.\"t\" ({list}) SELECT {list} FROM src.\"t\"")).unwrap();
+        let kept: String = conn.query_row("SELECT keep FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, "kept");
     }
 }

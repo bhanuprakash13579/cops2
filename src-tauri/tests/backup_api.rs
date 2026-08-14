@@ -4139,3 +4139,167 @@ async fn a_case_is_settled_across_all_the_receipts_that_paid_it() {
             "an ordinary duty receipt names no case and awaits nothing: {}", at(7)["status"]);
 }
 
+
+#[tokio::test]
+async fn a_formula_change_applies_from_the_day_it_is_made_and_never_backwards() {
+    // The figures already written were never at risk: a duty is worked out as the
+    // row is typed and stored as a flat amount. This is the row somebody edits
+    // after the formula has moved on — it must compute the way its own shift did.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let rule_id: i64 = {
+        let conn = pool.get().unwrap();
+        // The database ships with a default rule per column; this test is about
+        // one rule's history, so it starts from a clean table.
+        conn.execute("DELETE FROM dcr_formula_rules", []).unwrap();
+        // The officer who will sign the change.
+        conn.execute(
+            "INSERT INTO users (user_name, user_desig, user_id, user_pwd, user_role, user_status)
+             VALUES ('Test Officer','Supdt','1',?,'SDO','ACTIVE')",
+            [bcrypt::hash("RightOne#1", 4).unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO dcr_formula_rules
+               (sort_order, target_column, column_label, condition_type, condition_items,
+                expression, is_active, lineage_id, effective_from)
+             VALUES (1,'baggage_duty','Baggage duty','all','','value * 0.35',1,NULL,'1900-01-01')",
+            [],
+        ).unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute("UPDATE dcr_formula_rules SET lineage_id = ?1 WHERE id = ?1", [id]).unwrap();
+        // A second column, to prove only the one asked for moves.
+        conn.execute(
+            "INSERT INTO dcr_formula_rules
+               (sort_order, target_column, column_label, condition_type, condition_items,
+                expression, is_active, lineage_id, effective_from)
+             VALUES (2,'liquor_duty','Liquor Duty','only','LIQUOR','value * 0.5',1,99,'1900-01-01')",
+            [],
+        ).unwrap();
+        id
+    };
+
+    let expr_on = |day: String| {
+        let c = c.clone(); let base = base.clone();
+        async move {
+            let v: serde_json::Value = c.get(format!("{base}/dcr/formula-rules?as_of={day}"))
+                .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+            v["items"].as_array().unwrap().iter()
+                .filter(|r| r["target_column"] == "baggage_duty")
+                .map(|r| r["expression"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // A wrong password changes nothing.
+    let bad = c.post(format!("{base}/dcr/formula-rules/{rule_id}/revise"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "expression": "value * 0.99",
+                                   "username": "1", "password": "WrongOne#1" }))
+        .send().await.unwrap();
+    assert_eq!(bad.status(), 400, "a wrong password must be refused");
+
+    // So does somebody else's name.
+    let wrong_name = c.post(format!("{base}/dcr/formula-rules/{rule_id}/revise"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "expression": "value * 0.99",
+                                   "username": "someone-else", "password": "RightOne#1" }))
+        .send().await.unwrap();
+    assert_eq!(wrong_name.status(), 400, "the change is signed by the officer making it");
+    assert_eq!(expr_on("2099-01-01".into()).await, vec!["value * 0.35"],
+               "nothing was changed by either refusal");
+
+    // Signed properly, it takes effect today.
+    let ok = c.post(format!("{base}/dcr/formula-rules/{rule_id}/revise"))
+        .bearer_auth(officer_token())
+        .json(&serde_json::json!({ "expression": "value * 0.38",
+                                   "username": "1", "password": "RightOne#1" }))
+        .send().await.unwrap();
+    assert!(ok.status().is_success(), "a signed change is accepted: {}", ok.status());
+
+    assert_eq!(expr_on("2020-01-01".into()).await, vec!["value * 0.35"],
+               "a shift from before the change keeps the old formula");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert_eq!(expr_on(today.clone()).await, vec!["value * 0.38"],
+               "today's shift uses the new one");
+
+    // One rule per column on any day, and the other column untouched.
+    let v: serde_json::Value = c.get(format!("{base}/dcr/formula-rules"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.iter().filter(|r| r["target_column"] == "baggage_duty").count(), 1,
+               "a column has one formula in force at a time");
+    assert_eq!(items.iter().find(|r| r["target_column"] == "liquor_duty")
+                   .unwrap()["expression"], "value * 0.5",
+               "the column nobody asked about did not move");
+
+    // Both versions are kept, with the name of whoever wrote the new one.
+    let h: serde_json::Value = c.get(format!("{base}/dcr/formula-rules/{rule_id}/history"))
+        .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+    let hist = h["items"].as_array().unwrap();
+    assert_eq!(hist.len(), 2, "the old version is kept, not overwritten: {hist:?}");
+    assert_eq!(hist[0]["changed_by"], "1", "and it records who changed it");
+}
+
+#[tokio::test]
+async fn the_formula_in_force_is_the_one_that_was_in_force_that_day() {
+    // The same trials the other program's resolver is put through, so the two
+    // never drift apart on which formula a given shift computes with.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute("DELETE FROM dcr_formula_rules", []).unwrap();
+        let mut add = |order: i64, col: &str, expr: &str, eff: &str, lineage: Option<i64>| -> i64 {
+            conn.execute(
+                "INSERT INTO dcr_formula_rules
+                   (sort_order, target_column, column_label, condition_type, condition_items,
+                    expression, is_active, lineage_id, effective_from)
+                 VALUES (?,?,?, 'all','', ?, 1, ?, ?)",
+                rusqlite::params![order, col, col, expr, lineage, eff],
+            ).unwrap();
+            let id = conn.last_insert_rowid();
+            if lineage.is_none() {
+                conn.execute("UPDATE dcr_formula_rules SET lineage_id = ?1 WHERE id = ?1", [id]).unwrap();
+            }
+            id
+        };
+        // three versions of one rule, written out of order
+        let a = add(1, "baggage_duty", "v1", "1900-01-01", None);
+        add(1, "baggage_duty", "v3", "2026-08-14", Some(a));
+        add(1, "baggage_duty", "v2", "2026-07-15", Some(a));
+        // a version dated ahead of today
+        let b = add(2, "liquor_duty", "now", "1900-01-01", None);
+        add(2, "liquor_duty", "later", "2099-01-01", Some(b));
+        // and one written before any of this, with no dates at all
+        conn.execute(
+            "INSERT INTO dcr_formula_rules
+               (sort_order, target_column, condition_type, condition_items, expression, is_active)
+             VALUES (3, 'other_charges', 'all', '', 'orphan', 1)", []).unwrap();
+    }
+
+    let expr = |day: String, col: &'static str| {
+        let c = c.clone(); let base = base.clone();
+        async move {
+            let v: serde_json::Value = c.get(format!("{base}/dcr/formula-rules?as_of={day}"))
+                .bearer_auth(officer_token()).send().await.unwrap().json().await.unwrap();
+            v["items"].as_array().unwrap().iter()
+                .filter(|r| r["target_column"] == col)
+                .map(|r| r["expression"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(expr("2026-08-20".into(), "baggage_duty").await, vec!["v3"], "newest version wins");
+    assert_eq!(expr("2026-08-01".into(), "baggage_duty").await, vec!["v2"], "a day between two versions");
+    assert_eq!(expr("2026-01-01".into(), "baggage_duty").await, vec!["v1"], "before the later ones");
+    assert!(expr("1899-01-01".into(), "baggage_duty").await.is_empty(), "before every version");
+    assert_eq!(expr("2026-08-20".into(), "liquor_duty").await, vec!["now"], "a future version waits");
+    assert_eq!(expr("2099-06-01".into(), "liquor_duty").await, vec!["later"], "and applies on its day");
+    assert_eq!(expr("2026-08-20".into(), "other_charges").await, vec!["orphan"],
+               "a rule with no version history still applies");
+
+    // One version per lineage, in sort order, and the same answer every time.
+    let once = expr("2026-08-20".into(), "baggage_duty").await;
+    let twice = expr("2026-08-20".into(), "baggage_duty").await;
+    assert_eq!(once, twice, "the resolution is stable");
+}

@@ -148,16 +148,18 @@ export default function FormulaRulesPage({ onBack, onRulesChanged }: Props) {
       api.get('/dcr/tariffs'),
     ]).then(([tRes, rRes, hRes]) => {
       setTariff(tRes.data);
-      setRules(rRes.data);
+      // The endpoint answers { items: [...] }; the list is what everything
+      // downstream walks.
+      setRules(rRes.data.items ?? rRes.data);
       setRateHistory(hRes.data);
-      onRulesChanged(rRes.data);
+      onRulesChanged(rRes.data.items ?? rRes.data);
     }).catch(() => {}).finally(() => setLoading(false));
   }, []); // eslint-disable-line
 
   const reloadRules = useCallback(() => {
     api.get('/dcr/formula-rules').then(r => {
-      setRules(r.data);
-      onRulesChanged(r.data);
+      setRules(r.data.items ?? r.data);
+      onRulesChanged(r.data.items ?? r.data);
     }).catch(() => {});
   }, [onRulesChanged]);
 
