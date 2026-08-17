@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 mod backup_export;
 mod backup_service;
+mod cloud_backup;
 mod config;
 pub mod db;
 mod models;
@@ -500,6 +501,10 @@ pub fn run() {
             //
             // Does nothing at all until a destination folder is configured.
             backup_service::start(pool.clone());
+            // And the copy that leaves the building. It checks every few hours
+            // whether thirty days have passed, rather than firing on a date an
+            // office machine may be switched off for.
+            cloud_backup::spawn(pool.clone());
 
             // ── Windows: fix WebView2 double-taskbar thumbnail ────────────────
             // After 800 ms (WebView2 init time), enumerate child windows and set

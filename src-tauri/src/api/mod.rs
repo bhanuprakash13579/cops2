@@ -263,6 +263,10 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         // without anybody taking one. Changing where backups go, and forcing a
         // run, stay with the administrator.
         .route("/backup/auto/status",               get(backup::auto_status))
+        // The monthly copy that leaves the building on its own.
+        .route("/backup/cloud/status",              get(backup::cloud_status))
+        .route("/admin/backup/cloud/settings",      post(backup::cloud_settings))
+        .route("/admin/backup/cloud/run",           post(backup::cloud_run_now))
         .route("/backup/archive/status",            get(backup::archive_status))
         .route("/backup/archive/download",          get(backup::archive_download))
         .route("/backup/archive/save",              post(backup::archive_save_to))

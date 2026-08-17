@@ -2466,3 +2466,68 @@ pub async fn custom_report_brdr(
         "truncated": rows.len() as i64 >= limit,
     })))
 }
+
+// ── The copy that leaves the building ─────────────────────────────────────────
+
+/// What the office needs to know: is it working, and when did it last work.
+pub async fn cloud_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
+    Ok(Json(serde_json::to_value(crate::cloud_backup::status(&pool))
+        .map_err(|e| e500(&e.to_string()))?))
+}
+
+#[derive(serde::Deserialize)]
+pub struct CloudSettings {
+    pub enabled: Option<bool>,
+    pub domain: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub folder_id: Option<String>,
+    pub every_days: Option<i64>,
+    /// Given once, handed straight to the operating system's credential store
+    /// and never written to the database or to any file.
+    pub refresh_token: Option<String>,
+    /// Sent as true to remove a stored token.
+    pub forget_token: Option<bool>,
+}
+
+pub async fn cloud_settings(
+    State(pool): Db,
+    _admin: AdminUser,
+    Json(s): Json<CloudSettings>,
+) -> Result<Json<Value>, Err> {
+    if let Some(v) = s.enabled {
+        set_setting(&pool, "cloud_backup_enabled", if v { "true" } else { "false" })?;
+    }
+    if let Some(v) = s.domain {
+        // in / com / eu / au — an account is not portable between them.
+        let v = v.trim().trim_start_matches('.').to_lowercase();
+        if !["in", "com", "eu", "au", "jp", "ca", "sa"].contains(&v.as_str()) {
+            return Err(e400("The data centre must be one of: in, com, eu, au, jp, ca, sa."));
+        }
+        set_setting(&pool, "cloud_backup_domain", &v)?;
+    }
+    if let Some(v) = s.client_id     { set_setting(&pool, "cloud_backup_client_id", v.trim())?; }
+    if let Some(v) = s.client_secret { set_setting(&pool, "cloud_backup_client_secret", v.trim())?; }
+    if let Some(v) = s.folder_id     { set_setting(&pool, "cloud_backup_folder_id", v.trim())?; }
+    if let Some(v) = s.every_days {
+        set_setting(&pool, "cloud_backup_every_days", &v.clamp(1, 365).to_string())?;
+    }
+    if s.forget_token.unwrap_or(false) {
+        crate::cloud_backup::forget_refresh_token().map_err(|e| e400(&e.to_string()))?;
+    }
+    if let Some(t) = s.refresh_token {
+        if !t.trim().is_empty() {
+            crate::cloud_backup::store_refresh_token(&t).map_err(|e| e400(&e.to_string()))?;
+        }
+    }
+    Ok(Json(serde_json::to_value(crate::cloud_backup::status(&pool))
+        .map_err(|e| e500(&e.to_string()))?))
+}
+
+/// Send one now — used to prove the arrangement works before trusting it.
+pub async fn cloud_run_now(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, Err> {
+    match crate::cloud_backup::run_once(&pool).await {
+        Ok(size) => Ok(Json(json!({ "ok": true, "bytes": size }))),
+        Err(e) => Err(e400(&e.to_string())),
+    }
+}

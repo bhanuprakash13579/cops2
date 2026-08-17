@@ -62,6 +62,20 @@ export default function ArchiveReminder() {
       const until = Number(localStorage.getItem(SNOOZE_KEY) || 0);
       if (until && Date.now() < until) return;
       try {
+        // Only when the automatic copy is not doing its job.
+        //
+        // The office's archive goes to its own WorkDrive on a schedule. While
+        // that is working there is nothing for an officer to carry anywhere, and
+        // asking them to is how a warning becomes something people click past.
+        // This appears when that arrangement is off, unconfigured, or has gone
+        // quiet for longer than it should — which is exactly when a copy on a
+        // pen drive is the only one that would survive.
+        const cloud = await fetch(`${api.defaults.baseURL}/backup/cloud/status`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }).then(r => (r.ok ? r.json() : null)).catch(() => null);
+        if (cancelled) return;
+        if (cloud && cloud.needs_manual_backup === false) return;
+
         const res = await fetch(`${api.defaults.baseURL}/backup/archive/status`, {
           headers: { Authorization: `Bearer ${token}` },
         });
