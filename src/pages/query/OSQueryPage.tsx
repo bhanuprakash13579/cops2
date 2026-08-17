@@ -382,7 +382,15 @@ export default function OSQueryPage() {
             )}
           </div>
 
-          {results.length === 0 ? (
+          {/* Until the register has answered, it has not said there is nothing
+              — saying so turns every search into a failure that corrects itself
+              a moment later. */}
+          {loading ? (
+            <div className="p-12 text-center text-slate-500">
+              <Loader2 className="w-8 h-8 mx-auto text-slate-300 mb-3 animate-spin" />
+              <p>Searching the register…</p>
+            </div>
+          ) : results.length === 0 ? (
             <div className="p-12 text-center text-slate-500">
               <FileText className="w-12 h-12 mx-auto text-slate-300 mb-3" />
               <p>No records found matching your query criteria.</p>

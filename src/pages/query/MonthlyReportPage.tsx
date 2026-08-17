@@ -253,7 +253,13 @@ export default function MonthlyReportPage() {
             )}
           </div>
 
-          {rows.length === 0 ? (
+          {/* Not "nothing found" until the register has actually answered. */}
+          {loading ? (
+            <div className="p-12 text-center text-slate-500">
+              <Loader2 className="w-8 h-8 mx-auto text-slate-300 mb-3 animate-spin" />
+              <p>Gathering the month…</p>
+            </div>
+          ) : rows.length === 0 ? (
             <div className="p-12 text-center text-slate-500">
               <FileText className="w-12 h-12 mx-auto text-slate-300 mb-3" />
               <p className="font-medium">No submitted cases found for {MONTHS[month - 1]} {year}.</p>

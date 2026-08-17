@@ -809,7 +809,25 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                         <input
                           type="text"
                           value={(val as string) || ''}
-                          onChange={e => updateEntry(rowIdx, fieldKey, e.target.value)}
+                          placeholder={fieldKey === 'os_ref' ? '111/2026' : undefined}
+                          title={fieldKey === 'os_ref'
+                            ? 'The case number and its year, written as 111/2026.'
+                            : undefined}
+                          onChange={e => {
+                            // One way of writing it, and the column says which.
+                            //
+                            // This cell used to take anything — "OS No. 111",
+                            // "os 111", a note to nobody — and the register was
+                            // left to work out what was meant. An officer who can
+                            // see the shape expected types it, and the number is
+                            // then a case number rather than something to be
+                            // interpreted after the fact.
+                            const raw = e.target.value;
+                            const value = fieldKey === 'os_ref'
+                              ? raw.replace(/[^0-9/]/g, '').replace(/\/{2,}/g, '/')
+                              : raw;
+                            updateEntry(rowIdx, fieldKey, value);
+                          }}
                           onKeyDown={e => handleCellKeyDown(e, rowIdx, colIdx)}
                           onFocus={() => setFocusCell([rowIdx, colIdx])}
                           onBlur={fieldKey === 'os_ref' ? () => handleOsRefBlur(rowIdx) : undefined}

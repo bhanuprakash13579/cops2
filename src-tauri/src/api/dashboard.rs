@@ -16,15 +16,6 @@ pub async fn stats(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err>
     let month_start = chrono::Local::now().format("%Y-%m-01").to_string();
 
     // OS counts
-    let total_os: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'",
-        [], |r| r.get(0)
-    ).unwrap_or(0);
-
-    // Mirrors sidebar_counts: only count cases that still have goods on them,
-    // so the dashboard figure and the adjudication queue agree. It does not look
-    // at the release category — that column also carries the disposal the officer
-    // chose (RF, REF, CONFS), so gating on it hid every properly filled case.
     let pending_os: i64 = conn.query_row(
         "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
          AND adjudication_date IS NULL AND adj_offr_name IS NULL
@@ -41,58 +32,38 @@ pub async fn stats(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err>
         [], |r| r.get(0)
     ).unwrap_or(0);
 
-    let adjudicated_os: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
-         AND adjudication_date IS NOT NULL",
-        [], |r| r.get(0)
-    ).unwrap_or(0);
+    // One pass over the register instead of eleven.
+    //
+    // These were eleven separate COUNT(*) and SUM() statements, each reading the
+    // whole of cops_master to answer one question about it — the slowest thing
+    // on the dashboard, and it runs the moment an officer signs in. They ask
+    // different questions of the same rows, so they are asked together.
+    //
+    // Every figure is the same figure as before; the conditions are copied
+    // across unchanged, and a test compares the two ways of counting.
+    let (total_os, adjudicated_os, offline_pending, draft_os,
+         today_os, today_adj, month_os, year_os, total_duty, total_payable):
+        (i64, i64, i64, i64, i64, i64, i64, i64, f64, f64) = conn.query_row(
+        "SELECT
+           COUNT(*) FILTER (WHERE is_draft='N'),
+           COUNT(*) FILTER (WHERE is_draft='N'
+                              AND (adjudication_date IS NOT NULL OR adj_offr_name IS NOT NULL)),
+           COUNT(*) FILTER (WHERE is_draft='N'
+                              AND is_offline_adjudication='Y' AND adj_offr_name IS NULL),
+           COUNT(*) FILTER (WHERE is_draft='Y'),
+           COUNT(*) FILTER (WHERE is_draft='N' AND os_date = ?1),
+           COUNT(*) FILTER (WHERE adjudication_date = ?1),
+           COUNT(*) FILTER (WHERE is_draft='N' AND os_date >= ?2),
+           COUNT(*) FILTER (WHERE is_draft='N' AND os_year = ?3),
+           COALESCE(SUM(total_duty_amount) FILTER (WHERE is_draft='N'), 0),
+           COALESCE(SUM(total_payable)     FILTER (WHERE is_draft='N'
+                                                     AND adjudication_date IS NOT NULL), 0)
+         FROM cops_master WHERE entry_deleted='N'",
+        rusqlite::params![today, month_start, year.parse::<i64>().unwrap_or(0)],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+    ).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0));
 
-    let offline_pending: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
-         AND is_offline_adjudication='Y' AND adj_offr_name IS NULL",
-        [], |r| r.get(0)
-    ).unwrap_or(0);
-
-    let draft_os: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='Y'",
-        [], |r| r.get(0)
-    ).unwrap_or(0);
-
-    // Today's activity
-    let today_os: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE os_date=? AND entry_deleted='N' AND is_draft='N'",
-        rusqlite::params![today], |r| r.get(0)
-    ).unwrap_or(0);
-
-    let today_adj: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE adjudication_date=? AND entry_deleted='N'",
-        rusqlite::params![today], |r| r.get(0)
-    ).unwrap_or(0);
-
-    // This month
-    let month_os: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE os_date>=? AND entry_deleted='N' AND is_draft='N'",
-        rusqlite::params![month_start], |r| r.get(0)
-    ).unwrap_or(0);
-
-    // This year
-    let year_os: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cops_master WHERE os_year=? AND entry_deleted='N' AND is_draft='N'",
-        rusqlite::params![year.parse::<i64>().unwrap_or(0)], |r| r.get(0)
-    ).unwrap_or(0);
-
-    // Financial totals
-    let total_duty: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(total_duty_amount),0) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'",
-        [], |r| r.get(0)
-    ).unwrap_or(0.0);
-
-    let total_payable: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(total_payable),0) FROM cops_master WHERE entry_deleted='N' AND is_draft='N' AND adjudication_date IS NOT NULL",
-        [], |r| r.get(0)
-    ).unwrap_or(0.0);
-
-    // BR/DR counts
     let total_br: i64 = conn.query_row("SELECT COUNT(*) FROM br_master WHERE entry_deleted='N'", [], |r| r.get(0)).unwrap_or(0);
     let total_dr: i64 = conn.query_row("SELECT COUNT(*) FROM dr_master WHERE entry_deleted='N'", [], |r| r.get(0)).unwrap_or(0);
 

@@ -4555,8 +4555,30 @@ async fn cases_from_before_the_cut_off_are_legacy_whenever_they_are_loaded() {
             .find(|e| e["sl_no"] == sl)
             .and_then(|e| e["status"].as_str()).unwrap_or("").to_string()
     };
-    assert_eq!(status_of(1), "LEGACY", "an old case is not judged open or closed");
+    // The sheet is dated after the cut-off, so the money on it is money we can
+    // see: even the 2024 case is judged on what it actually paid.
+    assert_eq!(status_of(1), "CLOSED", "an old case paying now is judged on what it paid");
     assert_eq!(status_of(2), "CLOSED", "a case from the new regime is judged as usual");
+
+    // A sheet from before the cut-off is a record of the old regime, and its
+    // cases are shown as legacy rather than judged.
+    let old_sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute("INSERT INTO dcr_sessions (report_date, shift, created_at)
+                      VALUES ('2026-08-20','DAY',datetime('now'))", []).unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, br_no, os_ref,
+                                      personal_penalty, total_duty)
+             VALUES (?,1,1,'8001','6001/2026',5000,5000)", [id]).unwrap();
+        id
+    };
+    let old_sess: serde_json::Value = c.get(format!("{base}/dcr/sessions/{old_sid}"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let old_status = old_sess["entries"].as_array().cloned().unwrap_or_default()
+        .first().and_then(|e| e["status"].as_str()).unwrap_or("").to_string();
+    assert_eq!(old_status, "LEGACY",
+               "a sheet from before the cut-off shows its cases as legacy");
 
     // Clearing it puts every case back under the ordinary rule.
     c.put(format!("{base}/admin/config/legacy-cutoff")).bearer_auth(&atok)
@@ -4566,4 +4588,339 @@ async fn cases_from_before_the_cut_off_are_legacy_whenever_they_are_loaded() {
     assert!(list2["items"].as_array().unwrap().iter()
                 .all(|r| r["legacy_period"] == false),
             "with no cut-off set, nothing is legacy");
+}
+
+/// A register the size of the office's, and a stopwatch on the pages that open
+/// most often. Run it on purpose:
+///
+///     cargo test --test backup_api office_sized -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn office_sized_register_still_answers_quickly() {
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    // 30,000 cases and 70,000 items, near enough to the real register.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute_batch("PRAGMA synchronous=OFF; BEGIN;").unwrap();
+        {
+            let mut m = conn.prepare(
+                "INSERT INTO cops_master (os_no, os_year, os_date, pax_name, passport_no, flight_no,
+                                          is_draft, entry_deleted, adjudication_date, adj_offr_name,
+                                          total_items_value)
+                 VALUES (?,?,?,?,?,?,?,'N',?,?,?)").unwrap();
+            let mut it = conn.prepare(
+                "INSERT INTO cops_items (os_no, os_year, os_date, items_sno, items_desc,
+                                         items_value, items_release_category, entry_deleted)
+                 VALUES (?,?,?,?,?,?,?,'N')").unwrap();
+            for i in 1..=30_000i64 {
+                let year = 2019 + (i % 8);
+                let date = format!("{year}-{:02}-{:02}", 1 + (i % 12), 1 + (i % 28));
+                // most settled, as in a real register
+                let (adj_date, adj_name) = if i % 10 == 0 { (None, None) }
+                                           else { (Some(date.clone()), Some("SOME DC".to_string())) };
+                m.execute(rusqlite::params![
+                    i.to_string(), year, date, format!("PASSENGER {i}"),
+                    format!("Z{:07}", i), format!("AI-{:03}", i % 900),
+                    "N", adj_date, adj_name, (i % 500_000) as f64]).unwrap();
+                for k in 1..=(1 + i % 3) {
+                    it.execute(rusqlite::params![
+                        i.to_string(), year, date, k, "GOLD CHAIN 24K",
+                        25_000.0, if i % 3 == 0 { "CONFS" } else { "Under OS" }]).unwrap();
+                }
+            }
+        }
+        conn.execute_batch("COMMIT; ANALYZE;").unwrap();
+    }
+
+    let time = |url: String, tok: String| async move {
+        let c = reqwest::Client::new();
+        let t0 = std::time::Instant::now();
+        let r = c.get(&url).bearer_auth(tok).send().await.unwrap();
+        let n = r.text().await.unwrap().len();
+        (t0.elapsed().as_millis(), n)
+    };
+
+    let cases: i64 = pool.get().unwrap()
+        .query_row("SELECT COUNT(*) FROM cops_master", [], |r| r.get(0)).unwrap();
+    let items: i64 = pool.get().unwrap()
+        .query_row("SELECT COUNT(*) FROM cops_items", [], |r| r.get(0)).unwrap();
+    println!("\n  register: {cases} cases, {items} items");
+
+    for (label, url) in [
+        ("View All O/S Cases   ", format!("{base}/os?per_page=25")),
+        ("adjudication queue   ", format!("{base}/os?status=pending&per_page=25")),
+        ("adjudicated list     ", format!("{base}/os?status=adjudicated&per_page=25")),
+        ("search by name       ", format!("{base}/os?search=PASSENGER%2029999&per_page=25")),
+        ("search by passport   ", format!("{base}/os?search=Z0029999&per_page=25")),
+        ("filter by year       ", format!("{base}/os?year=2026&per_page=25")),
+        ("badge counts         ", format!("{base}/os/sidebar-counts")),
+        ("dashboard            ", format!("{base}/dashboard/stats")),
+    ] {
+        let (ms, bytes) = time(url.clone(), if label.starts_with("badge") || label.starts_with("dash")
+                                            { dc_token() } else { t.clone() }).await;
+        println!("  {label} {ms:>5} ms   {bytes:>7} bytes");
+    }
+
+    // The baggage register is the big one in the office — 335,000 receipts.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute_batch("PRAGMA synchronous=OFF; BEGIN;").unwrap();
+        {
+            let mut b = conn.prepare(
+                "INSERT INTO br_master (br_no, br_year, br_date, pax_name, passport_no,
+                                        flight_no, br_type, entry_deleted, total_payable)
+                 VALUES (?,?,?,?,?,?,'BAGGAGE','N',?)").unwrap();
+            for i in 1..=100_000i64 {
+                let year = 2019 + (i % 8);
+                b.execute(rusqlite::params![
+                    i, year, format!("{year}-{:02}-{:02}", 1 + (i % 12), 1 + (i % 28)),
+                    format!("BR PASSENGER {i}"), format!("P{:07}", i),
+                    format!("AI-{:03}", i % 900), (i % 90_000) as f64]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT; ANALYZE;").unwrap();
+    }
+    let brs: i64 = pool.get().unwrap()
+        .query_row("SELECT COUNT(*) FROM br_master", [], |r| r.get(0)).unwrap();
+    println!("  ── baggage register: {brs} receipts ──");
+    for (label, url) in [
+        ("baggage list         ", format!("{base}/br?per_page=25")),
+        ("baggage search       ", format!("{base}/br?search=BR%20PASSENGER%2099999&per_page=25")),
+        ("baggage by passport  ", format!("{base}/br/passport/P0099999")),
+        // What the BR/DR lookup page in the query module actually calls.
+        ("lookup: br search    ", format!("{base}/os-query/br/search?search=BR%20PASSENGER%2099999&per_page=50")),
+        ("lookup: br browse    ", format!("{base}/os-query/br/search?per_page=50")),
+        ("lookup: br by year   ", format!("{base}/os-query/br/search?year=2026&per_page=50")),
+        ("lookup: dr search    ", format!("{base}/os-query/dr/search?per_page=50")),
+    ] {
+        let (ms, bytes) = time(url, t.clone()).await;
+        println!("  {label} {ms:>5} ms   {bytes:>7} bytes");
+    }
+
+    // The same pages again with the cut-off in force, to see what it costs.
+    let admin: serde_json::Value = c.post(format!("{base}/admin/login"))
+        .json(&serde_json::json!({ "username": "sysadmin",
+                                   "password": std::env::var("ADMIN_PASSWORD").unwrap() }))
+        .send().await.unwrap().json().await.unwrap();
+    c.put(format!("{base}/admin/config/legacy-cutoff"))
+        .bearer_auth(admin["access_token"].as_str().unwrap())
+        .json(&serde_json::json!({ "cutoff": "2026-09-01" })).send().await.unwrap();
+
+    println!("  ── with the legacy cut-off set ──");
+    for (label, url) in [
+        ("View All O/S Cases   ", format!("{base}/os?per_page=25")),
+        ("adjudication queue   ", format!("{base}/os?status=pending&per_page=25")),
+        ("one case             ", format!("{base}/os/29999/2026")),
+    ] {
+        let (ms, bytes) = time(url, t.clone()).await;
+        println!("  {label} {ms:>5} ms   {bytes:>7} bytes");
+    }
+}
+
+#[tokio::test]
+async fn the_dashboard_counts_the_same_after_being_made_faster() {
+    // Eleven statements, each reading the whole register to answer one question,
+    // became one that answers all eleven. Same rows, same conditions — this
+    // counts both ways and compares, because a dashboard figure that quietly
+    // changes is worse than a slow one.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let year: i64 = chrono::Local::now().format("%Y").to_string().parse().unwrap();
+    let month_start = chrono::Local::now().format("%Y-%m-01").to_string();
+
+    {
+        let conn = pool.get().unwrap();
+        // A spread: drafts, pending, adjudicated, offline, today, this month,
+        // this year, last year, and one soft-deleted that must count nowhere.
+        let rows: [(&str, &str, &str, Option<&str>, Option<&str>, &str, &str, f64, f64); 9] = [
+            ("101", &today,        "N", None,          None,       "N", "N", 100.0, 0.0),
+            ("102", &today,        "N", Some(&today),  Some("DC"), "N", "N", 200.0, 500.0),
+            ("103", &month_start,  "N", None,          None,       "Y", "N", 300.0, 0.0),
+            ("104", "2019-01-05",  "N", Some("2019-01-06"), Some("DC"), "N", "N", 400.0, 900.0),
+            ("105", &today,        "Y", None,          None,       "N", "N", 500.0, 0.0),
+            ("106", "2019-02-05",  "N", None,          None,       "N", "N", 600.0, 0.0),
+            ("107", &today,        "N", None,          Some("DC"), "N", "N", 700.0, 0.0),
+            ("108", &month_start,  "N", None,          None,       "N", "N", 800.0, 0.0),
+            ("109", &today,        "N", None,          None,       "N", "Y", 900.0, 0.0),
+        ];
+        for (no, date, draft, adj_date, adj_name, offline, deleted, duty, payable) in rows {
+            let y: i64 = date[0..4].parse().unwrap();
+            conn.execute(
+                "INSERT INTO cops_master (os_no, os_year, os_date, is_draft, adjudication_date,
+                                          adj_offr_name, is_offline_adjudication, entry_deleted,
+                                          total_duty_amount, total_payable, pax_name)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,'X')",
+                rusqlite::params![no, y, date, draft, adj_date, adj_name, offline, deleted, duty, payable],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO cops_items (os_no, os_year, os_date, items_sno, items_desc,
+                                         items_value, items_release_category, entry_deleted)
+                 VALUES (?,?,?,1,'TV',100,'CONFS','N')",
+                rusqlite::params![no, y, date]).unwrap();
+        }
+    }
+
+    let got: serde_json::Value = c.get(format!("{base}/dashboard/stats"))
+        .bearer_auth(dc_token()).send().await.unwrap().json().await.unwrap();
+
+    // The same questions, asked the old way, one statement each.
+    let conn = pool.get().unwrap();
+    let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> i64 {
+        conn.query_row(sql, p, |r| r.get(0)).unwrap_or(0)
+    };
+    let onef = |sql: &str| -> f64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0.0) };
+
+    // The response nests them: os.total, os.adjudicated, financials.total_duty_amount.
+    let expect: Vec<(&str, i64)> = vec![
+        ("total", one("SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'", &[])),
+        ("adjudicated", one("SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
+             AND (adjudication_date IS NOT NULL OR adj_offr_name IS NOT NULL)", &[])),
+        ("offline_pending", one("SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='N'
+             AND is_offline_adjudication='Y' AND adj_offr_name IS NULL", &[])),
+        ("draft", one("SELECT COUNT(*) FROM cops_master WHERE entry_deleted='N' AND is_draft='Y'", &[])),
+        ("today", one("SELECT COUNT(*) FROM cops_master WHERE os_date=?1 AND entry_deleted='N' AND is_draft='N'", &[&today])),
+        ("today_adj", one("SELECT COUNT(*) FROM cops_master WHERE adjudication_date=?1 AND entry_deleted='N'", &[&today])),
+        ("this_month", one("SELECT COUNT(*) FROM cops_master WHERE os_date>=?1 AND entry_deleted='N' AND is_draft='N'", &[&month_start])),
+        ("this_year", one("SELECT COUNT(*) FROM cops_master WHERE os_year=?1 AND entry_deleted='N' AND is_draft='N'", &[&year])),
+    ];
+    for (key, want) in expect {
+        let saw = got["os"].get(key).and_then(|v| v.as_i64())
+            .unwrap_or_else(|| panic!("the dashboard did not report os.{key}: {got}"));
+        assert_eq!(saw, want, "{key}: one pass said {saw}, separate statements said {want}");
+    }
+    let duty = onef("SELECT COALESCE(SUM(total_duty_amount),0) FROM cops_master
+                      WHERE entry_deleted='N' AND is_draft='N'");
+    let payable = onef("SELECT COALESCE(SUM(total_payable),0) FROM cops_master
+                         WHERE entry_deleted='N' AND is_draft='N' AND adjudication_date IS NOT NULL");
+    assert_eq!(got["financials"]["total_duty_amount"].as_f64().unwrap_or(-1.0), duty,
+               "duty totals must match");
+    assert_eq!(got["financials"]["total_payable"].as_f64().unwrap_or(-1.0), payable,
+               "payable totals must match");
+
+    // The soft-deleted case counts nowhere: nine rows seeded, one deleted, one draft.
+    assert_eq!(got["os"]["total"].as_i64().unwrap_or(0), 7,
+               "a deleted case is not on the dashboard: {got}");
+}
+
+#[tokio::test]
+async fn a_receipt_written_against_a_bare_case_number_reaches_this_year_s_case() {
+    // What the officers actually write on the revenue sheet: the case number
+    // alone. On the day there is only one 520; in the register there is a 520 in
+    // every year, and attaching the receipt to the wrong one would be worse than
+    // attaching it to nothing.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    for year in [2025, 2026] {
+        c.post(format!("{base}/os")).bearer_auth(&t)
+            .json(&serde_json::json!({
+                "os_no": "520", "os_date": format!("{year}-05-10"), "os_year": year,
+                "pax_name": format!("PAX OF {year}"), "is_draft": "N",
+                "items": [{ "items_sno": 1, "items_desc": "GOLD", "items_qty": 1.0,
+                            "items_value": 100000.0, "items_release_category": "CONFS" }]
+            }))
+            .send().await.unwrap();
+    }
+
+    let sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute("INSERT INTO dcr_sessions (report_date, shift, created_at)
+                      VALUES ('2026-09-02','DAY',datetime('now'))", []).unwrap();
+        conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap()
+    };
+
+    // The sheet as it is filled: a receipt, and "520" with no year.
+    let saved = c.put(format!("{base}/dcr/sessions/{sid}/entries")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "entries": [{ "sort_order": 1, "sl_no": 1, "br_no": "49773", "os_ref": "520",
+                          "personal_penalty": 5000.0, "total_duty": 5000.0 }]
+        }))
+        .send().await.unwrap();
+    assert!(saved.status().is_success(), "saving the sheet: {}", saved.status());
+
+    let entries_of = |year: i64| -> String {
+        pool.get().unwrap().query_row(
+            "SELECT COALESCE(post_adj_br_entries,'') FROM cops_master
+              WHERE os_no = '520' AND os_year = ?1", [year], |r| r.get(0)).unwrap_or_default()
+    };
+    assert!(entries_of(2026).contains("49773"),
+            "the receipt belongs to this year's case: {}", entries_of(2026));
+    assert!(!entries_of(2025).contains("49773"),
+            "and must not reach into last year's: {}", entries_of(2025));
+
+    // Written out in full, the year given is the year meant.
+    c.put(format!("{base}/dcr/sessions/{sid}/entries")).bearer_auth(&t)
+        .json(&serde_json::json!({
+            "entries": [{ "sort_order": 1, "sl_no": 1, "br_no": "49773", "os_ref": "520",
+                          "personal_penalty": 5000.0, "total_duty": 5000.0 },
+                        { "sort_order": 2, "sl_no": 2, "br_no": "49999", "os_ref": "520/2025",
+                          "personal_penalty": 5000.0, "total_duty": 5000.0 }]
+        }))
+        .send().await.unwrap();
+    assert!(entries_of(2025).contains("49999"),
+            "an explicit year still means that year: {}", entries_of(2025));
+    assert!(!entries_of(2026).contains("49999"),
+            "and does not also land on this year's case: {}", entries_of(2026));
+}
+
+#[tokio::test]
+async fn a_report_is_worked_out_at_the_rates_that_were_in_force_that_day() {
+    // Rates change. A sheet for the 10th of March, filled on the 20th — after
+    // the change — must still be worked out at March's rates, and a tariff
+    // entered ahead of its date must not take effect the moment it is saved.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute("DELETE FROM dcr_tariffs", []).unwrap();
+        for (from, label, baggage) in [
+            ("2025-08-12", "period A", 35.0),
+            ("2026-03-15", "period B", 38.5),
+            ("2099-01-01", "not yet",  99.0),   // dated ahead: must wait its turn
+        ] {
+            conn.execute(
+                "INSERT INTO dcr_tariffs (effective_from, label, baggage_rate, liquor_duty_rate,
+                     aidc_liquor_rate, gold_bcd_rate, aidc_gold_rate, gold_cons_bcd_rate,
+                     aidc_gold_cons_rate, silver_bcd_rate, aidc_silver_rate,
+                     silver_cons_rate, aidc_silver_cons_rate)
+                 VALUES (?,?,?,0,0,0,0,0,0,0,0,0,0)",
+                rusqlite::params![from, label, baggage]).unwrap();
+        }
+    }
+
+    // A sheet for each period — both created now, well after period A ended.
+    for (date, want_label, want_rate) in [
+        ("2025-12-01", "period A", 35.0),     // inside period A
+        ("2026-03-14", "period A", 35.0),     // the day before the change
+        ("2026-03-15", "period B", 38.5),     // the day of the change
+        ("2026-06-01", "period B", 38.5),     // well inside period B
+    ] {
+        let made: serde_json::Value = c.post(format!("{base}/dcr/sessions")).bearer_auth(&t)
+            .json(&serde_json::json!({ "report_date": date, "shift": "DAY" }))
+            .send().await.unwrap().json().await.unwrap();
+        let id = made["id"].as_i64().unwrap_or_else(|| panic!("no session for {date}: {made}"));
+        let sess: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+            .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+        let label = sess["tariff"]["label"].as_str().unwrap_or("");
+        let rate  = sess["tariff"]["baggage_rate"].as_f64().unwrap_or(-1.0);
+        assert_eq!(label, want_label, "a report for {date} belongs to {want_label}: {sess}");
+        assert_eq!(rate, want_rate, "and carries that period's rate");
+    }
+
+    // A sheet older than every rate on file falls back to the earliest, rather
+    // than being left with no rate at all.
+    let old: serde_json::Value = c.post(format!("{base}/dcr/sessions")).bearer_auth(&t)
+        .json(&serde_json::json!({ "report_date": "2019-01-01", "shift": "DAY" }))
+        .send().await.unwrap().json().await.unwrap();
+    let id = old["id"].as_i64().unwrap();
+    let sess: serde_json::Value = c.get(format!("{base}/dcr/sessions/{id}"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(sess["tariff"]["label"].as_str().unwrap_or(""), "period A",
+               "the oldest rate on file is better than none");
 }

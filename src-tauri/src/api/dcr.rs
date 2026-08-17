@@ -129,7 +129,14 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
-    let entries = settle_cases(&conn, entries);
+    // The year the sheet was written for, so a bare "520" on it means that
+    // year's case rather than one of the same number from an earlier year.
+    let report_year: Option<i64> = session.get("report_date")
+        .and_then(|v| v.as_str())
+        .and_then(|d| d.get(0..4))
+        .and_then(|y| y.parse().ok());
+    let report_date_for_status = session.get("report_date").and_then(|v| v.as_str()).map(str::to_string);
+    let entries = settle_cases(&conn, entries, report_year, report_date_for_status.as_deref());
 
     // Load DR entries
     let mut stmt2 = conn.prepare(
@@ -319,12 +326,31 @@ pub async fn create_session(
     let batch_name = req.get("batch_name").and_then(|v| v.as_str());
     let created_by = req.get("created_by").and_then(|v| v.as_str());
 
-    // Look up latest tariff
+    // The rates that were in force on the day the report is for.
+    //
+    // This took the newest tariff in the table, whatever day the report was for.
+    // Rates change: a sheet filled on the 20th of March for the 10th — before
+    // the change — was worked out at the new rates, and so was every sheet
+    // reopened afterwards for any earlier day. A tariff entered ahead of time
+    // took effect the moment it was saved rather than on the day it was dated.
+    //
+    // A report older than every tariff on file falls back to the earliest one:
+    // it is the only rate the office has ever recorded, and computing at no rate
+    // at all is worse than computing at the oldest.
     let tariff_id: Option<i64> = conn.query_row(
-        "SELECT id FROM dcr_tariffs ORDER BY effective_from DESC LIMIT 1",
-        [],
+        "SELECT id FROM dcr_tariffs
+          WHERE effective_from <= ?1
+          ORDER BY effective_from DESC LIMIT 1",
+        rusqlite::params![report_date],
         |r| r.get(0),
     ).optional().map_err(|e| e500(&e.to_string()))?;
+    let tariff_id: Option<i64> = match tariff_id {
+        Some(id) => Some(id),
+        None => conn.query_row(
+            "SELECT id FROM dcr_tariffs ORDER BY effective_from ASC LIMIT 1",
+            [], |r| r.get(0),
+        ).optional().map_err(|e| e500(&e.to_string()))?,
+    };
 
     conn.execute(
         "INSERT INTO dcr_sessions (report_date, shift, batch_name, tariff_id, created_by, tariff_snapshot)
@@ -1414,21 +1440,23 @@ fn duty_of(e: &Value) -> f64 {
 /// Receipts against the same case on a different day are not in hand here. A
 /// case settled across two shifts still shows OPEN on the first of them, which
 /// is what the officer sees on the day and is true when they see it.
-fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>) -> Vec<Value> {
+fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>, report_year: Option<i64>,
+                report_date: Option<&str>) -> Vec<Value> {
     use std::collections::HashMap;
     let text = |e: &Value, k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let read_ref = |raw: &str| parse_os_ref_in_year(raw, report_year);
 
     // A receipt whose goods run over several lines names its case once, on the
     // first of them. The lines below carry the same receipt number, so that is
     // what ties them to the case.
     let mut by_receipt: HashMap<String, (String, i64)> = HashMap::new();
     for e in &entries {
-        let (br, Some(case)) = (text(e, "br_no"), parse_os_ref(&text(e, "os_ref"))) else { continue };
+        let (br, Some(case)) = (text(e, "br_no"), read_ref(&text(e, "os_ref"))) else { continue };
         if br.is_empty() { continue; }
         by_receipt.entry(br).or_insert(case);
     }
     let case_of = |e: &Value| -> Option<(String, i64)> {
-        parse_os_ref(&text(e, "os_ref"))
+        read_ref(&text(e, "os_ref"))
             .or_else(|| by_receipt.get(&text(e, "br_no")).cloned())
     };
 
@@ -1445,19 +1473,43 @@ fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>) -> Vec<Value> 
     // Cases from before the office began keeping them the new way. Whether those
     // were ever settled is not recorded anywhere, so they are not called open or
     // closed on the strength of a guess — they are shown as legacy.
+    // Looked up once for each case on the sheet, not once for each line.
+    //
+    // A shift names a handful of cases across dozens of lines, and asking the
+    // register for the same case's date on every line is the same question
+    // answered over and over. The distinct cases are already in hand from the
+    // totals above.
+    // An old case can come in to pay long after the line was drawn. The receipt
+    // is written today, on today's report, and what it collected is exactly what
+    // the open/closed rule reads — so a sheet dated on or after the cut-off
+    // judges its cases on their own figures, whatever year they are from. Only a
+    // sheet from before the cut-off — an old month loaded for the record — shows
+    // its cases as legacy.
     let cutoff = crate::api::admin::legacy_cutoff(conn);
-    let is_legacy = |case: &(String, i64)| -> bool {
-        if cutoff.is_none() { return false; }
-        let os_date: Option<String> = conn.query_row(
-            "SELECT os_date FROM cops_master WHERE os_no = ?1 AND os_year = ?2 AND entry_deleted = 'N'",
-            rusqlite::params![case.0, case.1], |r| r.get(0),
-        ).ok();
-        crate::api::admin::is_legacy_period(cutoff.as_deref(), os_date.as_deref())
+    let cutoff = match (cutoff.as_deref(), report_date) {
+        (Some(cut), Some(d)) if d.trim() < cut => cutoff,
+        _ => None,
     };
+    let mut legacy: std::collections::HashSet<(String, i64)> = Default::default();
+    if cutoff.is_some() {
+        if let Ok(mut st) = conn.prepare(
+            "SELECT os_date FROM cops_master
+              WHERE os_no = ?1 AND os_year = ?2 AND entry_deleted = 'N'"
+        ) {
+            for case in totals.keys() {
+                let os_date: Option<String> = st
+                    .query_row(rusqlite::params![case.0, case.1], |r| r.get(0))
+                    .ok();
+                if crate::api::admin::is_legacy_period(cutoff.as_deref(), os_date.as_deref()) {
+                    legacy.insert(case.clone());
+                }
+            }
+        }
+    }
 
     entries.into_iter().map(|mut e| {
         let verdict = case_of(&e).and_then(|c| {
-            if is_legacy(&c) { return Some("LEGACY"); }
+            if legacy.contains(&c) { return Some("LEGACY"); }
             totals.get(&c).map(|&(pp, rf, duty)| entry_status(pp, rf, duty))
         });
         if let Some(obj) = e.as_object_mut() {
@@ -1520,6 +1572,55 @@ pub fn entry_status(personal_penalty: f64, redemption_fine: f64, duty: f64) -> &
 /// so a number that follows a slash, dot or dash — as the middle of a date does
 /// — is not a case number.
 pub fn parse_os_ref(raw: &str) -> Option<(String, i64)> {
+    parse_os_ref_in_year(raw, None)
+}
+
+/// The same reading, for a sheet that knows its own year.
+///
+/// Officers write the case number alone — "520", not "520/2026" — because on the
+/// day they are filling the sheet there is only one 520. There is not, in the
+/// register: 520 of 2025 is a different case with a different passenger, and
+/// attaching this receipt to it would be worse than attaching it to nothing.
+///
+/// So a bare number is read as that year's case, and the year comes from the
+/// report the line was written on — not from today's date, which would put a
+/// sheet filled late for December into January. A number written out in full
+/// still means what it says: "520/2025" on a 2026 report is the 2025 case.
+pub fn parse_os_ref_in_year(raw: &str, default_year: Option<i64>) -> Option<(String, i64)> {
+    if let Some(found) = parse_os_ref_slashed(raw) { return Some(found); }
+
+    // No year written. Officers put the number down in whatever form is quickest
+    // — "205", "OS 205", "O.S.NO. 205", "os.no:205" — and all of them mean the
+    // same case on the day the sheet is being filled.
+    let year = default_year?;
+
+    // Exactly one run of digits. Two runs is a date, or two numbers, or a number
+    // with something else beside it, and none of those name one case.
+    let mut runs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() { cur.push(ch); }
+        else if !cur.is_empty() { runs.push(std::mem::take(&mut cur)); }
+    }
+    if !cur.is_empty() { runs.push(cur); }
+    if runs.len() != 1 { return None; }
+    let digits = &runs[0];
+    if digits.len() > 5 { return None; }
+
+    // And whatever letters sit beside it must be a way of writing "O.S. number".
+    // Otherwise "PAID 5000" would be read as case 5000 — a number in the column
+    // is not a case number just by being a number.
+    let letters: String = raw.chars().filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase()).collect();
+    const WAYS_OF_WRITING_IT: &[&str] = &["", "OS", "OSNO", "OSNUMBER", "NO", "OSN", "N", "OSNOS"];
+    if !WAYS_OF_WRITING_IT.contains(&letters.as_str()) { return None; }
+
+    let no = digits.trim_start_matches('0');
+    if no.is_empty() { return None; }
+    Some((no.to_string(), year))
+}
+
+fn parse_os_ref_slashed(raw: &str) -> Option<(String, i64)> {
     let c: Vec<char> = raw.chars().collect();
     for (i, ch) in c.iter().enumerate() {
         if *ch != '/' { continue; }
@@ -1576,6 +1677,7 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
         .query_row("SELECT report_date FROM dcr_sessions WHERE id = ?1", [session_id], |r| r.get(0))
         .unwrap_or_default();
     if report_date.trim().is_empty() { return 0; }
+    let report_year: Option<i64> = report_date.get(0..4).and_then(|y| y.parse().ok());
 
     let pairs: Vec<(String, String)> = {
         let Ok(mut st) = conn.prepare(
@@ -1590,7 +1692,8 @@ fn link_receipts_to_cases(conn: &rusqlite::Connection, session_id: i64) -> usize
     let mut added_total = 0usize;
     let mut cases: std::collections::HashSet<(String, i64)> = Default::default();
     for (br_no, os_ref) in pairs {
-        let Some((os_no, os_year)) = parse_os_ref(&os_ref) else { continue };
+        // A bare "520" means this report's year — see parse_os_ref_in_year.
+        let Some((os_no, os_year)) = parse_os_ref_in_year(&os_ref, report_year) else { continue };
         let os_no = os_no.as_str();
 
         // One revenue cell may name several receipts.
@@ -1673,7 +1776,49 @@ mod os_ref_tests {
 
         // Notes and empty cells name no case.
         assert_eq!(parse_os_ref("* 4 BRS CONTAIN MULTIPLE ITEMS"), None);
-        assert_eq!(parse_os_ref("520"), None);
         assert_eq!(parse_os_ref(""), None);
+    }
+
+    #[test]
+    fn a_case_number_written_without_a_year_belongs_to_the_year_of_the_report() {
+        use super::parse_os_ref_in_year;
+        // On the day, there is only one 520 — so that is what the officer writes.
+        // In the register there is a 520 in every year, and the receipt must not
+        // be attached to one of the old ones.
+        assert_eq!(parse_os_ref_in_year("520", Some(2026)), Some(("520".into(), 2026)));
+        assert_eq!(parse_os_ref_in_year(" 520 ", Some(2026)), Some(("520".into(), 2026)));
+        assert_eq!(parse_os_ref_in_year("0520", Some(2026)), Some(("520".into(), 2026)));
+
+        // A year written out still means what it says, even on a later sheet.
+        assert_eq!(parse_os_ref_in_year("520/2025", Some(2026)), Some(("520".into(), 2025)));
+        assert_eq!(parse_os_ref_in_year("OS No. 501/2026", Some(2019)), Some(("501".into(), 2026)));
+
+        // With no year to fall back on, a bare number still names no case: it is
+        // better to link nothing than to guess a year.
+        assert_eq!(parse_os_ref_in_year("520", None), None);
+
+        // And a note is not a case number, whatever year is offered.
+        // However it was written down on the day.
+        for written in ["205", " 205 ", "OS 205", "OS.NO. 205", "O.S.NO.205", "os.no:205",
+                        "OS-205", "No. 205", "OS/205"] {
+            assert_eq!(parse_os_ref_in_year(written, Some(2026)), Some(("205".into(), 2026)),
+                       "{written:?} is case 205 of the report's year");
+        }
+
+        // An old case paying now: the year written is the year meant, and it is
+        // linked to that case rather than to this year's number.
+        assert_eq!(parse_os_ref_in_year("125/2024", Some(2026)), Some(("125".into(), 2024)));
+        assert_eq!(parse_os_ref_in_year("OS.NO. 125/2024", Some(2026)), Some(("125".into(), 2024)));
+
+        // A number in the column is not a case number just by being a number.
+        assert_eq!(parse_os_ref_in_year("PAID 5000", Some(2026)), None);
+        assert_eq!(parse_os_ref_in_year("CASH 5000", Some(2026)), None);
+        assert_eq!(parse_os_ref_in_year("205 AND 206", Some(2026)), None,
+                   "two numbers name no single case");
+        assert_eq!(parse_os_ref_in_year("* 4 BRS CONTAIN MULTIPLE ITEMS", Some(2026)), None);
+        assert_eq!(parse_os_ref_in_year("PAID", Some(2026)), None);
+        assert_eq!(parse_os_ref_in_year("", Some(2026)), None);
+        assert_eq!(parse_os_ref_in_year("123456", Some(2026)), None,
+                   "six digits is not a case number in this office");
     }
 }

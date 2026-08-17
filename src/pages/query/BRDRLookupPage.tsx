@@ -512,7 +512,17 @@ export default function BRDRLookupPage() {
             )}
           </div>
 
-          {results.length === 0 ? (
+          {/* While the search is running the results are empty, and saying "no
+              records match" is not merely unhelpful but wrong — the register has
+              not been asked yet. It said that first and filled the table in
+              after, so every search looked as though it had failed and then
+              changed its mind. */}
+          {loading ? (
+            <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+              <Loader2 size={28} className="mb-3 animate-spin" />
+              <p className="text-sm">Searching the {tab.toUpperCase()} register…</p>
+            </div>
+          ) : results.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 text-slate-400">
               <FileX size={36} className="mb-3 opacity-40" />
               <p className="text-sm">No {tab.toUpperCase()} records match your search.</p>
