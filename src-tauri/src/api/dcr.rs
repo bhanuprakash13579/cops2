@@ -1547,27 +1547,23 @@ pub fn entry_status(
     reexport_fine: f64,
     duty: f64,
 ) -> &'static str {
-    if personal_penalty <= 0.0 {
-        // No personal penalty collected. A case with none is still settled if it
-        // was a *pure* re-export: the goods leave the country on the re-export
-        // fine alone, and no penalty is required for that (unlike an absolute
-        // confiscation, where the penalty is the whole of it).
-        //
-        // But only a pure re-export. A line that also carries a redemption fine
-        // is a redemption or a mixed disposition, where the personal penalty is
-        // still due — the re-export fine on it does not close it. With neither a
-        // penalty nor a lone re-export fine, nothing has been collected to close
-        // the case.
-        return if reexport_fine > 0.0 && redemption_fine <= 0.0 { "CLOSED" } else { "OPEN" };
+    // A re-export sends the goods back out of the country, so no duty is ever
+    // owed on them — the re-export fine alone settles the case. (A case is only
+    // ever a redemption or a re-export, never both; where a stray redemption
+    // fine sits alongside one, the re-export is still the disposition.)
+    if reexport_fine > 0.0 {
+        return "CLOSED";
     }
+    // A redemption lets the passenger keep the goods, so the duty on them falls
+    // due as well: the case is settled only once both the fine and that duty are
+    // paid. With the fine paid but the duty still owing, it stays open.
     if redemption_fine > 0.0 {
-        // Redemption was offered: the duty on the goods being taken back is due.
-        if duty > 0.0 { "CLOSED" } else { "OPEN" }
-    } else {
-        // Absolute confiscation, or a re-export where a penalty was also imposed:
-        // the penalty is paid.
-        "CLOSED"
+        return if duty > 0.0 { "CLOSED" } else { "OPEN" };
     }
+    // No fine at all — the goods were confiscated absolutely, and the personal
+    // penalty is the whole of the settlement. With neither a fine nor a penalty,
+    // nothing has been collected to close the case.
+    if personal_penalty > 0.0 { "CLOSED" } else { "OPEN" }
 }
 
 // ── Carrying the BR ↔ O.S. linkage back to the register ─────────────────────

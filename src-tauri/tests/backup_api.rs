@@ -3947,10 +3947,15 @@ async fn the_revenue_sheet_can_look_up_the_receipts_for_a_case() {
 }
 
 #[tokio::test]
-async fn a_line_is_open_until_the_personal_penalty_is_paid() {
-    // The penalty is mandatory. Unpaid, the case is still open whatever else was
-    // collected; paid, it is settled — on an absolute confiscation the penalty is
-    // the whole of it, and on a normal one it accompanies the fine and the duty.
+async fn a_redemption_needs_its_duty_but_a_re_export_does_not() {
+    // A redemption lets the passenger keep the goods, so its duty falls due as
+    // well — the fine alone does not close it. A re-export sends the goods back
+    // out, so no duty is ever owed and the re-export fine closes it on its own.
+    // An absolute confiscation carries no fine, so the penalty settles it; a bare
+    // duty with nothing collected against it stays open.
+    //
+    // total_duty is the line's grand total; the pure duty is what remains once the
+    // fine and penalty are taken out of it (see duty_of).
     let (base, _d, pool) = serve_with_pool(0).await;
     let c = reqwest::Client::new();
     let sid: i64 = {
@@ -3962,24 +3967,20 @@ async fn a_line_is_open_until_the_personal_penalty_is_paid() {
     };
     {
         let conn = pool.get().unwrap();
-        // duty and a fine collected, but no penalty — still open
-        conn.execute(
-            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
-                                      total_duty, redemption_fine, personal_penalty)
-             VALUES (?,1,1,'520/2026', 40000, 10000, 0)",
-            rusqlite::params![sid]).unwrap();
-        // absolute confiscation: the penalty is the whole of it
-        conn.execute(
-            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
-                                      total_duty, redemption_fine, personal_penalty)
-             VALUES (?,2,2,'521/2026', 0, 0, 5000)",
-            rusqlite::params![sid]).unwrap();
-        // normal confiscation: fine and duty alongside the penalty
-        conn.execute(
-            "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
-                                      total_duty, redemption_fine, personal_penalty)
-             VALUES (?,3,3,'522/2026', 40000, 10000, 2500)",
-            rusqlite::params![sid]).unwrap();
+        // (sl, os_ref, total_duty, redemption_fine, reexport_fine, personal_penalty)
+        for (sl, os_ref, td, rf, rex, pp) in [
+            (1, "520/2026", 40000.0,     0.0,     0.0,    0.0), // bare duty, nothing collected → open
+            (2, "521/2026",     0.0,     0.0,     0.0, 5000.0), // absolute confiscation → penalty closes it
+            (3, "522/2026", 40000.0, 10000.0,     0.0, 2500.0), // redemption, duty of 27500 remains → closed
+            (4, "523/2026", 10000.0, 10000.0,     0.0,    0.0), // redemption, fine paid but no duty → open
+            (5, "524/2026", 12000.0,     0.0, 12000.0,    0.0), // pure re-export, no duty owed → closed
+        ] {
+            conn.execute(
+                "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref,
+                     total_duty, redemption_fine, reexport_fine, personal_penalty)
+                 VALUES (?,?,?,?,?,?,?,?)",
+                rusqlite::params![sid, sl, sl, os_ref, td, rf, rex, pp]).unwrap();
+        }
     }
 
     let s: serde_json::Value = c.get(format!("{base}/dcr/sessions/{sid}"))
@@ -3987,18 +3988,22 @@ async fn a_line_is_open_until_the_personal_penalty_is_paid() {
     let entries = s["entries"].as_array().cloned()
         .or_else(|| s["items"].as_array().cloned())
         .unwrap_or_default();
-    assert_eq!(entries.len(), 3, "all three lines must come back: {s}");
+    assert_eq!(entries.len(), 5, "all five lines must come back: {s}");
 
     let status_of = |sl: i64| -> String {
         entries.iter().find(|e| e["sl_no"] == sl)
             .and_then(|e| e["status"].as_str()).unwrap_or("").to_string()
     };
     assert_eq!(status_of(1), "OPEN",
-               "duty and a fine without the penalty leaves the case open");
+               "a bare duty with no fine and no penalty leaves the case open");
     assert_eq!(status_of(2), "CLOSED",
                "an absolute confiscation is settled by the penalty alone");
     assert_eq!(status_of(3), "CLOSED",
-               "penalty with fine and duty settles a normal confiscation");
+               "a redemption with its fine and its duty both paid is settled");
+    assert_eq!(status_of(4), "OPEN",
+               "a redemption fine with no duty behind it leaves the case owing");
+    assert_eq!(status_of(5), "CLOSED",
+               "a re-export owes no duty — its re-export fine settles it alone");
 }
 
 #[tokio::test]
@@ -4133,24 +4138,23 @@ async fn a_case_is_settled_across_all_the_receipts_that_paid_it() {
         entries.iter().find(|e| e["sl_no"] == sl).cloned().unwrap_or(serde_json::Value::Null)
     };
 
+    // The rule: absolute confiscation (no fine) is settled by the personal
+    // penalty; a redemption is settled once its fine AND the duty on the retained
+    // goods are paid; a re-export is settled by its re-export fine alone, since
+    // goods leaving the country owe no duty. Nothing collected at all stays open.
     assert_eq!(at(1)["status"], "CLOSED", "confiscation: the penalty is the whole of it");
-    assert_eq!(at(2)["status"], "CLOSED", "redemption with the duty paid");
+    assert_eq!(at(2)["status"], "CLOSED", "redemption with the fine and the duty both paid");
     assert_eq!(at(3)["status"], "OPEN",
-               "the fine was paid and no duty was — the goods went back untaxed");
+               "the redemption fine was paid but no duty was — the case is still owing");
     assert_eq!(at(4)["status"], "CLOSED", "penalty receipt of a case paid on two");
     assert_eq!(at(5)["status"], "CLOSED",
                "and the challan that paid its fine and duty — judged alone it read OPEN");
-    assert_eq!(at(6)["status"], "OPEN", "no personal penalty was collected at all");
+    assert_eq!(at(6)["status"], "CLOSED",
+               "527/2025: re-exported, so the re-export fine settles it with no duty owed");
     assert!(at(7)["status"].is_null(),
             "an ordinary duty receipt names no case and awaits nothing: {}", at(7)["status"]);
     assert_eq!(at(8)["status"], "CLOSED",
                "a pure re-export is settled by its re-export fine, with no penalty");
-
-    // And a case that pays a re-export fine but also carries a redemption fine
-    // (527/2025 in the real reports) is NOT closed by the re-export fine — the
-    // penalty is still due. It reads OPEN, unchanged.
-    assert_eq!(at(6)["status"], "OPEN",
-               "a re-export fine alongside a redemption fine does not close it");
 }
 
 
