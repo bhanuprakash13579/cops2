@@ -12,6 +12,7 @@ import {
   AlertTriangle, CheckCircle, Info, GripVertical,
 } from 'lucide-react';
 import api from '@/lib/api';
+import { listOf } from '@/lib/listOf';
 import {
   DrFormulaRule, DrTariff, FORMULA_VARS, evalFormula, buildFormulaVars, validateExpression,
 } from './revenueCalc';
@@ -150,16 +151,16 @@ export default function FormulaRulesPage({ onBack, onRulesChanged }: Props) {
       setTariff(tRes.data);
       // The endpoint answers { items: [...] }; the list is what everything
       // downstream walks.
-      setRules(rRes.data.items ?? rRes.data);
-      setRateHistory(hRes.data);
-      onRulesChanged(rRes.data.items ?? rRes.data);
+      setRules(listOf<DrFormulaRule>(rRes.data));
+      setRateHistory(listOf<DrTariff>(hRes.data));
+      onRulesChanged(listOf<DrFormulaRule>(rRes.data));
     }).catch(() => {}).finally(() => setLoading(false));
   }, []); // eslint-disable-line
 
   const reloadRules = useCallback(() => {
     api.get('/dcr/formula-rules').then(r => {
-      setRules(r.data.items ?? r.data);
-      onRulesChanged(r.data.items ?? r.data);
+      setRules(listOf<DrFormulaRule>(r.data));
+      onRulesChanged(listOf<DrFormulaRule>(r.data));
     }).catch(() => {});
   }, [onRulesChanged]);
 
@@ -187,7 +188,7 @@ export default function FormulaRulesPage({ onBack, onRulesChanged }: Props) {
         api.get('/dcr/tariffs'),
       ]);
       setTariff(tRes.data);
-      setRateHistory(hRes.data);
+      setRateHistory(listOf<DrTariff>(hRes.data));
       setShowNewRateForm(false);
       setRateConfirm(null);
     } catch { /* silent */ }

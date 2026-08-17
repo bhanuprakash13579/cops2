@@ -1,164 +1,121 @@
 import { useState, useRef } from 'react';
-import { Download, Database } from 'lucide-react';
+import { Download } from 'lucide-react';
 import api from '@/lib/api';
+import { saveBlob } from '@/lib/saveFile';
 import { showDownloadToast } from '@/components/DownloadToast';
 
-function formatProgress(loaded: number, total: number | undefined): string {
-  const mb = (loaded / (1024 * 1024)).toFixed(1);
-  if (total && total > 0) {
-    const pct = Math.round((loaded / total) * 100);
-    const totalMb = (total / (1024 * 1024)).toFixed(1);
-    return `Downloading… ${pct}%  (${mb} / ${totalMb} MB)`;
-  }
-  return `Downloading… ${mb} MB`;
-}
-
+/**
+ * One button: take the backup.
+ *
+ * This page used to explain what a backup contains and how much smaller it is
+ * than the database, above a button that exported only the O.S. cases as CSV.
+ * An officer who wants a backup wants the file, not the explanation, and the
+ * button they were given was not the backup.
+ *
+ * So: the whole archive — every register, every setting, every user — in one
+ * encrypted file, saved wherever they choose. Nothing else on the page.
+ */
 export default function ExportData() {
-  const [csvLoading, setCsvLoading] = useState(false);
-  const [csvMsg, setCsvMsg] = useState('');
-  const [csvError, setCsvError] = useState('');
-  const [csvProgress, setCsvProgress] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [percent, setPercent] = useState<number | null>(null);
+  const [downloaded, setDownloaded] = useState('');
+  const [done, setDone] = useState('');
+  const [error, setError] = useState('');
+  const abort = useRef<AbortController | null>(null);
 
-  // Abort controllers for cancellation
-  const csvAbort = useRef<AbortController | null>(null);
-
-  const handleDownloadCsv = async () => {
-    setCsvMsg(''); setCsvError(''); setCsvProgress('Preparing…');
-    setCsvLoading(true);
-    csvAbort.current = new AbortController();
+  const download = async () => {
+    setDone(''); setError(''); setPercent(null); setDownloaded('');
+    setBusy(true);
+    abort.current = new AbortController();
     try {
-      const res = await api.get('/backup/export/csv', { 
+      const res = await api.get('/backup/archive/download', {
         responseType: 'blob',
-        timeout: 0,
-        signal: csvAbort.current.signal,
+        timeout: 0,                       // a large register takes as long as it takes
+        signal: abort.current.signal,
         onDownloadProgress: (evt) => {
-          setCsvProgress(formatProgress(evt.loaded, evt.total));
+          const mb = evt.loaded / (1024 * 1024);
+          setDownloaded(`${mb.toFixed(1)} MB`);
+          // The server cannot always say how large the file will be; without a
+          // total there is still movement to show.
+          setPercent(evt.total ? Math.round((evt.loaded / evt.total) * 100) : null);
         },
       });
-      setCsvProgress('');
-      const today = new Date().toISOString().slice(0, 10);
-      const defaultName = `cops_full_backup_${today}.zip`;
 
-      try {
-        const { save } = await import('@tauri-apps/plugin-dialog');
-        const { writeFile } = await import('@tauri-apps/plugin-fs');
-        const savePath = await save({ 
-          title: 'Save CSV Backup (Includes all modules e.g. BR/DR)', 
-          defaultPath: defaultName, 
-          filters: [{ name: 'ZIP', extensions: ['zip'] }] 
-        });
-        
-        if (savePath) {
-          setCsvProgress('Writing to disk…');
-          const arrayBuf = await (res.data as Blob).arrayBuffer();
-          await writeFile(savePath, new Uint8Array(arrayBuf));
-          setCsvProgress('');
-          setCsvMsg(`Backup saved successfully.`);
-          showDownloadToast(`Backup saved to ${savePath}`);
-        } else {
-          setCsvMsg('Save cancelled.');
-        }
-      } catch (fsErr) {
-        if (String(fsErr).includes('plugin-dialog') || String(fsErr).includes('__TAURI_IPC__')) {
-          // Fallback only if Tauri environment is missing (running in browser)
-          const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/zip' }));
-          const a = document.createElement('a');
-          a.href = url; a.download = defaultName; a.click();
-          window.URL.revokeObjectURL(url);
-          setCsvMsg(`Downloaded successfully.`);
-          showDownloadToast(`Downloaded as ${defaultName}`);
-        } else {
-          throw new Error(`Disk write failed: ${fsErr}`);
-        }
+      const name = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
+      const saved = await saveBlob(res.data as Blob, name, {
+        title: 'Save the backup', extensions: ['cops'],
+      });
+      if (saved.cancelled) { setDone(''); return; }
+
+      setDone(`Saved to ${saved.path}`);
+      showDownloadToast(`Backup saved to ${saved.path}`);
+      // The monthly reminder counts a backup as taken only when a file exists.
+      localStorage.setItem('cops_archive_reminder_done_month',
+        `${new Date().getFullYear()}-${new Date().getMonth() + 1}`);
+      localStorage.removeItem('cops_archive_reminder_snoozed_until');
+    } catch (err: unknown) {
+      const e = err as { name?: string; code?: string; message?: string;
+                         response?: { data?: unknown } };
+      if (e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED') return;
+      let msg = e?.message || 'The backup could not be downloaded.';
+      if (e?.response?.data instanceof Blob) {
+        const text = await (e.response.data as Blob).text();
+        try { msg = JSON.parse(text).detail || text; } catch { msg = text || msg; }
       }
-    } catch (err: any) {
-      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') {
-        setCsvMsg('Download cancelled.');
-        setCsvProgress('');
-        return;
-      }
-      // In blob responseType, error data is wrapped in a blob
-      let errMsg = 'Download failed.';
-      if (err.response?.data instanceof Blob) {
-        const text = await err.response.data.text();
-        try { errMsg = JSON.parse(text).detail || errMsg; } catch { errMsg = text; }
-      } else {
-        errMsg = err.response?.data?.detail || err.message;
-      }
-      setCsvError(errMsg);
-      setCsvProgress('');
+      setError(msg);
     } finally {
-      setCsvLoading(false);
-      csvAbort.current = null;
+      setBusy(false);
+      setPercent(null);
+      abort.current = null;
     }
   };
 
   return (
-    <div className="max-w-lg mx-auto py-6 space-y-6">
-      <h1 className="text-lg font-bold text-slate-800">Download Backup</h1>
-
-      {/* ── Backup ── */}
-      <div className="border border-slate-200 rounded-lg p-4 space-y-2 bg-white">
-        <div className="flex items-center gap-2">
-          <Database size={16} className="text-blue-600 shrink-0" />
-          <span className="text-sm font-semibold text-slate-800">Backup</span>
-        </div>
-        <p className="text-xs text-slate-500">
-          Everything — OS cases, items, the baggage and detention registers, users,
-          duty rates, print templates and every setting — in one compressed,
-          password-protected file. Take it from{' '}
-          <span className="font-medium text-slate-700">Admin &rarr; Backup</span>,
-          which is also where it is restored.
-        </p>
-        <p className="text-xs text-slate-500">
-          About six times smaller than a copy of the database: the indexes are left
-          out, and SQLite rebuilds them as the data goes back in.
-        </p>
-      </div>
-
-      {/* ── CSV ZIP (cases only) ── */}
-      <div className="border border-slate-200 rounded-lg p-4 space-y-2 bg-white">
-        <div className="flex items-center gap-2">
-          <Download size={16} className="text-slate-500 shrink-0" />
-          <span className="text-sm font-semibold text-slate-800">OS Cases Only (CSV ZIP)</span>
-        </div>
-        <p className="text-xs text-slate-500">
-          Exports <strong>cops_master.csv</strong> + <strong>cops_items.csv</strong> — OS cases and
-          items only. Does not include users, settings, or print template headings.
-          Use this for selective migration or sharing data with another system.
-        </p>
-        <div className="flex items-center gap-3">
+    <div className="max-w-lg mx-auto py-10 space-y-4">
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={download}
+          className="flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-lg
+                     bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60"
+        >
+          <Download size={16} />
+          {busy ? 'Preparing…' : 'Download backup'}
+        </button>
+        {busy && (
           <button
             type="button"
-            disabled={csvLoading}
-            onClick={handleDownloadCsv}
-            className="flex items-center gap-2 px-4 py-2 text-sm rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60"
+            onClick={() => abort.current?.abort()}
+            className="px-3 py-2 text-xs rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50"
           >
-            <Download size={14} />
-            {csvLoading ? (csvProgress || 'Preparing…') : 'Download Backup ZIP'}
+            Cancel
           </button>
-          {csvLoading && (
-            <button
-              type="button"
-              onClick={() => csvAbort.current?.abort()}
-              className="px-3 py-2 text-xs rounded-lg border border-red-300 text-red-600 hover:bg-red-50"
-            >
-              Cancel
-            </button>
-          )}
-        </div>
-        {/* Progress bar */}
-        {csvLoading && csvProgress && csvProgress.includes('%') && (
-          <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
-            <div
-              className="bg-emerald-500 h-1.5 rounded-full transition-all duration-300"
-              style={{ width: csvProgress.match(/(\d+)%/)?.[1] + '%' }}
-            />
-          </div>
         )}
-        {csvError && <p className="text-xs text-red-600">{csvError}</p>}
-        {csvMsg   && <p className="text-xs text-emerald-700">{csvMsg}</p>}
       </div>
+
+      {busy && (
+        <div className="space-y-1">
+          <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+            {percent === null ? (
+              // No total to measure against — a moving bar, so the officer can
+              // see it is working rather than wonder whether it has hung.
+              <div className="bg-emerald-500 h-2 w-1/3 rounded-full animate-pulse" />
+            ) : (
+              <div
+                className="bg-emerald-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${percent}%` }}
+              />
+            )}
+          </div>
+          <p className="text-xs text-slate-500">
+            {percent !== null ? `${percent}% · ` : ''}{downloaded}
+          </p>
+        </div>
+      )}
+
+      {done  && <p className="text-xs text-emerald-700">{done}</p>}
+      {error && <p className="text-xs text-red-600">{error}</p>}
     </div>
   );
 }

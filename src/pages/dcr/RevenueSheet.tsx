@@ -6,6 +6,7 @@ import {
   Save, ChevronDown, ChevronRight, AlertTriangle, X,
 } from 'lucide-react';
 import api from '@/lib/api';
+import { listOf } from '@/lib/listOf';
 import ItemCombobox from './ItemCombobox';
 import {
   DrEntry, DrDrEntry, DrOsEntry, DrSession, DrTariff, DrFormulaRule,
@@ -124,7 +125,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
 
   useEffect(() => {
     api.get('/dcr/item-types')
-      .then(r => setItemTypes(r.data))
+      .then(r => setItemTypes(listOf<ItemType>(r.data)))
       .catch(() => {});
   }, []);
 
@@ -526,7 +527,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
     try {
       // Fetch all sessions for the same date to get both shifts
       const listRes = await api.get('/dcr/sessions', { params: { date: session.report_date } });
-      const sessionsForDate: DrSession[] = listRes.data;
+      const sessionsForDate = listOf<DrSession>(listRes.data);
 
       const otherShift = session.shift === 'DAY' ? 'NIGHT' : 'DAY';
       const otherMeta = sessionsForDate.find(s => s.shift === otherShift);

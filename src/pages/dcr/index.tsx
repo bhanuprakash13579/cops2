@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, ClipboardList, Sun, Moon, Calendar, CheckCircle, Download, X } from 'lucide-react';
 import api from '@/lib/api';
+import { listOf } from '@/lib/listOf';
 import SessionSetup from './SessionSetup';
 import RevenueSheet from './RevenueSheet';
 import MessageGenerator from './MessageGenerator';
@@ -33,7 +34,7 @@ export default function DcrModule() {
   const loadSessions = useCallback(() => {
     setLoadingSessions(true);
     api.get('/dcr/sessions')
-      .then(r => setSessions(r.data))
+      .then(r => setSessions(listOf<DrSession>(r.data)))
       .catch(() => {})
       .finally(() => setLoadingSessions(false));
   }, []);
@@ -41,7 +42,7 @@ export default function DcrModule() {
   useEffect(() => {
     loadSessions();
     api.get('/dcr/formula-rules')
-      .then(r => { setRules(r.data.items ?? r.data); setRulesLoaded(true); })
+      .then(r => { setRules(listOf<DrFormulaRule>(r.data)); setRulesLoaded(true); })
       .catch(() => setRulesLoaded(true));
   }, []); // eslint-disable-line
 
@@ -52,7 +53,7 @@ export default function DcrModule() {
     try {
       const r = await api.get('/dcr/formula-rules',
                               reportDate ? { params: { as_of: reportDate } } : undefined);
-      setRules(r.data.items ?? r.data);
+      setRules(listOf<DrFormulaRule>(r.data));
     } catch { /* keep the rules already loaded */ }
   };
 
@@ -98,7 +99,7 @@ export default function DcrModule() {
     try {
       // Fetch all sessions for the date (already have `s` as one of them)
       const listRes = await api.get('/dcr/sessions', { params: { date: s.report_date } });
-      const sessionsForDate: DrSession[] = listRes.data;
+      const sessionsForDate = listOf<DrSession>(listRes.data);
 
       // Fetch full data for both shifts in parallel
       const [dayFull, nightFull] = await Promise.all(

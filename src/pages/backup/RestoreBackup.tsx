@@ -264,7 +264,10 @@ export default function RestoreBackup() {
     api.get('/admin/features', { headers: adminHeaders(adminToken) })
       .then(r => setApisEnabled(r.data.apis_enabled === true || r.data.apis_enabled === 'true')).catch(() => {});
     api.get('/admin/mode', { headers: adminHeaders(adminToken) })
-      .then(r => { setProdMode(r.data.mode !== undefined && r.data.mode !== 'sdo'); })
+      // `mode` is the module this installation runs as; `prod_mode` is whether
+      // this is an installed build. Reading the first as the second labelled
+      // every SDO machine "Development Mode" for good.
+      .then(r => { setProdMode(r.data.prod_mode === true); })
       .catch(() => {});
     loadDevices();
   }, [adminToken]);

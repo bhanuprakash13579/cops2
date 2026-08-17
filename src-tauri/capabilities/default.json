@@ -1,8 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for the main window. Writing files is allowed anywhere because every save in this app goes through the operating system's own Save dialog \u2014 the officer chooses the folder, and a report or a backup is meant to be put on a pen drive or an external disk. Without this, every save failed with \"Command plugin:fs|write_file not allowed by ACL\": exports, reports, printed orders and the backup alike.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "opener:default",
@@ -10,6 +12,16 @@
     "fs:default",
     "shell:allow-open",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "fs:allow-write-file",
+    "fs:allow-write-text-file",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        {
+          "path": "**"
+        }
+      ]
+    }
   ]
 }

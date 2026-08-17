@@ -504,9 +504,12 @@ async fn a_case_can_be_booked_opened_edited_and_adjudicated() {
             "os_no": "9001", "os_date": "2026-08-09", "os_year": 2026,
             "pax_name": "TEST PASSENGER", "passport_no": "Z9999999",
             "flight_no": "AI-101", "booked_by": "Test Officer",
-            // A real case carries seized items. A case with none never reaches
-            // the pending list at all — that list requires an item still Under
-            // OS or Under Duty, which is the whole definition of pending.
+            // A real case carries seized items; one with none never reaches the
+            // pending list, which asks for a case that still has goods on it.
+            // Note this posts "Under OS", which is NOT what the item form sends
+            // — it writes the disposal there. The pipeline is covered with the
+            // form's own payload in
+            // the_whole_pipeline_works_with_what_the_form_actually_sends.
             "items": [{
                 "items_sno": 1, "items_desc": "GOLD CHAIN 24K",
                 "items_qty": 1.0, "items_uqc": "PCS",
@@ -4302,4 +4305,169 @@ async fn the_formula_in_force_is_the_one_that_was_in_force_that_day() {
     let once = expr("2026-08-20".into(), "baggage_duty").await;
     let twice = expr("2026-08-20".into(), "baggage_duty").await;
     assert_eq!(once, twice, "the resolution is stable");
+}
+
+#[tokio::test]
+async fn a_case_booked_with_a_disposal_still_reaches_the_adjudication_list() {
+    // What the officer does on the form: pick "Under OS", then pick what is to
+    // happen to the goods — redemption, re-export, absolute confiscation. Both
+    // choices were written into the same field, so the second overwrote the
+    // first and the case was stored as "CONFS" rather than "Under OS".
+    //
+    // The pending list asks for an item that is Under OS or Under Duty. A case
+    // stored that way answers neither, so it never appeared in the adjudication
+    // module at all — the officer books it and it is simply gone.
+    let (base, _d, _pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    // Both spellings: the disposal in the category field, as the form writes it,
+    // and the two kept apart, as they ought to be.
+    for (os_no, disposal) in [("9101", "CONFS"), ("9102", "RF"), ("9103", "REF"),
+                              ("9104", "Under OS"), ("9105", "Under Duty")] {
+        let created = c.post(format!("{base}/os")).bearer_auth(&t)
+            .json(&serde_json::json!({
+                "os_no": os_no, "os_date": "2026-08-09", "os_year": 2026,
+                "pax_name": "TEST PAX", "passport_no": "Z1234567",
+                "is_draft": "N",
+                "items": [{
+                    "items_sno": 1, "items_desc": "GOLD CHAIN 24K",
+                    "items_qty": 1.0, "items_uqc": "PCS", "items_value": 250000.0,
+                    // Exactly what the form sends: the disposal choice landed in
+                    // the category field, overwriting "Under OS".
+                    "items_release_category": disposal,
+                }]
+            }))
+            .send().await.unwrap();
+        assert!(created.status().is_success(),
+                "booking {os_no} failed: HTTP {}", created.status());
+    }
+
+    // And the count beside the menu must agree with the list itself.
+    // The badge belongs to the adjudicating officer's side of the app.
+    let counts: serde_json::Value = c.get(format!("{base}/os/sidebar-counts"))
+        .bearer_auth(dc_token()).send().await.unwrap().json().await.unwrap();
+
+    let v: serde_json::Value = c.get(format!("{base}/os?status=pending&per_page=100"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let found: Vec<String> = v["items"].as_array().cloned().unwrap_or_default().iter()
+        .map(|r| r["os_no"].as_str().unwrap_or("").to_string()).collect();
+
+    for os_no in ["9101", "9102", "9103", "9104", "9105"] {
+        assert!(found.contains(&os_no.to_string()),
+                "a case awaiting adjudication must be in the list: {found:?}");
+    }
+    assert_eq!(counts["pending"].as_i64().unwrap_or(0), found.len() as i64,
+               "the badge must count what the list shows: {counts:?} vs {found:?}");
+}
+
+#[tokio::test]
+async fn view_all_os_cases_shows_all_of_them() {
+    // The page is called "View All O/S Cases" and its filter reads "All", so it
+    // sends no status at all. The list then defaulted to the adjudication queue,
+    // so the page showed only cases awaiting adjudication — and nothing whenever
+    // there were none.
+    let (base, _d, _pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    for (os_no, draft) in [("9201", "N"), ("9202", "Y")] {
+        c.post(format!("{base}/os")).bearer_auth(&t)
+            .json(&serde_json::json!({
+                "os_no": os_no, "os_date": "2026-08-09", "os_year": 2026,
+                "pax_name": "TEST PAX", "is_draft": draft,
+                "items": [{ "items_sno": 1, "items_desc": "TV", "items_qty": 1.0,
+                            "items_value": 25000.0, "items_release_category": "CONFS" }]
+            }))
+            .send().await.unwrap();
+    }
+    // One of them settled, so it is out of the pending queue.
+    c.put(format!("{base}/os/9201/2026/adjudicate")).bearer_auth(dc_token())
+        .json(&serde_json::json!({
+            "adjudication_date": "2026-08-10", "adj_offr_name": "TEST DC",
+            "adjn_offr_remarks": "Order passed."
+        }))
+        .send().await.unwrap();
+
+    let all: serde_json::Value = c.get(format!("{base}/os?per_page=100"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let found: Vec<String> = all["items"].as_array().cloned().unwrap_or_default().iter()
+        .map(|r| r["os_no"].as_str().unwrap_or("").to_string()).collect();
+
+    assert!(found.contains(&"9201".to_string()),
+            "an adjudicated case is still one of the office's cases: {found:?}");
+    assert!(found.contains(&"9202".to_string()),
+            "and so is a draft: {found:?}");
+}
+
+#[tokio::test]
+async fn the_whole_pipeline_works_with_what_the_form_actually_sends() {
+    // Every payload here is what the screens really post — in particular the
+    // release category, which the item form fills with the disposal the officer
+    // chose (CONFS, RF, REF) rather than with "Under OS". Tests that posted
+    // "Under OS" stayed green while the office could not see a single case.
+    //
+    // Book it, find it where the SDO looks, find it where the adjudicating
+    // officer looks, settle it, and find it among the settled.
+    let (base, _d, _pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let sdo = officer_token();
+    let dc  = dc_token();
+
+    let created = c.post(format!("{base}/os")).bearer_auth(&sdo)
+        .json(&serde_json::json!({
+            "os_no": "9301", "os_date": "2026-08-09", "os_year": 2026,
+            "pax_name": "PIPELINE PAX", "passport_no": "Z1112223",
+            "flight_no": "AI-101", "booked_by": "Test Officer", "is_draft": "N",
+            "items": [{
+                "items_sno": 1, "items_desc": "GOLD CHAIN 24K",
+                "items_qty": 1.0, "items_uqc": "PCS", "items_value": 250000.0,
+                "items_duty": 96250.0,
+                "items_release_category": "CONFS",     // as the form writes it
+            }]
+        }))
+        .send().await.unwrap();
+    assert!(created.status().is_success(), "booking: HTTP {}", created.status());
+
+    let has = |v: &serde_json::Value, no: &str| -> bool {
+        v["items"].as_array().map(|a| a.iter()
+            .any(|r| r["os_no"].as_str() == Some(no))).unwrap_or(false)
+    };
+
+    // 1. The SDO's "View All O/S Cases".
+    let all: serde_json::Value = c.get(format!("{base}/os?per_page=100"))
+        .bearer_auth(&sdo).send().await.unwrap().json().await.unwrap();
+    assert!(has(&all, "9301"), "the case must appear in View All O/S Cases");
+
+    // 2. The adjudication module's queue, and the badge beside it.
+    let pending: serde_json::Value = c.get(format!("{base}/os?status=pending&per_page=100"))
+        .bearer_auth(&dc).send().await.unwrap().json().await.unwrap();
+    assert!(has(&pending, "9301"), "and in the adjudication queue");
+    let counts: serde_json::Value = c.get(format!("{base}/os/sidebar-counts"))
+        .bearer_auth(&dc).send().await.unwrap().json().await.unwrap();
+    assert!(counts["pending"].as_i64().unwrap_or(0) >= 1, "and be counted there: {counts:?}");
+
+    // 3. Settled.
+    let adj = c.post(format!("{base}/os/9301/2026/adjudicate")).bearer_auth(&dc)
+        .json(&serde_json::json!({
+            "adj_offr_name": "TEST DC", "adj_offr_designation": "Deputy Commissioner",
+            "adjudication_date": "2026-08-10",
+            "adjn_offr_remarks": "Goods confiscated absolutely."
+        }))
+        .send().await.unwrap();
+    assert!(adj.status().is_success(), "adjudicating: HTTP {}", adj.status());
+
+    // 4. Out of the queue, into the settled list.
+    let pending2: serde_json::Value = c.get(format!("{base}/os?status=pending&per_page=100"))
+        .bearer_auth(&dc).send().await.unwrap().json().await.unwrap();
+    assert!(!has(&pending2, "9301"), "a settled case leaves the queue");
+    let done: serde_json::Value = c.get(format!("{base}/os?status=adjudicated&per_page=100"))
+        .bearer_auth(&dc).send().await.unwrap().json().await.unwrap();
+    assert!(has(&done, "9301"), "and appears among the adjudicated");
+
+    // 5. And it still prints.
+    let pdf = c.get(format!("{base}/os/9301/2026/print-pdf")).bearer_auth(&sdo)
+        .send().await.unwrap();
+    assert!(pdf.status().is_success(), "printing the order: HTTP {}", pdf.status());
+    assert!(pdf.bytes().await.unwrap().len() > 1000, "the printed order is not empty");
 }

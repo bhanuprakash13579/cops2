@@ -126,6 +126,20 @@ fn within_edit_window(adjudication_time: &Option<String>) -> bool {
 pub async fn sidebar_counts(State(pool): Db, _auth: AdjnUser) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
 
+    // The case must still have goods on it — nothing more.
+    //
+    // This used to require an item marked 'Under OS' or 'Under Duty'. The form
+    // writes the officer's first choice ("Under OS") into that field and then
+    // overwrites it with what is to happen to the goods — RF, REF or CONFS —
+    // because both selects bind to the same column. So a properly filled case
+    // answered neither name and never appeared in the adjudication module: the
+    // officer booked it and it was simply gone.
+    //
+    // A disposal IS a case under O.S.; the field cannot be used to tell pending
+    // from settled. Whether a case is awaiting adjudication is decided by the
+    // columns above — no order date, no adjudicating officer, not quashed, not
+    // rejected — and this only asks that the case has something on it.
+
     // Mirrors cops1 _pending_filters() exactly:
     //   is_draft='N', adjudication_date IS NULL, adj_offr_name IS NULL,
     //   adjn_offr_remarks IS NULL or '', quashed!='Y', rejected!='Y',
@@ -144,7 +158,6 @@ pub async fn sidebar_counts(State(pool): Db, _auth: AdjnUser) -> Result<Json<Val
                SELECT 1 FROM cops_items ci
                WHERE ci.os_no = cops_master.os_no
                  AND ci.os_year = cops_master.os_year
-                 AND ci.items_release_category IN ('Under OS', 'Under Duty')
                  AND (ci.entry_deleted IS NULL OR ci.entry_deleted != 'Y')
            )",
         [], |r| r.get(0)
@@ -208,7 +221,10 @@ pub async fn list_os(State(pool): Db, auth: AuthUser, Query(params): Query<OsLis
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
-    let status = params.status.as_deref().unwrap_or("pending");
+    // No status asked for means no status filter — "View All O/S Cases" shows
+    // every case, as it says. This defaulted to "pending", so that page showed
+    // only what was awaiting adjudication and looked empty whenever nothing was.
+    let status = params.status.as_deref().unwrap_or("").trim();
 
     let search_filter = params.search.as_deref().unwrap_or("").trim().to_string();
     let year_filter = params.year;
@@ -261,14 +277,20 @@ fn build_list_query(status: &str, search: &str, year: Option<i64>, br_dr_pending
     // year is an i64 — safe to format directly as a numeric literal
     let year_sql = year.map_or("1=1".to_string(), |y| format!("os_year = {y}"));
 
+    // See the note on the pending count above: the release-category column also
+    // carries the disposal, so it cannot decide what is awaiting adjudication.
     let base = match status {
+        // Everything on the books, drafts included — the caller asked for no
+        // particular state.
+        "" | "all"    => "entry_deleted='N'".to_string(),
         "draft"       => "entry_deleted='N' AND is_draft='Y'".to_string(),
         // Adjudicated = EITHER adjudication_date OR adj_offr_name is set (mirrors cops1 OR logic).
         // Old MDB-imported records may have adj_offr_name without a date — using AND would make them
         // invisible in both pending and adjudicated views.
         "adjudicated" => "entry_deleted='N' AND is_draft='N' AND (adjudication_date IS NOT NULL OR adj_offr_name IS NOT NULL) AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y')".to_string(),
         "offline-pending" => "entry_deleted='N' AND is_draft='N' AND is_offline_adjudication='Y' AND adj_offr_name IS NULL".to_string(),
-        _             => "entry_deleted='N' AND is_draft='N' AND adjudication_date IS NULL AND adj_offr_name IS NULL AND (adjn_offr_remarks IS NULL OR adjn_offr_remarks='') AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y') AND (is_offline_adjudication IS NULL OR is_offline_adjudication!='Y') AND (is_legacy IS NULL OR is_legacy!='Y') AND EXISTS (SELECT 1 FROM cops_items ci WHERE ci.os_no=cops_master.os_no AND ci.os_year=cops_master.os_year AND ci.items_release_category IN ('Under OS','Under Duty') AND (ci.entry_deleted IS NULL OR ci.entry_deleted!='Y'))".to_string(),
+        // Anything else — including "pending" — is the adjudication queue.
+        _             => "entry_deleted='N' AND is_draft='N' AND adjudication_date IS NULL AND adj_offr_name IS NULL AND (adjn_offr_remarks IS NULL OR adjn_offr_remarks='') AND (quashed IS NULL OR quashed!='Y') AND (rejected IS NULL OR rejected!='Y') AND (is_offline_adjudication IS NULL OR is_offline_adjudication!='Y') AND (is_legacy IS NULL OR is_legacy!='Y') AND EXISTS (SELECT 1 FROM cops_items ci WHERE ci.os_no=cops_master.os_no AND ci.os_year=cops_master.os_year AND (ci.entry_deleted IS NULL OR ci.entry_deleted!='Y'))".to_string(),
     };
 
     // br_dr_pending: adjudicated cases where SDO has not yet recorded BR/DR receipt data

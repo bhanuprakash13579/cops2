@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { AlertTriangle, Download, X } from 'lucide-react';
 import api from '@/lib/api';
+import { saveBlob } from '@/lib/saveFile';
 
 /**
  * A once-a-month reminder to take a backup off this network.
@@ -39,8 +40,17 @@ export default function ArchiveReminder() {
   const location = useLocation();
 
   useEffect(() => {
-    // Not on the print view — it would land in the printed page.
-    if (location.pathname.includes('/print')) return;
+    // Not while the officer is in the middle of something.
+    //
+    // This is a dialog across the whole window, so it takes the clicks meant for
+    // whatever is underneath. Appearing over a half-typed case — or over the
+    // adjudication order — it stops the work it interrupted until it is answered,
+    // and a case is not a thing to be interrupted in the middle of.
+    //
+    // It waits for a list or a dashboard, where there is nothing to lose. The
+    // print view is excluded too: it would land in the printed page.
+    const busy = ['/print', '/new', '/edit', '/view', '/case/', '/adjudicat', '/offline-adjudication', '/dcr'];
+    if (busy.some(part => location.pathname.includes(part))) return;
     let cancelled = false;
 
     const check = async () => {
@@ -88,14 +98,13 @@ export default function ArchiveReminder() {
       });
       if (!res.ok) throw new Error(String(res.status));
       const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+
+      // Through the operating system's Save dialog. Pointing a hidden link at a
+      // blob does nothing in the desktop window — no file, no error — so this
+      // button appeared to do nothing at all when it was pressed.
+      const name = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
+      const out = await saveBlob(blob, name, { title: 'Save the backup', extensions: ['cops'] });
+      if (out.cancelled) { setSaving(false); return; }
       setSaved(true);
       // Only this settles the month — the file actually exists now.
       localStorage.setItem(DONE_KEY, monthKey());

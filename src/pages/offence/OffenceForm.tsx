@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react';
 import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { Save, ArrowLeft, Plus, Trash2, FileText, User, Plane, AlertCircle, FileDigit, CheckCircle, Wand2 } from 'lucide-react';
 import DatePicker from '@/components/DatePicker';
 import PassportScanner from '@/components/PassportScanner';
@@ -452,6 +453,7 @@ let _descSuggestionsCache: string[] | null = null;
 export default function OffenceForm() {
   const { osNo, osYear } = useParams();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const location = useLocation();
   const { generateRemark, loading: remarksLoading } = useRemarksGenerator();
 
@@ -1162,6 +1164,11 @@ export default function OffenceForm() {
             : api.post('/os', finalPayload));
 
         clearDraft();
+        // The register is cached, so returning to it showed the case exactly as
+        // it was before saving — a case just submitted still read DRAFT, and the
+        // officer had no way to tell whether the submit had worked. Drop what is
+        // held about the case list so the page they land on is the truth.
+        await queryClient.invalidateQueries({ queryKey: ['os'] });
         navigate(goBackPath);
 
     } catch(err: any) {

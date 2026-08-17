@@ -18,7 +18,21 @@ pub async fn get_mode(State(pool): Db) -> Result<Json<Value>, Err> {
         "SELECT config_value FROM feature_flags WHERE config_key='APP_MODE'",
         [], |r| r.get(0)
     ).unwrap_or_else(|_| "sdo".to_string());
-    Ok(Json(json!({ "mode": mode })))
+
+    // Two different things, told apart at last.
+    //
+    // `mode` is which module this installation runs as — sdo, adjudication,
+    // query, apis. `prod_mode` is whether this is a built-and-installed copy or
+    // one running from a developer's machine.
+    //
+    // The screens read the second and were given the first: anything set to the
+    // SDO module was labelled "DEVELOPMENT MODE — security restrictions are
+    // relaxed", on every office machine, permanently, with nothing an officer
+    // could do about it. Registering a device did not help because the label
+    // never had anything to do with devices.
+    //
+    // A release build is the office's copy; a debug build is a developer's.
+    Ok(Json(json!({ "mode": mode, "prod_mode": !cfg!(debug_assertions) })))
 }
 
 pub async fn set_mode(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, Err> {
