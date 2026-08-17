@@ -1296,6 +1296,10 @@ pub struct CustomReportRequest {
     // Excel-upload batch: if provided, only these (os_no, os_year) pairs are returned
     #[serde(default)]
     os_list: Vec<OsListItem>,
+    // Read in pages, so a report of any size can be had in full without one
+    // request holding the whole register in memory.
+    #[serde(default)] limit:  Option<i64>,
+    #[serde(default)] offset: Option<i64>,
 }
 
 pub async fn custom_report(
@@ -1442,8 +1446,24 @@ pub async fn custom_report(
         if c != "os_no" && c != "os_year" { query_master_cols.push(c.clone()); }
     }
     let master_sel = query_master_cols.iter().map(|c| format!("cm.{c}")).collect::<Vec<_>>().join(", ");
+    // How many the filters actually match, counted before any of them are read.
+    //
+    // The rows below are capped so one request cannot pull the whole register
+    // into memory. The count is what makes that honest: the caller knows whether
+    // it has everything, and asks for the rest if it has not. A report that is
+    // silently the first ten thousand of thirty thousand is worse than no report,
+    // because nothing about the file says which it is.
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM cops_master cm WHERE {where_clause}"),
+        rusqlite::params_from_iter(params.iter()),
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    let page_size = body.limit.unwrap_or(10_000).clamp(1, 50_000);
+    let offset = body.offset.unwrap_or(0).max(0);
     let master_sql = format!(
-        "SELECT {master_sel} FROM cops_master cm WHERE {where_clause} ORDER BY cm.os_year, CAST(cm.os_no AS INTEGER) LIMIT 10000"
+        "SELECT {master_sel} FROM cops_master cm WHERE {where_clause} \
+          ORDER BY cm.os_year, CAST(cm.os_no AS INTEGER) LIMIT {page_size} OFFSET {offset}"
     );
 
     let qmc_len = query_master_cols.len();
@@ -1532,7 +1552,12 @@ pub async fn custom_report(
     };
 
     Ok(Json(json!({
-        "columns": all_cols, "rows": json_rows, "total": json_rows.len(),
+        "columns": all_cols,
+        "rows": json_rows,
+        // What the filters matched, which is not always what this page holds —
+        // the caller reads on until it has them all.
+        "total": total,
+        "returned": json_rows.len(),
         "not_found": not_found, "resolved_by_name": resolved_by_name_list
     })))
 }

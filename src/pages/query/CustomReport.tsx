@@ -323,6 +323,52 @@ function ItemCell({ value }: { value: string }) {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
+/** A report, and the notes it carries beside its rows. */
+interface ReportResult {
+  columns: string[];
+  rows: Record<string, string>[];
+  total: number;
+  not_found?: { os_no: string; os_year: number | null; reason?: string }[];
+  resolved_by_name?: { os_no: string; resolved_year: number; matched_name: string;
+                       method: string; score?: number }[];
+}
+
+/**
+ * The whole report, however many pages it takes.
+ *
+ * The server caps a single response so one request cannot pull the register into
+ * memory, and tells the caller how many rows the filters matched. Asking once
+ * and writing whatever came back produced a file that looked complete and was
+ * not — the worst kind of report, because nothing about it says so.
+ */
+async function fetchWholeReport(
+  body: Record<string, unknown>,
+  // The shape the page already holds — the notes travel with the rows.
+): Promise<ReportResult> {
+  const PAGE = 10_000;
+  const rows: Record<string, string>[] = [];
+  let extras: Record<string, unknown> = {};
+  let columns: string[] = [];
+  let total = Number.POSITIVE_INFINITY;
+  for (let offset = 0; rows.length < total; offset += PAGE) {
+    const res = await api.post('/backup/custom-report', { ...body, limit: PAGE, offset });
+    const batch: Record<string, string>[] = res.data.rows || [];
+    columns = res.data.columns || columns;
+    // Notes the report carries beside its rows — which cases were not found,
+    // which were matched by name — belong to the report, not to one page.
+    const { rows: _r, columns: _c, total: _t, returned: _n, ...rest } = res.data;
+    extras = { ...extras, ...rest };
+    total = typeof res.data.total === 'number' ? res.data.total : batch.length;
+    rows.push(...batch);
+    if (batch.length < PAGE) break;      // the register had no more to give
+  }
+  if (rows.length < total) {
+    throw new Error(`Only ${rows.length} of ${total} rows could be read — the report `
+                  + 'has not been written, so it cannot be mistaken for the whole.');
+  }
+  return { columns, rows, total, ...extras };
+}
+
 export default function CustomReport() {
   const [selectedMaster, setSelectedMaster] = useState<Set<string>>(new Set(['os_no', 'os_year', 'pax_name']));
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
@@ -342,11 +388,7 @@ export default function CustomReport() {
   const [filterItemDesc,   setFilterItemDesc]   = useState('');
 
   const [loading, setLoading]   = useState(false);
-  const [result, setResult]     = useState<{
-    columns: string[]; rows: Record<string, string>[]; total: number;
-    not_found?: { os_no: string; os_year: number | null; reason?: string }[];
-    resolved_by_name?: { os_no: string; resolved_year: number; matched_name: string; method: string; score?: number }[];
-  } | null>(null);
+  const [result, setResult]     = useState<ReportResult | null>(null);
   const [error, setError]       = useState('');
   const [sortCol, setSortCol]   = useState<string | null>(null);
   const [sortDir, setSortDir]   = useState<'asc' | 'desc'>('asc');
@@ -388,12 +430,12 @@ export default function CustomReport() {
     if (selectedMaster.size === 0 && selectedItems.size === 0) { setError('Select at least one column.'); return; }
     setError(''); setLoading(true); setResult(null); setSortCol(null); setSortDir('asc');
     try {
-      const res = await api.post('/backup/custom-report', {
+      const whole = await fetchWholeReport({
         master_cols: [...selectedMaster],
         item_cols:   effectiveItemCols,
         os_list:     xlsxRows.map(r => ({ os_no: r.os_no, os_year: r.os_year ?? null, pax_name: r.pax_name ?? null })),
       });
-      setResult(res.data);
+      setResult(whole);
       setXlsxHasResult(true);
     } catch (err: any) {
       let detail = err.response?.data?.detail || 'Failed to generate report.';
@@ -464,7 +506,7 @@ export default function CustomReport() {
     setError(''); setLoading(true); setResult(null); setSortCol(null); setSortDir('asc');
     setXlsxHasResult(false);
     try {
-      const res = await api.post('/backup/custom-report', {
+      const whole = await fetchWholeReport({
         master_cols: [...selectedMaster],
         item_cols:   effectiveItemCols,
         from_date:   fromDate || null,
@@ -478,7 +520,7 @@ export default function CustomReport() {
         passport_no:   filterPassportNo.trim() || null,
         item_desc:     filterItemDesc.trim()   || null,
       });
-      setResult(res.data);
+      setResult(whole);
     } catch (err: any) {
       let detail = err.response?.data?.detail || 'Failed to generate report.';
       if (Array.isArray(detail)) detail = detail.map((e: any) => `${e.loc?.join('.')} - ${e.msg}`).join(', ');

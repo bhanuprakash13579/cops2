@@ -798,6 +798,13 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                     const isBrNoCell = col.key === 'br_no';
                     const isOffline = entry.is_offline_br;
                     const isSplit = isBrNoCell && splitReceipts.has((entry.br_no || '').trim());
+                    // A case reference is finished when it reads 111/2026. Half
+                    // written, the cell is marked and says what is missing —
+                    // rather than a greyed-out example sitting in every empty
+                    // cell, which reads like something already typed.
+                    const osRefIncomplete = fieldKey === 'os_ref'
+                      && !!((val as string) || '').trim()
+                      && !/^\d{1,5}\/\d{4}$/.test(((val as string) || '').trim());
                     return (
                       <td key={col.key} data-col-idx={colIdx} style={{ width: col.width }}
                         title={isSplit
@@ -809,9 +816,8 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                         <input
                           type="text"
                           value={(val as string) || ''}
-                          placeholder={fieldKey === 'os_ref' ? '111/2026' : undefined}
-                          title={fieldKey === 'os_ref'
-                            ? 'The case number and its year, written as 111/2026.'
+                          title={osRefIncomplete
+                            ? 'Write the case number and its year: 111/2026'
                             : undefined}
                           onChange={e => {
                             // One way of writing it, and the column says which.
@@ -833,6 +839,7 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
                           onBlur={fieldKey === 'os_ref' ? () => handleOsRefBlur(rowIdx) : undefined}
                           className={`w-full px-1 py-1 text-xs bg-transparent focus:outline-none focus:bg-blue-100 rounded
                             ${isBrNoCell && isOffline ? 'text-red-600 font-bold' : ''}
+                            ${osRefIncomplete ? 'text-amber-700 bg-amber-50' : ''}
                           `}
                           ref={el => { if (el) cellRefs.current.set(`${rowIdx}-${colIdx}`, el); }}
                         />

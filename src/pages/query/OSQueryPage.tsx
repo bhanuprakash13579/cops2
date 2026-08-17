@@ -84,6 +84,7 @@ export default function OSQueryPage() {
     case_type: ''
   });
   const [downloadLoading, setDownloadLoading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState('');
   const [activeSearch, setActiveSearch] = useState<typeof formData>({ ...formData });
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -158,7 +159,8 @@ export default function OSQueryPage() {
 
   // Build the search payload from the last executed search (activeSearch).
   const buildExportPayload = () => {
-    const payload: Record<string, any> = { export: true, page: 1, limit: 5000 };
+    // page and limit are set by the caller, which reads every page in turn.
+    const payload: Record<string, any> = { export: true };
     Object.entries(activeSearch).forEach(([key, value]) => {
       if (value.trim() !== '') {
         if (key === 'os_year') payload[key] = parseInt(value, 10);
@@ -173,9 +175,32 @@ export default function OSQueryPage() {
 
   const downloadCSV = async () => {
     setDownloadLoading(true);
+    setDownloadProgress('');
     try {
-      const response = await api.post('/os-query/search', buildExportPayload());
-      const allRows: OSResult[] = response.data.items || [];
+      // Everything the filters matched, not the first page of it.
+      //
+      // This asked for one page of five thousand and wrote whatever came back.
+      // A search matching more than that produced a file that looked complete
+      // and was not — the worst kind of report, because nothing about it says so.
+      // It now keeps asking until the register has given up every row it counted.
+      const PAGE = 5000;
+      const allRows: OSResult[] = [];
+      let total = Number.POSITIVE_INFINITY;
+      for (let page = 1; allRows.length < total; page++) {
+        const res = await api.post('/os-query/search',
+                                   { ...buildExportPayload(), page, limit: PAGE });
+        const batch: OSResult[] = res.data.items || [];
+        total = typeof res.data.total === 'number' ? res.data.total : batch.length;
+        allRows.push(...batch);
+        setDownloadProgress(total > PAGE ? `${allRows.length.toLocaleString('en-IN')} of ${total.toLocaleString('en-IN')}…` : '');
+        // The register had no more to give, whatever it counted.
+        if (batch.length < PAGE) break;
+      }
+      setDownloadProgress('');
+      if (allRows.length < total) {
+        throw new Error(`Only ${allRows.length} of ${total} records could be read. `
+                      + 'The file has not been written, so it cannot be mistaken for the whole.');
+      }
 
       const showCountry  = !!activeSearch.country_of_departure.trim();
       const showItemDesc = !!activeSearch.item_desc.trim();
@@ -376,7 +401,9 @@ export default function OSQueryPage() {
                   className="flex items-center gap-1.5 text-xs font-medium text-white bg-emerald-600 border border-emerald-600 px-3 py-1.5 rounded hover:bg-emerald-700 transition-colors shadow-sm disabled:opacity-50"
                 >
                   {downloadLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileDown className="w-3.5 h-3.5" />}
-                  Download CSV ({pagination.total_count})
+                  {downloadLoading && downloadProgress
+                    ? `Reading ${downloadProgress}`
+                    : `Download CSV (${pagination.total_count})`}
                 </button>
               </div>
             )}
