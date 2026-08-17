@@ -1460,14 +1460,15 @@ fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>, report_year: O
             .or_else(|| by_receipt.get(&text(e, "br_no")).cloned())
     };
 
-    let mut totals: HashMap<(String, i64), (f64, f64, f64)> = HashMap::new();
+    let mut totals: HashMap<(String, i64), (f64, f64, f64, f64)> = HashMap::new();
     for e in &entries {
         let Some(case) = case_of(e) else { continue };
         let g = |k: &str| e.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let t = totals.entry(case).or_insert((0.0, 0.0, 0.0));
+        let t = totals.entry(case).or_insert((0.0, 0.0, 0.0, 0.0));
         t.0 += g("personal_penalty");
         t.1 += g("redemption_fine");
-        t.2 += duty_of(e);
+        t.2 += g("reexport_fine");
+        t.3 += duty_of(e);
     }
 
     // Cases from before the office began keeping them the new way. Whether those
@@ -1510,7 +1511,7 @@ fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>, report_year: O
     entries.into_iter().map(|mut e| {
         let verdict = case_of(&e).and_then(|c| {
             if legacy.contains(&c) { return Some("LEGACY"); }
-            totals.get(&c).map(|&(pp, rf, duty)| entry_status(pp, rf, duty))
+            totals.get(&c).map(|&(pp, rf, refn, duty)| entry_status(pp, rf, refn, duty))
         });
         if let Some(obj) = e.as_object_mut() {
             obj.insert("status".into(), match verdict {
@@ -1540,13 +1541,31 @@ fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>, report_year: O
 ///
 /// Derived on read rather than stored, so it cannot drift away from the figures
 /// it describes: correct a penalty and the status corrects itself.
-pub fn entry_status(personal_penalty: f64, redemption_fine: f64, duty: f64) -> &'static str {
-    if personal_penalty <= 0.0 { return "OPEN"; }
+pub fn entry_status(
+    personal_penalty: f64,
+    redemption_fine: f64,
+    reexport_fine: f64,
+    duty: f64,
+) -> &'static str {
+    if personal_penalty <= 0.0 {
+        // No personal penalty collected. A case with none is still settled if it
+        // was a *pure* re-export: the goods leave the country on the re-export
+        // fine alone, and no penalty is required for that (unlike an absolute
+        // confiscation, where the penalty is the whole of it).
+        //
+        // But only a pure re-export. A line that also carries a redemption fine
+        // is a redemption or a mixed disposition, where the personal penalty is
+        // still due — the re-export fine on it does not close it. With neither a
+        // penalty nor a lone re-export fine, nothing has been collected to close
+        // the case.
+        return if reexport_fine > 0.0 && redemption_fine <= 0.0 { "CLOSED" } else { "OPEN" };
+    }
     if redemption_fine > 0.0 {
         // Redemption was offered: the duty on the goods being taken back is due.
         if duty > 0.0 { "CLOSED" } else { "OPEN" }
     } else {
-        // Absolute confiscation: the penalty is the whole of it.
+        // Absolute confiscation, or a re-export where a penalty was also imposed:
+        // the penalty is paid.
         "CLOSED"
     }
 }

@@ -4112,6 +4112,9 @@ async fn a_case_is_settled_across_all_the_receipts_that_paid_it() {
             (6, "OS 527/2025 DATED 22.07.2025",
                              30000.0, 600000.0, 0.0, 0.0, 761373.0),  // no penalty
             (7, "",          0.0,      0.0, 0.0,     0.0,   8750.0),  // ordinary duty
+            // A pure re-export: the goods leave on the re-export fine alone, no
+            // penalty, no redemption. This must read CLOSED.
+            (8, "600/2026",  0.0,   12000.0, 0.0,     0.0,  12000.0),
         ] {
             conn.execute(
                 "INSERT INTO dcr_entries (session_id, sort_order, sl_no, br_no, os_ref,
@@ -4140,6 +4143,14 @@ async fn a_case_is_settled_across_all_the_receipts_that_paid_it() {
     assert_eq!(at(6)["status"], "OPEN", "no personal penalty was collected at all");
     assert!(at(7)["status"].is_null(),
             "an ordinary duty receipt names no case and awaits nothing: {}", at(7)["status"]);
+    assert_eq!(at(8)["status"], "CLOSED",
+               "a pure re-export is settled by its re-export fine, with no penalty");
+
+    // And a case that pays a re-export fine but also carries a redemption fine
+    // (527/2025 in the real reports) is NOT closed by the re-export fine — the
+    // penalty is still due. It reads OPEN, unchanged.
+    assert_eq!(at(6)["status"], "OPEN",
+               "a re-export fine alongside a redemption fine does not close it");
 }
 
 
