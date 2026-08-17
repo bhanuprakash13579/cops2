@@ -2478,7 +2478,10 @@ pub async fn cloud_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value
 #[derive(serde::Deserialize)]
 pub struct CloudSettings {
     pub enabled: Option<bool>,
-    pub domain: Option<String>,
+    /// The sign-in host and the API host. The department's WorkDrive is on the
+    /// government cloud, which is a separate deployment from public Zoho.
+    pub accounts_base: Option<String>,
+    pub api_base: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub folder_id: Option<String>,
@@ -2498,14 +2501,20 @@ pub async fn cloud_settings(
     if let Some(v) = s.enabled {
         set_setting(&pool, "cloud_backup_enabled", if v { "true" } else { "false" })?;
     }
-    if let Some(v) = s.domain {
-        // in / com / eu / au — an account is not portable between them.
-        let v = v.trim().trim_start_matches('.').to_lowercase();
-        if !["in", "com", "eu", "au", "jp", "ca", "sa"].contains(&v.as_str()) {
-            return Err(e400("The data centre must be one of: in, com, eu, au, jp, ca, sa."));
+    // Only https, and only a host — a mistyped address that silently becomes
+    // http would put the office's token on the wire in the clear.
+    let mut host = |value: Option<String>, key: &str| -> Result<(), Err> {
+        if let Some(v) = value {
+            let v = v.trim().trim_end_matches('/').to_string();
+            if !v.starts_with("https://") || v.len() < 12 {
+                return Err(e400("The address must begin with https://"));
+            }
+            set_setting(&pool, key, &v)?;
         }
-        set_setting(&pool, "cloud_backup_domain", &v)?;
-    }
+        Ok(())
+    };
+    host(s.accounts_base, "cloud_backup_accounts_base")?;
+    host(s.api_base, "cloud_backup_api_base")?;
     if let Some(v) = s.client_id     { set_setting(&pool, "cloud_backup_client_id", v.trim())?; }
     if let Some(v) = s.client_secret { set_setting(&pool, "cloud_backup_client_secret", v.trim())?; }
     if let Some(v) = s.folder_id     { set_setting(&pool, "cloud_backup_folder_id", v.trim())?; }

@@ -68,13 +68,39 @@ fn put_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Which Zoho data centre the office's account lives in.
+/// Where the office's WorkDrive actually lives.
 ///
-/// Accounts are not portable between them: a token issued for the Indian centre
-/// is refused by the European one, with an error that does not say so plainly.
-/// It is asked for rather than guessed.
-fn domain(pool: &DbPool) -> String {
-    setting(pool, "cloud_backup_domain").unwrap_or_else(|| "in".into())
+/// Not a data-centre letter. The department's account is on the government cloud
+/// — workplace.mgovcloud.in — which is a separate deployment from public Zoho
+/// with its own sign-in and its own API host. A token issued by one is refused
+/// by the other, with an error that does not say so plainly.
+///
+/// Both hosts are therefore settings rather than something worked out from a
+/// suffix, so an office on the government cloud, on zoho.in, or on whatever
+/// replaces either of them is a matter of typing two addresses.
+fn accounts_base(pool: &DbPool) -> String {
+    setting(pool, "cloud_backup_accounts_base")
+        .unwrap_or_else(|| "https://accounts.mgovcloud.in".into())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The API root, up to and including the version — because the two deployments
+/// do not agree on the path either:
+///
+/// ```text
+/// government cloud   https://workdrive.mgovcloud.in/api/v1
+/// public Zoho        https://www.zohoapis.in/workdrive/api/v1
+/// ```
+///
+/// Confirmed against the live host: an unauthenticated call to
+/// `…/api/v1/users/me` on the government cloud answers with WorkDrive's own
+/// INVALID_TICKET, which is the API saying "no token", not a wrong address.
+fn api_base(pool: &DbPool) -> String {
+    setting(pool, "cloud_backup_api_base")
+        .unwrap_or_else(|| "https://workdrive.mgovcloud.in/api/v1".into())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub fn is_enabled(pool: &DbPool) -> bool {
@@ -152,9 +178,9 @@ async fn access_token(pool: &DbPool) -> Result<String> {
             .collect()
     };
     let url = format!(
-        "https://accounts.zoho.{}/oauth/v2/token\
+        "{}/oauth/v2/token\
          ?refresh_token={}&client_id={}&client_secret={}&grant_type=refresh_token",
-        domain(pool), enc(&token), enc(&client_id), enc(&client_secret),
+        accounts_base(pool), enc(&token), enc(&client_id), enc(&client_secret),
     );
     let res = reqwest::Client::new()
         .post(&url)
@@ -196,7 +222,7 @@ async fn upload(pool: &DbPool, path: &Path, filename: &str) -> Result<Uploaded> 
         .text("override-name-exist", "true")
         .part("content", part);
 
-    let url = format!("https://www.zohoapis.{}/workdrive/api/v1/upload", domain(pool));
+    let url = format!("{}/upload", api_base(pool));
     let res = reqwest::Client::new()
         .post(&url)
         .header("Authorization", format!("Zoho-oauthtoken {token}"))
@@ -257,8 +283,7 @@ fn find_resource_id(v: &serde_json::Value) -> Option<String> {
 /// — the opposite order would risk a month with no copy at all.
 async fn remove(pool: &DbPool, file_id: &str) -> Result<()> {
     let token = access_token(pool).await?;
-    let url = format!("https://www.zohoapis.{}/workdrive/api/v1/files/{}",
-                      domain(pool), file_id);
+    let url = format!("{}/files/{}", api_base(pool), file_id);
     let res = reqwest::Client::new()
         .delete(&url)
         .header("Authorization", format!("Zoho-oauthtoken {token}"))

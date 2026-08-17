@@ -1,10 +1,10 @@
-import { useState, useEffect, useRef, Fragment } from 'react';
+import { useState, useEffect, useRef, Fragment, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, ShieldCheck, ShieldAlert, Lock, LogIn,
   UserPlus, Users, Pencil, X, KeyRound, Download,
   Upload, FileUp, Eye, EyeOff, RefreshCw, Database, ToggleLeft, ToggleRight, ScanLine,
-  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle, CalendarDays } from 'lucide-react';
+  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle, CalendarDays, CloudUpload } from 'lucide-react';
 import api from '@/lib/api';
 import { showDownloadToast } from '@/components/DownloadToast';
 import StatutesAdmin from './StatutesAdmin';
@@ -183,6 +183,69 @@ export default function RestoreBackup() {
   const [flagsLoading, setFlagsLoading] = useState(false);
   const [flagsMsg, setFlagsMsg] = useState('');
 
+  // The monthly copy that leaves the building. The token is typed here once and
+  // handed to the operating system; it is never read back, so the field stays
+  // blank afterwards and an empty box means "leave the stored one alone".
+  const [cloud, setCloud] = useState<{
+    enabled: boolean; configured: boolean; credential_store: boolean;
+    every_days: number; last_success: string | null; last_error: string | null;
+    days_since_success: number | null; needs_manual_backup: boolean;
+  } | null>(null);
+  const [cloudForm, setCloudForm] = useState({
+    client_id: '', client_secret: '', folder_id: '', refresh_token: '',
+    accounts_base: 'https://accounts.mgovcloud.in',
+    api_base: 'https://workdrive.mgovcloud.in/api/v1',
+    every_days: '30',
+  });
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudMsg, setCloudMsg] = useState('');
+
+  const loadCloud = useCallback(async () => {
+    try {
+      const r = await api.get('/backup/cloud/status', { headers: adminHeaders(adminToken) });
+      setCloud(r.data);
+    } catch { /* the panel simply shows nothing about it */ }
+  }, [adminToken]);
+
+  const saveCloud = async (enabled: boolean) => {
+    setCloudBusy(true); setCloudMsg('');
+    try {
+      const body: Record<string, unknown> = {
+        enabled,
+        accounts_base: cloudForm.accounts_base,
+        api_base:      cloudForm.api_base,
+        every_days:    Number(cloudForm.every_days) || 30,
+      };
+      // Only what was typed is sent: an untouched box must not blank a setting
+      // that is already there.
+      for (const k of ['client_id', 'client_secret', 'folder_id', 'refresh_token'] as const) {
+        if (cloudForm[k].trim()) body[k] = cloudForm[k].trim();
+      }
+      const r = await api.post('/admin/backup/cloud/settings', body,
+                               { headers: adminHeaders(adminToken) });
+      setCloud(r.data);
+      setCloudForm(f => ({ ...f, client_secret: '', refresh_token: '' }));
+      setCloudMsg(enabled ? 'Saved. Use "Send one now" to prove it works.' : 'Turned off.');
+    } catch (err: unknown) {
+      setCloudMsg((err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                  || 'Could not save.');
+    } finally { setCloudBusy(false); }
+  };
+
+  const runCloudNow = async () => {
+    setCloudBusy(true); setCloudMsg('Sending…');
+    try {
+      const r = await api.post('/admin/backup/cloud/run', {},
+                               { headers: adminHeaders(adminToken) });
+      setCloudMsg(`Sent — ${Number(r.data.bytes || 0).toLocaleString('en-IN')} bytes.`);
+      await loadCloud();
+    } catch (err: unknown) {
+      setCloudMsg((err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                  || 'The copy could not be sent.');
+      await loadCloud();
+    } finally { setCloudBusy(false); }
+  };
+
   // App mode
   const [prodMode, setProdMode] = useState(false);
 
@@ -267,6 +330,7 @@ export default function RestoreBackup() {
     loadUsers();
     api.get('/admin/features', { headers: adminHeaders(adminToken) })
       .then(r => setApisEnabled(r.data.apis_enabled === true || r.data.apis_enabled === 'true')).catch(() => {});
+    loadCloud();
     api.get('/config/legacy-cutoff', { headers: adminHeaders(adminToken) })
       .then(r => setLegacyCutoff(r.data.cutoff || '')).catch(() => {});
     api.get('/admin/mode', { headers: adminHeaders(adminToken) })
@@ -1322,6 +1386,132 @@ export default function RestoreBackup() {
             {compactMsg && (
               <p className={`text-xs ${compactErr ? 'text-red-600' : 'text-emerald-700'}`}>{compactMsg}</p>
             )}
+          </section>
+
+          {/* ── The copy that leaves the building ── */}
+          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <CloudUpload size={18} className="text-blue-600" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-700">Monthly copy to WorkDrive</h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Sent on its own, so nobody has to carry one out on a pen drive.
+                </p>
+              </div>
+              {cloud && (
+                <span className={`ml-auto text-xs font-bold px-2 py-0.5 rounded-full ${
+                  cloud.enabled && cloud.configured && !cloud.needs_manual_backup
+                    ? 'bg-emerald-100 text-emerald-700'
+                    : 'bg-amber-100 text-amber-700'}`}>
+                  {!cloud.configured ? 'NOT SET UP'
+                    : !cloud.enabled ? 'OFF'
+                    : cloud.needs_manual_backup ? 'NOT WORKING' : 'WORKING'}
+                </span>
+              )}
+            </div>
+
+            {cloud && (
+              <div className="text-xs text-slate-600 space-y-1">
+                <p>
+                  {cloud.last_success
+                    ? `Last sent ${new Date(cloud.last_success).toLocaleString()}`
+                    : 'Nothing has been sent yet.'}
+                  {cloud.days_since_success !== null && cloud.days_since_success !== undefined
+                    ? ` — ${cloud.days_since_success} day(s) ago.` : ''}
+                </p>
+                {cloud.last_error && (
+                  <p className="text-red-600 break-words">{cloud.last_error}</p>
+                )}
+                {!cloud.credential_store && (
+                  <p className="text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    This machine has no credential store, so there is nowhere safe to keep the
+                    token. It is not written anywhere else — set this up on a machine that has one.
+                  </p>
+                )}
+                <p className="text-slate-500">
+                  While this is working the monthly reminder stays away. It returns if the copy
+                  stops going out — that is the moment a pen drive is the only copy that would
+                  survive.
+                </p>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {([
+                ['client_id',     'Client ID'],
+                ['client_secret', 'Client secret'],
+                ['folder_id',     'WorkDrive folder ID'],
+                ['refresh_token', 'Refresh token (stored by Windows, not by COPS)'],
+              ] as const).map(([key, label]) => (
+                <label key={key} className="block">
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500">{label}</span>
+                  <input
+                    type={key === 'client_secret' || key === 'refresh_token' ? 'password' : 'text'}
+                    autoComplete="off"
+                    value={cloudForm[key]}
+                    onChange={e => setCloudForm(f => ({ ...f, [key]: e.target.value }))}
+                    className="mt-1 w-full px-2 py-1.5 text-sm border border-slate-300 rounded-lg
+                               focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </label>
+              ))}
+              <label className="block">
+                <span className="text-[11px] uppercase tracking-wide text-slate-500">Sign-in host</span>
+                <input
+                  value={cloudForm.accounts_base}
+                  onChange={e => setCloudForm(f => ({ ...f, accounts_base: e.target.value }))}
+                  className="mt-1 w-full px-2 py-1.5 text-sm border border-slate-300 rounded-lg font-mono"
+                />
+              </label>
+              <label className="block">
+                <span className="text-[11px] uppercase tracking-wide text-slate-500">API host</span>
+                <input
+                  value={cloudForm.api_base}
+                  onChange={e => setCloudForm(f => ({ ...f, api_base: e.target.value }))}
+                  className="mt-1 w-full px-2 py-1.5 text-sm border border-slate-300 rounded-lg font-mono"
+                />
+              </label>
+              <label className="block">
+                <span className="text-[11px] uppercase tracking-wide text-slate-500">Send every (days)</span>
+                <input
+                  type="number" min={1} max={365}
+                  value={cloudForm.every_days}
+                  onChange={e => setCloudForm(f => ({ ...f, every_days: e.target.value }))}
+                  className="mt-1 w-full px-2 py-1.5 text-sm border border-slate-300 rounded-lg"
+                />
+              </label>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={cloudBusy}
+                onClick={() => saveCloud(true)}
+                className="px-4 py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white
+                           hover:bg-blue-700 disabled:opacity-60"
+              >
+                {cloudBusy ? 'Working…' : 'Save and turn on'}
+              </button>
+              <button
+                type="button"
+                disabled={cloudBusy || !cloud?.configured}
+                onClick={runCloudNow}
+                className="px-3 py-2 text-xs rounded-lg border border-slate-300 text-slate-700
+                           hover:bg-slate-50 disabled:opacity-50"
+                title="Send one now, to prove the arrangement works before trusting it"
+              >
+                Send one now
+              </button>
+              <button
+                type="button"
+                disabled={cloudBusy}
+                onClick={() => saveCloud(false)}
+                className="px-3 py-2 text-xs rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50"
+              >
+                Turn off
+              </button>
+              {cloudMsg && <span className="text-xs text-slate-600 break-words">{cloudMsg}</span>}
+            </div>
           </section>
 
           {/* ── Automatic backups ── */}
