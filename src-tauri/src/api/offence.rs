@@ -234,6 +234,10 @@ pub async fn list_os(State(pool): Db, auth: AuthUser, Query(params): Query<OsLis
 
     let total: i64 = conn.query_row(&count_sql, rusqlite::params_from_iter(search_params.iter()), |r| r.get(0)).unwrap_or(0);
 
+    // Worked out once, here, rather than by each screen from a date and a rule:
+    // one place decides which side of the cut-off a case falls on.
+    let cutoff = crate::api::admin::legacy_cutoff(&conn);
+
     let mut stmt = conn.prepare(&list_sql).map_err(|e| e500(&e.to_string()))?;
     let cases: Vec<Value> = stmt.query_map(rusqlite::params_from_iter(search_params.iter()), |r| {
         Ok(json!({
@@ -259,6 +263,11 @@ pub async fn list_os(State(pool): Db, auth: AuthUser, Query(params): Query<OsLis
             "booked_by": r.get::<_, Option<String>>(19)?,
             "location_code": r.get::<_, Option<String>>(20)?,
             "total_items": r.get::<_, Option<i64>>(21)?,
+            // Before the office began keeping cases the new way. Whether such a
+            // case was ever settled is not recorded, so it is shown as legacy
+            // rather than as open or closed.
+            "legacy_period": crate::api::admin::is_legacy_period(
+                cutoff.as_deref(), r.get::<_, Option<String>>(2)?.as_deref()),
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
@@ -337,6 +346,12 @@ pub async fn get_os(State(pool): Db, auth: AuthUser, Path((os_no, os_year)): Pat
 
     let items = load_items(&conn, &os_no, os_year).map_err(|e| e500(&e.to_string()))?;
     case["items"] = json!(items);
+
+    // Which side of the cut-off it falls on — the same answer the list gives.
+    let cutoff = crate::api::admin::legacy_cutoff(&conn);
+    let os_date = case.get("os_date").and_then(|v| v.as_str()).map(str::to_string);
+    case["legacy_period"] = json!(crate::api::admin::is_legacy_period(
+        cutoff.as_deref(), os_date.as_deref()));
 
     Ok(Json(case))
 }
@@ -1737,6 +1752,13 @@ fn get_case_json(conn: &rusqlite::Connection, os_no: &str, os_year: i64) -> rusq
 
     let items = load_items(conn, os_no, os_year)?;
     case["items"] = json!(items);
+    // Which side of the cut-off this case falls on, decided in one place.
+    if let Some(obj) = case.as_object_mut() {
+        let cutoff = crate::api::admin::legacy_cutoff(conn);
+        let os_date = obj.get("os_date").and_then(|v| v.as_str()).map(str::to_string);
+        obj.insert("legacy_period".into(),
+                   json!(crate::api::admin::is_legacy_period(cutoff.as_deref(), os_date.as_deref())));
+    }
     Ok(case)
 }
 

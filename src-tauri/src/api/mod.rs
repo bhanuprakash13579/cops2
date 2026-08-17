@@ -219,6 +219,10 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
 
         // ── Admin — mode, features, config ───────────────────────────────────
         .route("/admin/mode",                       get(admin::get_mode).put(admin::set_mode))
+        // The day the office started keeping cases the new way. Anything before
+        // it is legacy, whenever it happens to be loaded.
+        .route("/admin/config/legacy-cutoff",       put(admin::set_legacy_cutoff))
+        .route("/config/legacy-cutoff",             get(admin::get_legacy_cutoff))
         .route("/admin/features",                   get(admin::get_features).put(admin::set_features))
         .route("/admin/config/print-template",      get(admin::get_print_template).post(admin::upsert_print_template))
         .route("/admin/config/print-template/:id", put(admin::update_print_template_row).delete(admin::delete_print_template_row))

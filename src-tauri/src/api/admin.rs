@@ -52,6 +52,68 @@ pub async fn set_mode(State(pool): Db, _admin: AdminUser, Json(req): Json<serde_
 
 // ── Feature flags ─────────────────────────────────────────────────────────────
 
+/// The day the office started keeping cases the new way.
+///
+/// Everything dated before it belongs to the old regime: whether those cases
+/// were ever settled is not recorded anywhere this program can read, so it does
+/// not guess. They are shown as legacy rather than as open or closed, and the
+/// open/closed rule — the one driven by what the revenue report shows collected
+/// — applies only from this day onwards.
+///
+/// It is a date, not a flag on each case, so an offline sheet for August loaded
+/// in September lands on the right side of the line without anyone marking it.
+pub fn legacy_cutoff(conn: &rusqlite::Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT config_value FROM feature_flags WHERE config_key = 'LEGACY_CUTOFF_DATE'",
+        [], |r| r.get::<_, String>(0),
+    ).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Whether a case falls before the cut-off. A case with no date is not legacy:
+/// guessing "old" would hide a case nobody has finished entering.
+pub fn is_legacy_period(cutoff: Option<&str>, os_date: Option<&str>) -> bool {
+    match (cutoff, os_date) {
+        (Some(c), Some(d)) if !d.trim().is_empty() => d.trim() < c,
+        _ => false,
+    }
+}
+
+/// Read by every screen that shows whether a case is settled.
+pub async fn get_legacy_cutoff(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, Err> {
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    Ok(Json(json!({ "cutoff": legacy_cutoff(&conn) })))
+}
+
+/// Set, or cleared by sending an empty date.
+pub async fn set_legacy_cutoff(
+    State(pool): Db,
+    _admin: AdminUser,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, Err> {
+    let raw = req.get("cutoff").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+
+    // A date, written the way every date is stored here. Anything else would sort
+    // wrongly against os_date and quietly put cases on the wrong side of the line.
+    if !raw.is_empty() {
+        let ok = raw.len() == 10
+            && raw.as_bytes()[4] == b'-' && raw.as_bytes()[7] == b'-'
+            && raw.chars().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() });
+        if !ok {
+            return Err(e400("The cut-off must be a date, as yyyy-mm-dd."));
+        }
+    }
+
+    let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
+    conn.execute(
+        "INSERT INTO feature_flags (config_key, config_value) VALUES ('LEGACY_CUTOFF_DATE', ?1)
+         ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value",
+        [&raw],
+    ).map_err(|e| e500(&e.to_string()))?;
+
+    tracing::info!("legacy cut-off set to {}", if raw.is_empty() { "(none)" } else { raw.as_str() });
+    Ok(Json(json!({ "cutoff": if raw.is_empty() { None } else { Some(raw) } })))
+}
+
 pub async fn get_features(State(pool): Db) -> Result<Json<Value>, Err> {
     let conn = pool.get().map_err(|e| e500(&e.to_string()))?;
     let mut stmt = conn.prepare(

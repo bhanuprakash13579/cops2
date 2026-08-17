@@ -49,6 +49,13 @@ export interface DrFormulaRule {
 
 export interface DrEntry {
   id?: number;
+  /**
+   * Where the case named on this line stands: settled, still owing, or from
+   * before the office began keeping cases the new way. Worked out by the server
+   * across all the receipts that paid the case — never stored, so it cannot
+   * drift from the figures it describes.
+   */
+  status?: 'OPEN' | 'CLOSED' | 'LEGACY' | null;
   sort_order: number;
   sl_no: number | null;
   br_no: string;

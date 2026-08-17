@@ -174,9 +174,14 @@ export default function AdjudicatedList() {
                       {totalDemand.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                     </td>
                     <td className="px-5 py-3 align-middle text-center">
-                      {c.closure_ind === 'Y'
-                        ? <span className="bg-green-100 text-green-700 text-xs font-semibold px-2.5 py-1 rounded-full border border-green-200">Closed</span>
-                        : <span className="bg-yellow-100 text-yellow-700 text-xs font-semibold px-2.5 py-1 rounded-full border border-yellow-200">Open</span>}
+                      {/* Before the office began keeping cases the new way,
+                          whether a case was settled is not recorded anywhere —
+                          so it is not called open or closed on a guess. */}
+                      {c.legacy_period
+                        ? <span className="bg-slate-100 text-slate-600 text-xs font-semibold px-2.5 py-1 rounded-full border border-slate-300">Legacy O.S.</span>
+                        : c.closure_ind === 'Y'
+                          ? <span className="bg-green-100 text-green-700 text-xs font-semibold px-2.5 py-1 rounded-full border border-green-200">Closed</span>
+                          : <span className="bg-yellow-100 text-yellow-700 text-xs font-semibold px-2.5 py-1 rounded-full border border-yellow-200">Open</span>}
                     </td>
                     <td className="px-5 py-3 align-middle text-center">
                       <span className="inline-flex items-center gap-1 bg-slate-600 text-white text-xs font-semibold px-3 py-1.5 rounded-lg group-hover:bg-slate-500 transition-colors">

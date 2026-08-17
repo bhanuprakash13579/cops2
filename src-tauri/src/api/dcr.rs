@@ -129,7 +129,7 @@ fn load_full_session(conn: &rusqlite::Connection, id: i64) -> Result<Option<Valu
         }))
     }).map_err(|e| e500(&e.to_string()))?.filter_map(|r| r.ok()).collect();
 
-    let entries = settle_cases(entries);
+    let entries = settle_cases(&conn, entries);
 
     // Load DR entries
     let mut stmt2 = conn.prepare(
@@ -1414,7 +1414,7 @@ fn duty_of(e: &Value) -> f64 {
 /// Receipts against the same case on a different day are not in hand here. A
 /// case settled across two shifts still shows OPEN on the first of them, which
 /// is what the officer sees on the day and is true when they see it.
-fn settle_cases(entries: Vec<Value>) -> Vec<Value> {
+fn settle_cases(conn: &rusqlite::Connection, entries: Vec<Value>) -> Vec<Value> {
     use std::collections::HashMap;
     let text = |e: &Value, k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
 
@@ -1442,9 +1442,24 @@ fn settle_cases(entries: Vec<Value>) -> Vec<Value> {
         t.2 += duty_of(e);
     }
 
+    // Cases from before the office began keeping them the new way. Whether those
+    // were ever settled is not recorded anywhere, so they are not called open or
+    // closed on the strength of a guess — they are shown as legacy.
+    let cutoff = crate::api::admin::legacy_cutoff(conn);
+    let is_legacy = |case: &(String, i64)| -> bool {
+        if cutoff.is_none() { return false; }
+        let os_date: Option<String> = conn.query_row(
+            "SELECT os_date FROM cops_master WHERE os_no = ?1 AND os_year = ?2 AND entry_deleted = 'N'",
+            rusqlite::params![case.0, case.1], |r| r.get(0),
+        ).ok();
+        crate::api::admin::is_legacy_period(cutoff.as_deref(), os_date.as_deref())
+    };
+
     entries.into_iter().map(|mut e| {
-        let verdict = case_of(&e).and_then(|c| totals.get(&c))
-            .map(|&(pp, rf, duty)| entry_status(pp, rf, duty));
+        let verdict = case_of(&e).and_then(|c| {
+            if is_legacy(&c) { return Some("LEGACY"); }
+            totals.get(&c).map(|&(pp, rf, duty)| entry_status(pp, rf, duty))
+        });
         if let Some(obj) = e.as_object_mut() {
             obj.insert("status".into(), match verdict {
                 Some(v) => json!(v),

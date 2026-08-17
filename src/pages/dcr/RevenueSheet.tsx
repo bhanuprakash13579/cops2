@@ -377,6 +377,21 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
   }, [entries]);
 
   /**
+   * Where the case under the cursor stands.
+   *
+   * The sheet is where an officer sees the money arrive, so it is where they
+   * should be able to see whether the case it belongs to is settled. The server
+   * decides that across every receipt that paid the case; this only shows it.
+   */
+  const focusedCase = useMemo(() => {
+    if (!focusCell) return null;
+    const e = entries[focusCell[0]];
+    const ref = (e?.os_ref || '').trim();
+    if (!ref || !e?.status) return null;
+    return { ref, status: e.status };
+  }, [focusCell, entries]);
+
+  /**
    * What the receipt under the cursor comes to, all its items together.
    *
    * One BR is one receipt for one amount, but its items are written a row each,
@@ -1211,6 +1226,18 @@ export default function RevenueSheet({ session: initialSession, rules, onMessage
           <span className="text-emerald-300" title="Every item on this receipt, added up">
             BR {focusedReceipt.br} · {focusedReceipt.count} items · ₹
             {Math.round(focusedReceipt.total).toLocaleString('en-IN')}
+          </span>
+        )}
+        {focusedCase && (
+          <span
+            className={focusedCase.status === 'CLOSED' ? 'text-emerald-300'
+                     : focusedCase.status === 'OPEN'   ? 'text-amber-300'
+                     : 'text-slate-400'}
+            title={focusedCase.status === 'LEGACY'
+              ? 'From before the office began keeping cases the new way — whether it was settled is not recorded, so it is not called open or closed.'
+              : 'Across every receipt on this sheet that paid this case.'}
+          >
+            O.S. {focusedCase.ref} · {focusedCase.status === 'LEGACY' ? 'LEGACY O.S.' : focusedCase.status}
           </span>
         )}
         {focusCell && (

@@ -4471,3 +4471,99 @@ async fn the_whole_pipeline_works_with_what_the_form_actually_sends() {
     assert!(pdf.status().is_success(), "printing the order: HTTP {}", pdf.status());
     assert!(pdf.bytes().await.unwrap().len() > 1000, "the printed order is not empty");
 }
+
+#[tokio::test]
+async fn cases_from_before_the_cut_off_are_legacy_whenever_they_are_loaded() {
+    // The office installs this in September and sets the first of the month as
+    // the day it starts keeping cases the new way. August's cases — including an
+    // offline sheet loaded on the second — belong to the old regime: whether they
+    // were ever settled is not recorded, so they are not called open or closed.
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    // Admin sets the cut-off.
+    let admin: serde_json::Value = c.post(format!("{base}/admin/login"))
+        .json(&serde_json::json!({ "username": "sysadmin",
+                                   "password": std::env::var("ADMIN_PASSWORD").unwrap() }))
+        .send().await.unwrap().json().await.unwrap();
+    let atok = admin["access_token"].as_str().unwrap().to_string();
+
+    let set = c.put(format!("{base}/admin/config/legacy-cutoff"))
+        .bearer_auth(&atok)
+        .json(&serde_json::json!({ "cutoff": "2026-09-01" }))
+        .send().await.unwrap();
+    assert!(set.status().is_success(), "setting the cut-off: {}", set.status());
+
+    // Anything that is not a date is refused: it would sort wrongly against the
+    // case dates and put cases on the wrong side of the line.
+    for bad in ["01-09-2026", "September", "2026/09/01", "2026-9-1"] {
+        let r = c.put(format!("{base}/admin/config/legacy-cutoff")).bearer_auth(&atok)
+            .json(&serde_json::json!({ "cutoff": bad })).send().await.unwrap();
+        assert_eq!(r.status(), 400, "{bad:?} must be refused");
+    }
+
+    // Three cases: one from August, loaded now; one from the day of the cut-off;
+    // one from after it.
+    for (os_no, date) in [("6001", "2026-08-20"), ("6002", "2026-09-01"), ("6003", "2026-09-15")] {
+        let r = c.post(format!("{base}/os")).bearer_auth(&t)
+            .json(&serde_json::json!({
+                "os_no": os_no, "os_date": date, "os_year": 2026,
+                "pax_name": "TEST PAX", "is_draft": "N",
+                "items": [{ "items_sno": 1, "items_desc": "TV", "items_qty": 1.0,
+                            "items_value": 25000.0, "items_release_category": "CONFS" }]
+            }))
+            .send().await.unwrap();
+        assert!(r.status().is_success(), "booking {os_no}: {}", r.status());
+    }
+
+    let list: serde_json::Value = c.get(format!("{base}/os?per_page=50"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let legacy_of = |no: &str| -> bool {
+        list["items"].as_array().unwrap().iter()
+            .find(|r| r["os_no"] == no)
+            .and_then(|r| r["legacy_period"].as_bool()).unwrap_or(false)
+    };
+    assert!(legacy_of("6001"),  "August's case is legacy, though it was loaded today");
+    assert!(!legacy_of("6002"), "the cut-off day itself belongs to the new regime");
+    assert!(!legacy_of("6003"), "and so does everything after it");
+
+    // The case as opened on its own says the same.
+    let one: serde_json::Value = c.get(format!("{base}/os/6001/2026"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["legacy_period"], true, "the case itself agrees with the list");
+
+    // A revenue line naming an old case reads LEGACY, not OPEN or CLOSED.
+    let sid: i64 = {
+        let conn = pool.get().unwrap();
+        conn.execute("INSERT INTO dcr_sessions (report_date, shift, created_at)
+                      VALUES ('2026-09-02','DAY',datetime('now'))", []).unwrap();
+        let id = conn.last_insert_rowid();
+        for (sl, os_ref) in [(1, "6001/2026"), (2, "6003/2026")] {
+            conn.execute(
+                "INSERT INTO dcr_entries (session_id, sort_order, sl_no, br_no, os_ref,
+                                          personal_penalty, total_duty)
+                 VALUES (?,?,?,?,?,5000,5000)",
+                rusqlite::params![id, sl, sl, format!("70{sl}"), os_ref]).unwrap();
+        }
+        id
+    };
+    let sess: serde_json::Value = c.get(format!("{base}/dcr/sessions/{sid}"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    let status_of = |sl: i64| -> String {
+        sess["entries"].as_array().cloned().unwrap_or_default().iter()
+            .find(|e| e["sl_no"] == sl)
+            .and_then(|e| e["status"].as_str()).unwrap_or("").to_string()
+    };
+    assert_eq!(status_of(1), "LEGACY", "an old case is not judged open or closed");
+    assert_eq!(status_of(2), "CLOSED", "a case from the new regime is judged as usual");
+
+    // Clearing it puts every case back under the ordinary rule.
+    c.put(format!("{base}/admin/config/legacy-cutoff")).bearer_auth(&atok)
+        .json(&serde_json::json!({ "cutoff": "" })).send().await.unwrap();
+    let list2: serde_json::Value = c.get(format!("{base}/os?per_page=50"))
+        .bearer_auth(&t).send().await.unwrap().json().await.unwrap();
+    assert!(list2["items"].as_array().unwrap().iter()
+                .all(|r| r["legacy_period"] == false),
+            "with no cut-off set, nothing is legacy");
+}

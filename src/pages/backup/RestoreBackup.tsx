@@ -4,8 +4,7 @@ import {
   ArrowLeft, ShieldCheck, ShieldAlert, Lock, LogIn,
   UserPlus, Users, Pencil, X, KeyRound, Download,
   Upload, FileUp, Eye, EyeOff, RefreshCw, Database, ToggleLeft, ToggleRight, ScanLine,
-  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle
-} from 'lucide-react';
+  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle, CalendarDays } from 'lucide-react';
 import api from '@/lib/api';
 import { showDownloadToast } from '@/components/DownloadToast';
 import StatutesAdmin from './StatutesAdmin';
@@ -187,6 +186,11 @@ export default function RestoreBackup() {
   // App mode
   const [prodMode, setProdMode] = useState(false);
 
+  // The day the office starts keeping cases the new way; before it, legacy.
+  const [legacyCutoff, setLegacyCutoff] = useState('');
+  const [cutoffSaving, setCutoffSaving] = useState(false);
+  const [cutoffMsg, setCutoffMsg] = useState('');
+
   // Allowed devices (IP/MAC whitelist)
   const [devices, setDevices] = useState<AllowedDeviceRow[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(false);
@@ -263,6 +267,8 @@ export default function RestoreBackup() {
     loadUsers();
     api.get('/admin/features', { headers: adminHeaders(adminToken) })
       .then(r => setApisEnabled(r.data.apis_enabled === true || r.data.apis_enabled === 'true')).catch(() => {});
+    api.get('/config/legacy-cutoff', { headers: adminHeaders(adminToken) })
+      .then(r => setLegacyCutoff(r.data.cutoff || '')).catch(() => {});
     api.get('/admin/mode', { headers: adminHeaders(adminToken) })
       // `mode` is the module this installation runs as; `prod_mode` is whether
       // this is an installed build. Reading the first as the second labelled
@@ -1189,6 +1195,63 @@ export default function RestoreBackup() {
               </span>
             </div>
 
+          </section>
+
+          {/* Legacy cut-off — the day the office starts keeping cases the new way */}
+          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <CalendarDays size={18} className="text-blue-600" />
+              <h2 className="text-sm font-semibold text-slate-700">Start of the new register</h2>
+            </div>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Cases dated <strong>before</strong> this day are shown as <strong>Legacy O.S.</strong> —
+              never as open or closed. Whether they were settled is not recorded anywhere this
+              program can read, and it does not guess. From this day onwards a case is judged
+              open or closed by what the revenue report shows collected against it.
+              <br />
+              It is a date, not a mark on each case: an offline sheet for August, loaded in
+              September, lands on the right side of the line without anyone tagging it.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="date"
+                value={legacyCutoff}
+                onChange={e => { setLegacyCutoff(e.target.value); setCutoffMsg(''); }}
+                className="px-3 py-2 text-sm border border-slate-300 rounded-lg
+                           focus:outline-none focus:ring-2 focus:ring-blue-400"
+              />
+              <button
+                type="button"
+                disabled={cutoffSaving}
+                onClick={async () => {
+                  setCutoffSaving(true); setCutoffMsg('');
+                  try {
+                    await api.put('/admin/config/legacy-cutoff', { cutoff: legacyCutoff },
+                                  { headers: adminHeaders(adminToken) });
+                    setCutoffMsg(legacyCutoff
+                      ? `Saved. Cases before ${legacyCutoff} are shown as Legacy O.S.`
+                      : 'Cleared. Every case is judged open or closed as usual.');
+                  } catch (err: unknown) {
+                    const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+                    setCutoffMsg(d || 'Could not save the date.');
+                  } finally { setCutoffSaving(false); }
+                }}
+                className="px-4 py-2 text-xs font-semibold rounded-lg bg-blue-600 text-white
+                           hover:bg-blue-700 disabled:opacity-60"
+              >
+                {cutoffSaving ? 'Saving…' : 'Save'}
+              </button>
+              {legacyCutoff && (
+                <button
+                  type="button"
+                  onClick={() => setLegacyCutoff('')}
+                  className="px-3 py-2 text-xs rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50"
+                >
+                  Clear
+                </button>
+              )}
+              {cutoffMsg && <span className="text-xs text-slate-600">{cutoffMsg}</span>}
+            </div>
           </section>
 
           {/* Feature Flags */}
