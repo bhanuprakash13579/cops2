@@ -590,8 +590,10 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     let office_hdr2   = cfg("office_header_line2", "(Airport), Anna International Airport, Chennai-600027");
     let page1_title   = if is_export { "DETENTION / SEIZURE OF PASSENGER'S BAGGAGE (EXPORT)" }
                         else { "DETENTION / SEIZURE OF PASSENGER'S BAGGAGE" };
-    let inv_heading   = if is_export { "INVENTORY OF THE GOODS DETAINED FOR EXPORT" }
-                        else { "INVENTORY OF THE GOODS IMPORTED" };
+    // Read from config now, with the same text it always carried, so the printed
+    // inventory heading follows the same edit the preview already honoured.
+    let inv_heading   = if is_export { cfg("export_inventory_heading", "INVENTORY OF THE GOODS DETAINED FOR EXPORT") }
+                        else { cfg("inventory_heading", "INVENTORY OF THE GOODS IMPORTED") };
     let col_fa_hdr    = cfg("col_fa_heading", "Goods Allowed Free Under Rule 5 / Rule 13 of Baggage Rules, 1994");
     let col_duty_hdr  = cfg("col_duty_heading", "Goods Passed On Duty");
     let col_liable_hdr= cfg("col_liable_heading", "Goods Liable to Action Under FEMA / Foreign Trade Act, 1992 & Customs Act, 1962");
@@ -840,7 +842,7 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         oinfo_prev_visits   = esc(&previous_visits),
         p1_size             = p1_size,
         p2_size             = p2_size,
-        inv_heading         = esc(inv_heading),
+        inv_heading         = esc(&inv_heading),
         col_fa_hdr          = esc(&col_fa_hdr),
         col_duty_hdr        = esc(&col_duty_hdr),
         col_liable_hdr      = esc(&col_liable_hdr),
