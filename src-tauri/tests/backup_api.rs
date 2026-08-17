@@ -4924,3 +4924,88 @@ async fn a_report_is_worked_out_at_the_rates_that_were_in_force_that_day() {
     assert_eq!(sess["tariff"]["label"].as_str().unwrap_or(""), "period A",
                "the oldest rate on file is better than none");
 }
+
+/// The printed order must cite the section the officer actually selected, and
+/// must reflect an edit to the order wording — the two things the PDF used to
+/// get wrong while the on-screen preview got them right.
+///
+/// Renders a real PDF and reads its text with pdftotext. Skips cleanly if
+/// pdftotext is not installed, so it never fails a machine that just lacks it.
+#[tokio::test]
+async fn the_printed_order_cites_the_officer_s_section_and_honours_edits() {
+    if std::process::Command::new("pdftotext").arg("-v").output().is_err() {
+        eprintln!("pdftotext not installed — skipping the rendered-order check");
+        return;
+    }
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    let t = officer_token();
+
+    {
+        let conn = pool.get().unwrap();
+        // A print heading the resolver needs, and an adjudicated absolute-
+        // confiscation case that cites ONLY (d), (l), (m) — not (i) or (o).
+        conn.execute(
+            "INSERT INTO print_template_config(field_key, field_value, effective_from)
+             VALUES ('os_heading', 'CHENNAI', '2020-01-01')", []).unwrap();
+        conn.execute(
+            "INSERT INTO cops_master
+               (os_no, os_year, os_date, pax_name, is_draft, entry_deleted,
+                adjudication_date, adj_offr_name, adjn_section_ref, confiscated_value,
+                pp_amount, total_items_value)
+             VALUES ('801', 2026, '2026-08-11', 'SECTION TEST', 'N', 'N',
+                     '2026-08-12', 'TEST DC',
+                     'Section 111(d), (l), (m) of the Customs Act, 1962',
+                     80000, 5000, 80000)", []).unwrap();
+        conn.execute(
+            "INSERT INTO cops_items
+               (os_no, os_year, os_date, items_sno, items_desc, items_qty, items_value,
+                items_release_category, entry_deleted)
+             VALUES ('801', 2026, '2026-08-11', 1, 'GOLD', 1, 80000, 'CONFS', 'N')", []).unwrap();
+    }
+
+    let text_of = |bytes: Vec<u8>| -> String {
+        let dir = std::env::temp_dir();
+        let pdf = dir.join(format!("cops_pdftest_{}.pdf", uuid::Uuid::new_v4()));
+        std::fs::write(&pdf, &bytes).unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .args(["-layout", pdf.to_str().unwrap(), "-"]).output().unwrap();
+        let _ = std::fs::remove_file(&pdf);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let render = || {
+        let c = c.clone(); let base = base.clone(); let t = t.clone();
+        async move {
+            let r = c.get(format!("{base}/os/801/2026/print-pdf")).bearer_auth(t).send().await.unwrap();
+            assert!(r.status().is_success(), "print-pdf failed: {}", r.status());
+            r.bytes().await.unwrap().to_vec()
+        }
+    };
+
+    // ── 1. the section citation ──
+    let txt = text_of(render().await);
+    let flat: String = txt.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("Section 111(d), (l), (m) of the Customs Act, 1962"),
+            "the order must cite the officer's selection (d),(l),(m). Got:\n{flat}");
+    assert!(!flat.contains("(i), (l), (m) & (o)"),
+            "the order must NOT cite subsections (i)/(o) the officer never selected:\n{flat}");
+    assert!(flat.contains("Personal Penalty of Rs.5000/- (Rupees Five Thousand Only)"),
+            "the penalty paragraph must read correctly:\n{flat}");
+    assert!(flat.contains("absolute confiscation of the goods"),
+            "the confiscation paragraph must be present:\n{flat}");
+
+    // ── 2. an edit to the wording must print ──
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO print_template_config(field_key, field_value, effective_from)
+             VALUES ('order_para_pp',
+                     'A penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) is levied under Section 112(a).',
+                     '2020-01-01')", []).unwrap();
+    }
+    let txt2 = text_of(render().await);
+    let flat2: String = txt2.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat2.contains("A penalty of Rs.5000/- (Rupees Five Thousand Only) is levied under Section 112(a)."),
+            "an edited order paragraph must print, with values filled in:\n{flat2}");
+}

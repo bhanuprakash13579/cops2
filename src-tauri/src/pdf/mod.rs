@@ -122,6 +122,40 @@ pub fn template_config(conn: &rusqlite::Connection, as_of: &str) -> std::collect
 // ── Text helpers ──────────────────────────────────────────────────────────────
 
 /// Escape special characters for Typst content blocks.
+/// Fill `{placeholder}` tokens in a template with values, exactly as the
+/// on-screen preview does (its `fillTpl`). An unknown token is left as it stands
+/// rather than blanked, so a mistyped placeholder shows itself instead of
+/// silently dropping text from a legal order.
+fn fill_tpl(tpl: &str, vars: &std::collections::HashMap<&str, String>) -> String {
+    let mut out = String::with_capacity(tpl.len() + 32);
+    let mut rest = tpl;
+    while let Some(open) = rest.find('{') {
+        // Text up to the brace, byte-exact, so UTF-8 is never split.
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}') {
+            Some(close) => {
+                let key = &after[..close];
+                if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    match vars.get(key) {
+                        Some(v) => out.push_str(v),
+                        None => { out.push('{'); out.push_str(key); out.push('}'); }
+                    }
+                } else {
+                    // Not a placeholder — a stray brace. Keep it as written.
+                    out.push('{');
+                    out.push_str(&after[..close]);
+                    out.push('}');
+                }
+                rest = &after[close + 1..];
+            }
+            None => { out.push_str(&rest[open..]); return out; }  // unmatched '{'
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -525,39 +559,92 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
         format!(" #text(size: 7pt)[(along with {})]", esc(&qty_fa_str))
     } else { String::new() };
 
-    // ── Order paragraphs ──────────────────────────────────────────────────────
-    let para_rf = if conf_value > 0.0 && rf_amount > 0.0 {
-        let slnos_txt = esc(&slnos_text(&rf_slnos));
-        if is_export {
-            format!("I Order confiscation of the goods{slnos_txt} valued at Rs.{}/- under Section 113 of the Customs Act, 1962, but allow the passenger an option to redeem the goods valued at Rs.{}/- on a fine of Rs.{}/- (Rupees {} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.",
-                conf_value as i64, conf_value as i64, rf_amount as i64, esc(&title_words(rf_amount)))
+    // Wording the office can change, resolved as it stood on the case's own date.
+    // Hoisted here because the order paragraphs below read from it too.
+    let tcfg = case.get("__template_config").and_then(|v| v.as_object()).cloned()
+        .unwrap_or_default();
+    let cfg = |key: &str, default: &str| -> String {
+        tcfg.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+            .unwrap_or(default).to_string()
+    };
+
+    // The section the order cites — the officer's exact selection, not a fixed
+    // superset. The preview honours adjn_section_ref verbatim; the PDF used to
+    // cite a hardcoded (d),(i),(l),(m),(o) regardless, so a printed order named
+    // subsections the officer never invoked. Confirmed on a real order.
+    let confiscation_full_ref = {
+        let stored = str_val(case, "adjn_section_ref");
+        let stored = stored.trim();
+        if !stored.is_empty() {
+            stored.to_string()
         } else {
-            format!("I Order confiscation of the goods{slnos_txt} valued at Rs.{}/- under Section 111(d), (i), (l), (m) \\& (o) of the Customs Act, 1962 read with Section 3(3) of Foreign Trade (D\\&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{}/- on a fine of Rs.{}/- (Rupees {} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.",
-                conf_value as i64, conf_value as i64, rf_amount as i64, esc(&title_words(rf_amount)))
+            let sec_no = if is_export { cfg("confiscation_section_export", "113") }
+                         else         { cfg("confiscation_section_import", "111") };
+            let fix_csv = if is_export { cfg("confiscation_fixed_subs_export", "") }
+                          else         { cfg("confiscation_fixed_subs_import", "d,l,m") };
+            let mut subs: Vec<String> = fix_csv.split(',')
+                .map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty()).collect();
+            subs.sort();
+            let fmt = if subs.is_empty() { String::new() }
+                      else if subs.len() == 1 { format!("({})", subs[0]) }
+                      else {
+                          let parts: Vec<String> = subs.iter().map(|x| format!("({x})")).collect();
+                          format!("{} & {}", parts[..parts.len()-1].join(", "), parts[parts.len()-1])
+                      };
+            format!("Section {sec_no}{fmt} of the Customs Act, 1962")
+        }
+    };
+
+    // ── Order paragraphs ──────────────────────────────────────────────────────
+    // Each order paragraph is the office's own wording — editable and versioned —
+    // with this case's values filled in. Same templates and same substitution the
+    // on-screen preview uses, so what is edited is what prints, and the section
+    // cited is the officer's own selection rather than a fixed superset. The whole
+    // filled paragraph is escaped for Typst once, at the end.
+    let mut vars: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    vars.insert("confiscation_full_ref", confiscation_full_ref.clone());
+    vars.insert("conf_value",          (conf_value as i64).to_string());
+    vars.insert("re_exp_value",        (re_exp_value as i64).to_string());
+    vars.insert("abs_conf_value",      (abs_conf_value as i64).to_string());
+    vars.insert("rf_amount",           (rf_amount as i64).to_string());
+    vars.insert("rf_words",            title_words(rf_amount));
+    vars.insert("ref_amount",          (ref_amount as i64).to_string());
+    vars.insert("ref_words",           title_words(ref_amount));
+    vars.insert("pp_amount",           (pp_amount as i64).to_string());
+    vars.insert("pp_words",            title_words(pp_amount));
+    vars.insert("rf_slnos_text",       slnos_text(&rf_slnos));
+    vars.insert("ref_slnos_text",      slnos_text(&ref_slnos));
+    vars.insert("abs_conf_slnos_text", slnos_text(&all_abs_conf_slnos));
+    vars.insert("also_text",
+        if conf_value > 0.0 || re_exp_value > 0.0 { "also ".to_string() } else { String::new() });
+
+    let para = |key: &str, default: &str| -> String { esc(&fill_tpl(&cfg(key, default), &vars)) };
+
+    let para_rf = if conf_value > 0.0 && rf_amount > 0.0 {
+        if is_export {
+            para("export_order_para_rf", "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref}, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order.")
+        } else {
+            para("order_para_rf", "I Order confiscation of the goods{rf_slnos_text} valued at Rs.{conf_value}/- under {confiscation_full_ref} read with Section 3(3) of Foreign Trade (D&R) Act, 1992, but allow the passenger an option to redeem the goods valued at Rs.{conf_value}/- on a fine of Rs.{rf_amount}/- (Rupees {rf_words} Only) in lieu of confiscation under Section 125 of the Customs Act 1962 within 7 days from the date of receipt of this Order, Duty extra.")
         }
     } else { String::new() };
 
     let para_ref = if re_exp_value > 0.0 && ref_amount > 0.0 && !is_export {
-        let slnos_txt = esc(&slnos_text(&ref_slnos));
-        format!("However, I give an option to reship the goods{slnos_txt} valued at Rs.{}/- on a fine of Rs.{}/- (Rupees {} Only) under Section 125 of the Customs Act 1962 within 1 Month from the date of this Order.",
-            re_exp_value as i64, ref_amount as i64, esc(&title_words(ref_amount)))
+        para("order_para_ref", "However, I give an option to reship the goods{ref_slnos_text} valued at Rs.{re_exp_value}/- on a fine of Rs.{ref_amount}/- (Rupees {ref_words} Only) under Section 125 of the Customs Act 1962 within 1 Month from the date of this Order.")
     } else { String::new() };
 
     let para_abs_conf = if abs_conf_value > 0.0 {
-        let also = if conf_value > 0.0 || re_exp_value > 0.0 { "also " } else { "" };
-        let slnos_txt = esc(&slnos_text(&all_abs_conf_slnos));
         if is_export {
-            format!("I {also}order absolute confiscation of the goods{slnos_txt} valued at Rs.{}/- under Section 113 of the Customs Act, 1962.", abs_conf_value as i64)
+            para("export_order_para_abs_conf", "I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref}.")
         } else {
-            format!("I {also}order absolute confiscation of the goods{slnos_txt} valued at Rs.{}/- under Section 111(d), (i), (l), (m) \\& (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (D\\&R) Act, 1992.", abs_conf_value as i64)
+            para("order_para_abs_conf", "I {also_text}order absolute confiscation of the goods{abs_conf_slnos_text} valued at Rs.{abs_conf_value}/- under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (D&R) Act, 1992.")
         }
     } else { String::new() };
 
     let para_pp = if pp_amount > 0.0 {
         if is_export {
-            format!("I further impose a Personal Penalty of Rs.{}/- (Rupees {} Only) under Section 114 of the Customs Act, 1962.", pp_amount as i64, esc(&title_words(pp_amount)))
+            para("export_order_para_pp", "I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 114 of the Customs Act, 1962.")
         } else {
-            format!("I further impose a Personal Penalty of Rs.{}/- (Rupees {} Only) under Section 112(a) of the Customs Act, 1962.", pp_amount as i64, esc(&title_words(pp_amount)))
+            para("order_para_pp", "I further impose a Personal Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only) under Section 112(a) of the Customs Act, 1962.")
         }
     } else { String::new() };
 
@@ -579,12 +666,6 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     // Wording the office can change, resolved as it stood on the case's own date.
     // Every default below is the text this form has always carried, so an office
     // that never opens the editor sees no difference.
-    let tcfg = case.get("__template_config").and_then(|v| v.as_object()).cloned()
-        .unwrap_or_default();
-    let cfg = |key: &str, default: &str| -> String {
-        tcfg.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
-            .unwrap_or(default).to_string()
-    };
 
     let office_hdr1   = cfg("office_header_line1", "Office of the Deputy / Asst. Commissioner of Customs");
     let office_hdr2   = cfg("office_header_line2", "(Airport), Anna International Airport, Chennai-600027");
@@ -609,8 +690,8 @@ fn build_typst_source(case: &Value, p1_size: f64, p2_size: f64) -> String {
     let nb1_txt       = cfg("nb1_text", "N.B: 1. This copy is granted free of charge for the private use of the person to whom it is issued.");
     let nb2_txt       = cfg("nb2_text", "2. An Appeal against this Order shall lie before the Commissioner of Customs (Appeals), Custom House, Chennai-600 001 on payment of 7.5% of the duty demanded where duty or duty and penalty are in dispute, or penalty, where penalty alone is in dispute. The Appeal shall be filed within 60 days provided under Section 128 of the Customs Act, 1962 from the date of receipt of this Order.");
     let note_scn      = cfg("note_scn_waived", "Note: The issue of Show Cause Notice was waived at the instance of the Passenger.");
-    let legal_p1      = if is_export { cfg("export_legal_para_1", "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.") } else { cfg("legal_para_1", "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992 read with the Rules framed thereunder, also read with Section 11(2)(u) of Customs Act, 1962, import of 'goods in commercial quantity / goods in the nature of non-bonafide baggage' is not permitted without a valid import licence, though exemption exists under clause 3(h) of the Foreign Trade (Exemption from application of Rules in certain cases) order 1993 for import of goods by a passenger from abroad only to the extent admissible under the Baggage Rules framed under Section 79 of the Customs Act, 1962.") };
-    let legal_p2      = if is_export { cfg("export_legal_para_2", "Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under Section 113 of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.") } else { cfg("legal_para_2", "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under Section 111(d), (i), (l), (m) & (o) of the Customs Act, 1962 read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.") };
+    let legal_p1      = fill_tpl(&if is_export { cfg("export_legal_para_1", "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992, export of goods without proper Customs declaration or in violation of applicable export regulations / restrictions is prohibited. Passengers are required to declare all goods carried at the time of departure as mandated under Section 40 of the Customs Act, 1962.") } else { cfg("legal_para_1", "In terms of Foreign Trade Policy notified by the Government in pursuance to Section 3(1) & 3(2) of the Foreign Trade (Development & Regulation) Act, 1992 read with the Rules framed thereunder, also read with Section 11(2)(u) of Customs Act, 1962, import of 'goods in commercial quantity / goods in the nature of non-bonafide baggage' is not permitted without a valid import licence, though exemption exists under clause 3(h) of the Foreign Trade (Exemption from application of Rules in certain cases) order 1993 for import of goods by a passenger from abroad only to the extent admissible under the Baggage Rules framed under Section 79 of the Customs Act, 1962.") }, &vars);
+    let legal_p2      = fill_tpl(&if is_export { cfg("export_legal_para_2", "Export of goods non-declared / misdeclared / concealed / in commercial quantity / contrary to any prohibition or export restriction is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.") } else { cfg("legal_para_2", "Import of goods non-declared / misdeclared / concealed / in trade and in commercial quantity / non-bonafide in excess of the baggage allowance is therefore liable for confiscation under {confiscation_full_ref} read with Section 3(3) of the Foreign Trade (Development & Regulation) Act, 1992.") }, &vars);
     let deputy_sig    = cfg("deputy_sig_title", "Deputy / Asst. Commissioner of Customs (Airport)");
     let bottom_nb1    = cfg("bottom_nb1", "N.B: 1. Perishables will be disposed off within seven days from the date of detention.");
     let bottom_nb2    = if !is_export { "2. Where re-export is permitted, the passenger is advised to intimate the date of departure of flight atleast 48 hours in advance." } else { "" };
@@ -1155,5 +1236,38 @@ mod tests {
         // An amount, where an officer entered one.
         assert!(fmt_br_entries(r#"[{"no":"901","date":"2026-08-11","amount":"5000"}]"#)
                 .contains("Rs. 5000"));
+    }
+}
+
+#[cfg(test)]
+mod fill_tpl_tests {
+    use super::fill_tpl;
+    use std::collections::HashMap;
+
+    fn v(pairs: &[(&'static str, &str)]) -> HashMap<&'static str, String> {
+        pairs.iter().map(|(k, val)| (*k, val.to_string())).collect()
+    }
+
+    #[test]
+    fn it_fills_only_real_placeholders_and_keeps_everything_else() {
+        let vars = v(&[("pp_amount", "5000"), ("pp_words", "Five Thousand")]);
+        assert_eq!(
+            fill_tpl("Penalty of Rs.{pp_amount}/- (Rupees {pp_words} Only).", &vars),
+            "Penalty of Rs.5000/- (Rupees Five Thousand Only)."
+        );
+        // A placeholder with no value is left visible, not silently dropped —
+        // better a wrong-looking order someone notices than a sentence missing.
+        assert_eq!(fill_tpl("under {confiscation_full_ref} read", &vars),
+                   "under {confiscation_full_ref} read");
+        // Braces that are not placeholders stay exactly as written.
+        assert_eq!(fill_tpl("a { b } c", &vars), "a { b } c");
+        assert_eq!(fill_tpl("no braces here", &vars), "no braces here");
+        // An unmatched brace does not eat the rest of the order.
+        assert_eq!(fill_tpl("trailing {oops", &vars), "trailing {oops");
+        // Non-ASCII survives intact.
+        assert_eq!(fill_tpl("₹{pp_amount} — {pp_words}", &vars), "₹5000 — Five Thousand");
+        // Empty inputs.
+        assert_eq!(fill_tpl("", &vars), "");
+        assert_eq!(fill_tpl("{}", &vars), "{}");
     }
 }
