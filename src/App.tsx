@@ -8,6 +8,7 @@ import api from './lib/api';
 import DevModeBanner from './components/DevModeBanner';
 import DownloadToast from './components/DownloadToast';
 import ArchiveReminder from './components/ArchiveReminder';
+import EscapeHatch from './components/EscapeHatch';
 import ErrorBoundary from './components/ErrorBoundary';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import Login from './pages/auth/Login';
@@ -350,6 +351,8 @@ export default function App() {
           <DownloadToast />
           <BrowserRouter>
             <AppRoutes />
+            {/* A guaranteed way off every page — see EscapeHatch. */}
+            <EscapeHatch />
             {/* Inside the router — it hides itself on the backup page, and
                 needs the current location to know that. Rendered last so it
                 sits above page content, but at a lower z-index than

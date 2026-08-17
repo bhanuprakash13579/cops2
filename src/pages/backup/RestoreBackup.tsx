@@ -4,21 +4,11 @@ import {
   ArrowLeft, ShieldCheck, ShieldAlert, Lock, LogIn,
   UserPlus, Users, Pencil, X, KeyRound, Download,
   Upload, FileUp, Eye, EyeOff, RefreshCw, Database, ToggleLeft, ToggleRight, ScanLine,
-  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle, CalendarDays, CloudUpload } from 'lucide-react';
+  Wifi, Plus, AlertTriangle, Monitor, Settings, Scale, Trash2, Clock, CheckCircle, CalendarDays, CloudUpload, FileDown } from 'lucide-react';
 import api from '@/lib/api';
 import { showDownloadToast } from '@/components/DownloadToast';
 import StatutesAdmin from './StatutesAdmin';
 import OSTemplateEditor from './OSTemplateEditor';
-
-function formatProgress(loaded: number, total: number | undefined): string {
-  const mb = (loaded / (1024 * 1024)).toFixed(1);
-  if (total && total > 0) {
-    const pct = Math.round((loaded / total) * 100);
-    const totalMb = (total / (1024 * 1024)).toFixed(1);
-    return `Downloading… ${pct}%  (${mb} / ${totalMb} MB)`;
-  }
-  return `Downloading… ${mb} MB`;
-}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -274,7 +264,6 @@ export default function RestoreBackup() {
   const [backupLoading, setBackupLoading] = useState(false);
   const [backupMsg, setBackupMsg] = useState('');
   const [backupProgress, setBackupProgress] = useState('');
-  const backupAbort = useRef<AbortController | null>(null);
 
   // Legacy CSV upload — cops_master (from old MDB)
   const legacyRef = useRef<HTMLInputElement>(null);
@@ -304,11 +293,6 @@ export default function RestoreBackup() {
   const [restoreErr, setRestoreErr] = useState('');
 
   // Full SQLite DB backup / restore
-  const fullDbRestoreRef = useRef<HTMLInputElement>(null);
-  const [fullDbRestoreFile, setFullDbRestoreFile] = useState<File | null>(null);
-  const [fullDbRestoreLoading, setFullDbRestoreLoading] = useState(false);
-  const [fullDbRestoreResult, setFullDbRestoreResult] = useState('');
-  const [fullDbRestoreErr, setFullDbRestoreErr] = useState('');
 
   // Tab navigation
   const [activeTab, setActiveTab] = useState<'security' | 'users' | 'settings' | 'backup' | 'osconfig' | 'statutes' | 'danger'>('security');
@@ -569,96 +553,59 @@ export default function RestoreBackup() {
   useEffect(() => { if (activeTab === 'backup' && adminToken) loadAutoStatus(); }, [activeTab, adminToken]);
 
   // ── Backup download ───────────────────────────────────────────────────────
+  // The one backup: the whole register in a single compressed, encrypted file.
+  //
+  // It used to be a ZIP of CSVs of only settings and cases — a second, weaker
+  // kind of backup that invited the officer to save the wrong thing. There is
+  // one backup now, and this is it: every table, about six times smaller than a
+  // copy of the database, openable only with the office's own key.
   const downloadBackup = async () => {
-    setBackupLoading(true);
-    setBackupMsg('');
-    setBackupProgress('Preparing…');
-    backupAbort.current = new AbortController();
+    setBackupLoading(true); setBackupMsg(''); setBackupProgress('Preparing…');
+    const name = `cops_backup_${new Date().toISOString().slice(0, 10)}.cops`;
     try {
-      const res = await api.get('/admin/backup/export', {
-        headers: adminHeaders(adminToken),
-        responseType: 'blob',
-        timeout: 0,
-        signal: backupAbort.current.signal,
-        onDownloadProgress: (evt) => {
-          setBackupProgress(formatProgress(evt.loaded, evt.total));
-        },
-      });
-      setBackupProgress('');
-      const defaultName = `cops_backup_${new Date().toISOString().slice(0, 10)}.zip`;
+      // Preferred path: the server writes straight to the folder the officer
+      // chooses, so the size never has to fit in memory.
+      let savePath: string | null = null;
       try {
         const { save } = await import('@tauri-apps/plugin-dialog');
-        const { writeFile } = await import('@tauri-apps/plugin-fs');
-        const savePath = await save({ 
-          title: 'Save Backup (Includes all modules e.g. BR/DR)', 
-          defaultPath: defaultName, 
-          filters: [{ name: 'ZIP', extensions: ['zip'] }] 
+        savePath = await save({
+          title: 'Save the backup',
+          defaultPath: name,
+          filters: [{ name: 'COPS backup', extensions: ['cops'] }],
         });
-        if (savePath) {
-          setBackupProgress('Writing to disk…');
-          const arrayBuf = await (res.data as Blob).arrayBuffer();
-          await writeFile(savePath, new Uint8Array(arrayBuf));
-          setBackupProgress('');
-          setBackupMsg('Backup saved successfully.');
-          showDownloadToast(`Backup saved to ${savePath}`);
-        } else {
-          setBackupMsg('Save cancelled.');
-        }
-      } catch (fsErr) {
-        if (String(fsErr).includes('plugin-dialog') || String(fsErr).includes('__TAURI_IPC__')) {
-          const url = URL.createObjectURL(res.data);
-          const a = document.createElement('a');
-          a.href = url; a.download = defaultName; a.click();
-          URL.revokeObjectURL(url);
-          setBackupMsg('Backup downloaded successfully.');
-          showDownloadToast(`Backup downloaded as ${defaultName}`);
-        } else {
-          throw new Error(`Disk write failed: ${fsErr}`);
-        }
-      }
-    } catch (err: unknown) {
-      if ((err as any)?.name === 'CanceledError' || (err as any)?.code === 'ERR_CANCELED') {
-        setBackupMsg('Download cancelled.');
+      } catch { /* not in the desktop window — fall through to a download */ }
+
+      if (savePath) {
+        setBackupProgress('Writing…');
+        await api.post('/backup/archive/save', { path: savePath },
+                       { headers: adminHeaders(adminToken), timeout: 0 });
         setBackupProgress('');
-        return;
+        setBackupMsg(`Backup saved to ${savePath}`);
+        showDownloadToast('Backup saved — one encrypted file with every record.');
+      } else {
+        // In a browser: stream it down.
+        const res = await api.get('/backup/archive/download', {
+          headers: adminHeaders(adminToken), responseType: 'blob', timeout: 0,
+        });
+        const url = URL.createObjectURL(res.data as Blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        setBackupProgress('');
+        setBackupMsg('Backup downloaded.');
       }
-      const msg = err instanceof Error ? err.message : String(err);
-      setBackupMsg(`Download failed: ${msg}`);
+    } catch (e: unknown) {
       setBackupProgress('');
+      const d = (e as { response?: { data?: { detail?: string } }; message?: string });
+      setBackupMsg(`Backup failed: ${d?.response?.data?.detail || d?.message || 'unknown error'}.`);
     } finally {
       setBackupLoading(false);
-      backupAbort.current = null;
     }
   };
 
   // ── Full DB export ────────────────────────────────────────────────────────
 
-  // ── Full DB restore ───────────────────────────────────────────────────────
-  const uploadFullDbRestore = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!fullDbRestoreFile) return;
-    if (!window.confirm(
-      'WARNING: This will completely replace ALL data in the database with the backup file.\n\n' +
-      'Every table will be overwritten. This cannot be undone.\n\nProceed?'
-    )) return;
-    setFullDbRestoreErr('');
-    setFullDbRestoreResult('');
-    setFullDbRestoreLoading(true);
-    const fd = new FormData();
-    fd.append('file', fullDbRestoreFile);
-    try {
-      const res = await api.post('/admin/backup/restore-fulldb', fd, {
-        headers: { ...adminHeaders(adminToken), 'Content-Type': 'multipart/form-data' },
-      });
-      setFullDbRestoreResult(res.data.message);
-      setFullDbRestoreFile(null);
-      if (fullDbRestoreRef.current) fullDbRestoreRef.current.value = '';
-    } catch (err: any) {
-      setFullDbRestoreErr(err?.response?.data?.detail || 'Restore failed.');
-    } finally {
-      setFullDbRestoreLoading(false);
-    }
-  };
 
   // ── Legacy CSV upload — cops_master ──────────────────────────────────────
   const uploadLegacy = async (e: React.FormEvent) => {
@@ -738,38 +685,90 @@ export default function RestoreBackup() {
     }
   };
 
-  // ── Restore from backup ZIP ───────────────────────────────────────────────
+  // A CSV export for moving selected data between machines — not a backup.
+  //
+  // Kept for the admin who is migrating or reconciling data by hand. It is
+  // deliberately not called a backup and not offered to officers: it holds only
+  // cases and settings as CSV, not the whole encrypted register, and confusing
+  // the two is how someone saves the wrong thing.
+  const [csvBusy, setCsvBusy] = useState(false);
+  const [csvMsg, setCsvMsg] = useState('');
+  const downloadCsvMigration = async () => {
+    setCsvBusy(true); setCsvMsg('');
+    try {
+      const res = await api.get('/admin/backup/export',
+        { headers: adminHeaders(adminToken), responseType: 'blob', timeout: 0 });
+      const url = URL.createObjectURL(res.data as Blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `cops_cases_export_${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setCsvMsg('Exported.');
+    } catch (e: unknown) {
+      setCsvMsg((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                || 'Export failed.');
+    } finally { setCsvBusy(false); }
+  };
+
+  // ── Restore, whatever kind of backup it is ──────────────────────────────────
+  //
+  // One box. The current backup is a .cops archive; a .db or a .zip is an older
+  // one the office might still have on a drive. The right path is chosen from the
+  // file itself, so recovery is: pick the file, confirm, done.
   const uploadRestore = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!restoreFile) return;
-    setRestoreErr('');
-    setRestoreResult('');
-    setRestoreLoading(true);
-    const fd = new FormData();
-    fd.append('file', restoreFile);
+    const nm = restoreFile.name.toLowerCase();
+    const kind = nm.endsWith('.cops') ? 'archive'
+               : nm.endsWith('.db')   ? 'fulldb'
+               : nm.endsWith('.zip')  ? 'merge'
+               : '';
+    if (!kind) {
+      setRestoreErr('Choose a .cops backup (or an older .db or .zip).');
+      return;
+    }
+    if (kind !== 'merge' && !window.confirm(
+      'This replaces ALL current data with the backup. It cannot be undone.\n\nProceed?'
+    )) return;
+
+    setRestoreErr(''); setRestoreResult(''); setRestoreLoading(true);
     try {
-      const res = await api.post('/admin/backup/restore', fd, {
-        headers: { ...adminHeaders(adminToken), 'Content-Type': 'multipart/form-data' },
-        timeout: 600000,
-      });
+      const post = async (confirmLoss: boolean) => {
+        const fd = new FormData();
+        fd.append('file', restoreFile);
+        if (confirmLoss) fd.append('confirm_data_loss', 'yes');
+        const url = kind === 'archive' ? '/admin/backup/restore-archive'
+                  : kind === 'fulldb'  ? '/admin/backup/restore-fulldb'
+                  : '/admin/backup/restore';
+        return api.post(url, fd, {
+          headers: { ...adminHeaders(adminToken), 'Content-Type': 'multipart/form-data' },
+          timeout: 600000,
+        });
+      };
+
+      let res;
+      try {
+        res = await post(false);
+      } catch (err: unknown) {
+        // The archive restore refuses, unasked, to overwrite good data with a
+        // backup that holds fewer records. If the officer means it, they say so.
+        const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail || '';
+        if (kind === 'archive' && /fewer records/i.test(detail)
+            && window.confirm(detail + '\n\nRestore anyway?')) {
+          res = await post(true);
+        } else {
+          throw err;
+        }
+      }
+
       const d = res.data;
-      const parts: string[] = [];
-      if ((d.master_inserted ?? 0) + (d.master_skipped ?? 0) > 0)
-        parts.push(`OS: ${d.master_inserted} inserted (${d.master_skipped} skipped), ${d.items_inserted ?? 0} items`);
-      if ((d.br_inserted ?? 0) + (d.br_skipped ?? 0) > 0)
-        parts.push(`BR: ${d.br_inserted} inserted (${d.br_skipped} skipped), ${d.br_items_inserted ?? 0} items`);
-      if ((d.dr_inserted ?? 0) + (d.dr_skipped ?? 0) > 0)
-        parts.push(`DR: ${d.dr_inserted} inserted (${d.dr_skipped} skipped), ${d.dr_items_inserted ?? 0} items`);
-      if ((d.users_inserted ?? 0) > 0)
-        parts.push(`Users: ${d.users_inserted} added`);
-      const dcrCount = (d.dcr_tariffs_inserted ?? 0) + (d.dcr_sessions_inserted ?? 0) + (d.dcr_entries_inserted ?? 0);
-      if (dcrCount > 0)
-        parts.push(`DCR: ${d.dcr_sessions_inserted ?? 0} sessions, ${d.dcr_entries_inserted ?? 0} entries, ${d.dcr_tariffs_inserted ?? 0} tariffs`);
-      setRestoreResult(parts.length ? `Restored — ${parts.join(' | ')}` : 'Restore complete (no new records found).');
+      setRestoreResult(d.message
+        || (typeof d === 'object' ? 'Restored. Restart the app to reload the data.' : String(d)));
       setRestoreFile(null);
       if (restoreRef.current) restoreRef.current.value = '';
-    } catch (err: any) {
-      setRestoreErr(err.response?.data?.detail || 'Restore failed.');
+    } catch (err: unknown) {
+      setRestoreErr((err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                    || 'Restore failed. The file may not be a COPS backup, or the key is wrong.');
     } finally {
       setRestoreLoading(false);
     }
@@ -1605,85 +1604,81 @@ export default function RestoreBackup() {
             )}
           </section>
 
-          {/* ── Restore full SQLite DB ── */}
-          <section className="bg-white rounded-xl border border-red-200 shadow-sm p-5 space-y-3">
-            <div className="flex items-center gap-2">
-              <Upload size={18} className="text-red-500" />
-              <div>
-                <h2 className="text-sm font-semibold text-slate-700">Restore Full Database Backup</h2>
-                <p className="text-xs text-slate-500 mt-0.5 break-words">Upload a <code className="bg-slate-100 px-1 rounded">.db</code> file — both encrypted (new app) and plain SQLite (old app) backups are accepted. <strong className="text-red-600">Replaces all data</strong> — use only to recover from data loss.</p>
-              </div>
-            </div>
-            <form onSubmit={uploadFullDbRestore} className="space-y-3">
-              <div className="flex items-center gap-3 flex-wrap">
-                <input ref={fullDbRestoreRef} type="file" accept=".db"
-                  onChange={e => { setFullDbRestoreFile(e.target.files?.[0] || null); setFullDbRestoreResult(''); setFullDbRestoreErr(''); }}
-                  className="text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200" />
-                <button type="submit" disabled={!fullDbRestoreFile || fullDbRestoreLoading}
-                  className="flex items-center gap-2 px-4 py-1.5 text-xs rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">
-                  <Upload size={13} />
-                  {fullDbRestoreLoading ? 'Restoring…' : 'Restore Full DB'}
-                </button>
-              </div>
-              {fullDbRestoreErr    && <p className="text-xs text-red-600">{fullDbRestoreErr}</p>}
-              {fullDbRestoreResult && <p className="text-xs text-emerald-700 font-medium">{fullDbRestoreResult}</p>}
-            </form>
-          </section>
-
-          {/* ── ZIP backup (selective / migration) ── */}
+          {/* ── The one backup ── */}
           <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
             <div className="flex items-center gap-2">
-              <Download size={18} className="text-slate-600" />
+              <Download size={18} className="text-blue-600" />
               <div>
-                <h2 className="text-sm font-semibold text-slate-700">Download Settings + Cases Backup (ZIP)</h2>
-                <p className="text-xs text-slate-500 mt-0.5">ZIP with CSV files for OS cases, settings, template history, statutes, users. Use for merging data between machines.</p>
+                <h2 className="text-sm font-semibold text-slate-700">Download backup</h2>
+                <p className="text-xs text-slate-500 mt-0.5 break-words">
+                  One file with <strong>everything</strong> — every case, receipt, user and setting
+                  from the first record to today. Compressed to about a sixth of the database, and
+                  encrypted: it opens only with this office's own key, so it is safe to carry on a
+                  drive. The newest file replaces the last; there is no need to keep the old ones.
+                </p>
               </div>
             </div>
             <div className="flex items-center gap-3">
               <button onClick={downloadBackup} disabled={backupLoading}
-                className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-60">
+                className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60">
                 <Download size={13} />
-                {backupLoading ? (backupProgress || 'Preparing…') : 'Download Backup ZIP'}
+                {backupLoading ? (backupProgress || 'Preparing…') : 'Download backup'}
               </button>
-              {backupLoading && (
-                <button onClick={() => backupAbort.current?.abort()}
-                  className="px-3 py-2 text-xs rounded-lg border border-red-300 text-red-600 hover:bg-red-50">
-                  Cancel
-                </button>
-              )}
             </div>
-            {backupLoading && backupProgress && backupProgress.includes('%') && (
-              <div className="w-full max-w-sm bg-slate-200 rounded-full h-1.5 overflow-hidden mt-1">
-                <div className="bg-slate-500 h-1.5 rounded-full transition-all duration-300"
-                     style={{ width: backupProgress.match(/(\d+)%/)?.[1] + '%' }} />
-              </div>
-            )}
             {backupMsg && <p className={`text-xs ${backupMsg.includes('failed') ? 'text-red-600' : 'text-emerald-700'}`}>{backupMsg}</p>}
           </section>
 
-          {/* Restore from backup ZIP */}
-          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+          {/* ── Restore ── */}
+          <section className="bg-white rounded-xl border border-red-200 shadow-sm p-5 space-y-3">
             <div className="flex items-center gap-2">
-              <Upload size={18} className="text-slate-600" />
-              <h2 className="text-sm font-semibold text-slate-700">Restore from Backup ZIP</h2>
+              <Upload size={18} className="text-red-500" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-700">Restore backup</h2>
+                <p className="text-xs text-slate-500 mt-0.5 break-words">
+                  Choose a backup file and it is put back in full. The current backup is a{' '}
+                  <code className="bg-slate-100 px-1 rounded">.cops</code> file; an older{' '}
+                  <code className="bg-slate-100 px-1 rounded">.db</code> or{' '}
+                  <code className="bg-slate-100 px-1 rounded">.zip</code> the office may still have is
+                  taken too. <strong className="text-red-600">Replaces all current data</strong> — use
+                  only to recover, and only with the right key.
+                </p>
+              </div>
             </div>
-            <p className="text-xs text-slate-500 break-words">
-              Upload a ZIP backup — both encrypted (new app) and plain (old app) ZIPs are accepted. Existing records are never overwritten — only missing rows are inserted.
-            </p>
             <form onSubmit={uploadRestore} className="space-y-3">
-              <div className="flex items-center gap-3">
-                <input ref={restoreRef} type="file" accept=".zip"
-                  onChange={e => setRestoreFile(e.target.files?.[0] || null)}
+              <div className="flex items-center gap-3 flex-wrap">
+                <input ref={restoreRef} type="file" accept=".cops,.db,.zip"
+                  onChange={e => { setRestoreFile(e.target.files?.[0] || null); setRestoreResult(''); setRestoreErr(''); }}
                   className="text-xs text-slate-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200" />
                 <button type="submit" disabled={!restoreFile || restoreLoading}
-                  className="flex items-center gap-2 px-4 py-1.5 text-xs rounded-lg bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50">
+                  className="flex items-center gap-2 px-4 py-1.5 text-xs rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">
                   <Upload size={13} />
-                  {restoreLoading ? 'Restoring…' : 'Restore ZIP'}
+                  {restoreLoading ? 'Restoring…' : 'Restore backup'}
                 </button>
               </div>
               {restoreErr    && <p className="text-xs text-red-600">{restoreErr}</p>}
-              {restoreResult && <p className="text-xs text-emerald-700">{restoreResult}</p>}
+              {restoreResult && <p className="text-xs text-emerald-700 font-medium">{restoreResult}</p>}
             </form>
+          </section>
+
+          {/* ── Migration export (admin tool, not a backup) ── */}
+          <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <FileDown size={18} className="text-slate-500" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-700">Export cases &amp; settings (for migration)</h2>
+                <p className="text-xs text-slate-500 mt-0.5 break-words">
+                  A ZIP of CSV files — cases, settings, template history, statutes, users — for
+                  moving or merging data between machines. This is <strong>not</strong> a backup:
+                  for that, use <em>Download backup</em> above. Restoring a ZIP only fills in
+                  missing rows and never overwrites what is here.
+                </p>
+              </div>
+            </div>
+            <button onClick={downloadCsvMigration} disabled={csvBusy}
+              className="flex items-center gap-2 px-4 py-2 text-xs rounded-lg bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-60">
+              <FileDown size={13} /> {csvBusy ? 'Preparing…' : 'Export CSV (ZIP)'}
+            </button>
+            {csvMsg && <p className="text-xs text-slate-600">{csvMsg}</p>}
           </section>
 
           {/* Import from old MDB — two CSVs */}
