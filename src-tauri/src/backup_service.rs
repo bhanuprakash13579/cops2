@@ -109,14 +109,68 @@ fn setting(pool: &DbPool, key: &str) -> Option<String> {
     .filter(|s| !s.trim().is_empty())
 }
 
+/// A folder ON THIS machine that every backup is always written to, on top of
+/// whatever off-machine folders are configured. Set once at startup to a folder
+/// under the app's own data directory.
+///
+/// It exists for the case the office actually runs in: the other PCs are asleep
+/// or switched off most of the time. Without it, a run where every configured
+/// folder is an unreachable slave would save the backup NOWHERE and the work
+/// would live only in the database it is meant to protect. With it, a backup can
+/// never fail for want of a reachable destination — one copy always lands here,
+/// and the sleeping slaves are caught up the next time they are awake and a run
+/// finds them. It is not a substitute for the off-machine copies (this folder
+/// dies with this machine); it is the floor beneath them.
+static LOCAL_BACKUP_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Called once at startup with a writable folder under the app data directory.
+pub fn set_local_dir(dir: String) {
+    let _ = LOCAL_BACKUP_DIR.set(dir);
+}
+
+/// Two paths that name the same folder, for the dedup below. Case-insensitive
+/// (Windows shares and drives are), and trailing separators do not matter.
+fn same_folder(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_lowercase();
+    norm(a) == norm(b)
+}
+
 pub fn destinations(pool: &DbPool) -> Vec<String> {
     let raw = setting(pool, "backup_dirs")
         .or_else(|| std::env::var("COPS_BACKUP_DIRS").ok())
         .unwrap_or_default();
-    raw.split(',')
+    let configured: Vec<String> = raw
+        .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect();
+    with_local_copy(LOCAL_BACKUP_DIR.get().map(|s| s.as_str()), configured)
+}
+
+/// The always-present local copy comes first, then the configured off-machine
+/// folders, with no folder listed twice — split out and pure so the ordering and
+/// dedup can be tested without touching the process-wide local-dir slot.
+fn with_local_copy(local: Option<&str>, configured: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(l) = local {
+        if !l.trim().is_empty() {
+            out.push(l.to_string());
+        }
+    }
+    for d in configured {
+        if !out.iter().any(|existing| same_folder(existing, &d)) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// When this exact destination folder last received a good copy (RFC-3339), if
+/// ever. Read from the per-folder marker `run_once` writes on each success, so a
+/// slave that has quietly stopped receiving copies can be told apart from its
+/// siblings that are still current.
+pub fn last_ok_for(pool: &DbPool, path: &str) -> Option<String> {
+    setting(pool, &format!("backup_last_ok::{path}"))
 }
 
 pub fn interval_minutes(pool: &DbPool) -> u64 {
@@ -186,6 +240,47 @@ pub fn is_remote(path: &str) -> bool {
         return p[..2].to_uppercase() != sysdrive;
     }
     false
+}
+
+/// How an off-machine destination names the other PC — the one thing that decides
+/// whether the folder survives a move to a different network.
+///
+/// A share addressed by the PC's NAME (`\\SLAVE1\backups`) keeps working after a
+/// relocation: Windows re-resolves the name to whatever new address the machine
+/// gets on the new LAN. A share addressed by a literal IP (`\\192.168.1.50\...`)
+/// breaks the moment the new router hands out a different address. So we tell them
+/// apart and let the panel steer the office to the durable form.
+///
+///   "name"  — UNC by PC name: durable across a network change.
+///   "ip"    — UNC by IP literal: FRAGILE; will break if the address changes.
+///   "drive" — a mapped/other drive letter: opaque (its real target is hidden
+///             behind the letter), so we can't vouch for it either way.
+///   "local" — a folder on this machine: not off-machine at all.
+pub fn destination_kind(path: &str) -> &'static str {
+    let p = path.trim();
+    let unc = p.strip_prefix("\\\\").or_else(|| p.strip_prefix("//"));
+    if let Some(rest) = unc {
+        let server = rest.split(|c| c == '\\' || c == '/').next().unwrap_or("");
+        return if is_ip_literal(server) { "ip" } else { "name" };
+    }
+    let bytes = p.as_bytes();
+    if bytes.len() > 1 && bytes[1] == b':' {
+        let sysdrive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let sysdrive = sysdrive.trim_end_matches('\\').to_uppercase();
+        if p[..2].to_uppercase() != sysdrive {
+            return "drive";
+        }
+    }
+    "local"
+}
+
+/// Is this UNC server component a raw IP address rather than a PC name?
+fn is_ip_literal(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    // Windows spells an IPv6 share host as <addr-with-dashes>.ipv6-literal.net;
+    // treat that as an IP too, since it is an address, not a resolvable name.
+    h.parse::<std::net::IpAddr>().is_ok()
+        || h.to_ascii_lowercase().ends_with(".ipv6-literal.net")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,12 +646,24 @@ fn copy_into(src: &Path, dest_dir: &str, name: &str, keep: usize) -> Destination
 /// "Back up now" can never be the action that replaces good backups with an
 /// emptied database.
 pub fn run_once(pool: &DbPool, force: bool, allow_shrink: bool) -> BackupOutcome {
-    let Ok(_guard) = RUN_LOCK.try_lock() else {
-        return BackupOutcome {
-            skipped: true,
-            reason: "a backup is already running".into(),
-            ..Default::default()
-        };
+    // One backup at a time (rule 7) — but distinguish the two ways try_lock can
+    // fail. WouldBlock means a run really is in progress, so we stand down. A
+    // Poisoned lock means a PREVIOUS run panicked while holding it; the guarded
+    // value is only `()`, with no half-updated state to protect, so we take it
+    // over and carry on. Treating poison as "already running" (the old behaviour)
+    // would have stopped every backup, scheduled and manual alike, permanently
+    // after a single panic — a silent backup outage, the worst possible failure
+    // for the one thing whose entire job is to still be there after a failure.
+    let _guard = match RUN_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return BackupOutcome {
+                skipped: true,
+                reason: "a backup is already running".into(),
+                ..Default::default()
+            };
+        }
     };
 
     let dests = destinations(pool);
@@ -1184,5 +1291,171 @@ mod tests {
         assert!(!ok);
         assert!(started.elapsed() < PROBE_TIMEOUT + Duration::from_secs(2),
                 "the probe must be bounded by its timeout");
+    }
+
+    #[test]
+    fn a_share_by_name_is_durable_and_a_share_by_ip_is_fragile() {
+        // The name form survives a move; the IP form does not.
+        assert_eq!(destination_kind(r"\\SLAVE1\cops-backups"), "name");
+        assert_eq!(destination_kind("//slave-2/cops-backups"), "name");
+        assert_eq!(destination_kind(r"\\192.168.1.50\cops-backups"), "ip");
+        assert_eq!(destination_kind(r"\\10.0.0.7\backups"), "ip");
+        assert_eq!(destination_kind(r"\\[fe80::1]\backups"), "ip", "IPv6 literal");
+        // A hostname that merely contains digits is still a name, not an IP.
+        assert_eq!(destination_kind(r"\\PC-2024\backups"), "name");
+        // Drive letters and local folders are classified but not off-machine names.
+        assert_eq!(destination_kind(r"E:\Backups"), "drive");
+        assert_eq!(destination_kind(r"C:\ProgramData\COPS"), "local");
+    }
+
+    /// The one that matters most: a backup does not merely REPORT success, it
+    /// actually leaves the office's records on the other machine, decryptable with
+    /// the password, every single time — proven by reading them back, over and
+    /// over, exactly the failure a data-loss incident would be.
+    #[test]
+    fn the_data_is_actually_saved_and_recoverable_across_many_runs() {
+        let _serial = one_at_a_time();
+        let dir = tmpdir("recover_n");
+        let slave1 = dir.join("slave1");
+        let slave2 = dir.join("slave2");
+        std::fs::create_dir_all(&slave1).unwrap();
+        std::fs::create_dir_all(&slave2).unwrap();
+        let pool = test_pool(&dir, 5);   // opens with 5 cases already recorded
+        put_setting(&pool, "backup_dirs",
+                    &format!("{},{}", slave1.display(), slave2.display()));
+
+        // Open the newest archive this machine wrote to `folder`, decrypt it with
+        // the password, open the database inside, and return the case numbers it
+        // holds. This is the real recovery path, not a count in a manifest.
+        let recover = |folder: &Path| -> Vec<String> {
+            let newest = std::fs::read_dir(folder).unwrap().flatten()
+                .map(|e| e.path())
+                .filter(|p| p.file_name().and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("cops_auto_") && n.ends_with(ARCHIVE_EXT))
+                    .unwrap_or(false))
+                .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).unwrap())
+                .expect("an archive must exist in the folder");
+            let f = std::fs::File::open(&newest).unwrap();
+            let mut za = zip::ZipArchive::new(f).unwrap();
+            let mut entry = za
+                .by_name_decrypt(crate::backup_export::ENTRY_NAME,
+                                 crate::security::zip_password().as_bytes())
+                .expect("the archive must open with the password");
+            let tmp = folder.join("recovered.db");
+            let mut out = std::fs::File::create(&tmp).unwrap();
+            std::io::copy(&mut entry, &mut out).unwrap();
+            drop(out); drop(entry); drop(za);
+            let conn = rusqlite::Connection::open(&tmp).unwrap();
+            // The recovered database must itself be sound, not just openable.
+            let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap();
+            assert_eq!(ok, "ok", "the recovered database must pass its integrity check");
+            let mut st = conn
+                .prepare("SELECT os_no FROM cops_master ORDER BY CAST(os_no AS INTEGER)").unwrap();
+            let rows: Vec<String> = st.query_map([], |r| r.get::<_, String>(0)).unwrap()
+                .filter_map(|r| r.ok()).collect();
+            drop(st); drop(conn);
+            let _ = std::fs::remove_file(&tmp);
+            rows
+        };
+
+        // Ten rounds. Each records a new case, forces a backup, then proves BOTH
+        // folders hold an archive that decrypts to every case entered so far —
+        // including, by value, the one just added.
+        for round in 1..=10 {
+            let n = 5 + round;
+            pool.get().unwrap().execute(
+                "INSERT INTO cops_master(os_no, os_date, os_year, pax_name) VALUES (?1,?2,?3,?4)",
+                params![format!("{n}"), "2026-08-09", 2026, "z".repeat(300)]).unwrap();
+
+            let out = run_once(&pool, true, false);
+            assert!(out.ok, "round {round}: the backup must actually save: {}", out.reason);
+
+            for folder in [&slave1, &slave2] {
+                let cases = recover(folder);
+                assert_eq!(cases.len() as i64, n,
+                           "round {round}: {} must hold all {n} cases, held {}",
+                           folder.display(), cases.len());
+                assert!(cases.contains(&format!("{n}")),
+                        "round {round}: the case just entered must be in the recovered data");
+            }
+        }
+
+        // The safety floor must never let a bad run destroy the good copies: an
+        // emptied database is REFUSED, and the last archive still recovers all 15.
+        pool.get().unwrap().execute("DELETE FROM cops_master", []).unwrap();
+        let refused = run_once(&pool, true, false);
+        assert!(refused.refused, "an emptied database must be refused, not written");
+        assert_eq!(recover(&slave1).len(), 15,
+                   "after a refused run the last good backup still recovers every case");
+        assert_eq!(recover(&slave2).len(), 15, "on both folders");
+    }
+
+    /// Not just the OS register — the revenue (DCR) module's data too, which is
+    /// the one the rule "every table that has rows" exists to never silently drop.
+    #[test]
+    fn the_backup_carries_the_os_and_the_revenue_data() {
+        let _serial = one_at_a_time();
+        let dir = tmpdir("modules");
+        let slave = dir.join("slave");
+        std::fs::create_dir_all(&slave).unwrap();
+        let pool = test_pool(&dir, 3);   // 3 OS cases
+
+        // Revenue register — a shift and its duty lines.
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO dcr_sessions (report_date, shift, created_at)
+                 VALUES ('2026-08-09','DAY',datetime('now'))", []).unwrap();
+            let sid: i64 = conn.query_row("SELECT id FROM dcr_sessions LIMIT 1", [], |r| r.get(0)).unwrap();
+            for i in 1..=4 {
+                conn.execute(
+                    "INSERT INTO dcr_entries (session_id, sort_order, sl_no, os_ref, total_duty)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![sid, i, i, format!("{i}/2026"), 1000.0 * i as f64]).unwrap();
+            }
+        }
+        put_setting(&pool, "backup_dirs", slave.to_str().unwrap());
+        assert!(run_once(&pool, true, false).ok, "the backup must succeed");
+
+        // Open the archive and count each module's rows in the recovered database.
+        let newest = std::fs::read_dir(&slave).unwrap().flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str())
+                .map(|n| n.starts_with("cops_auto_") && n.ends_with(ARCHIVE_EXT)).unwrap_or(false))
+            .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).unwrap())
+            .expect("an archive must exist");
+        let f = std::fs::File::open(&newest).unwrap();
+        let mut za = zip::ZipArchive::new(f).unwrap();
+        let mut entry = za.by_name_decrypt(crate::backup_export::ENTRY_NAME,
+            crate::security::zip_password().as_bytes()).expect("opens with the password");
+        let rec = slave.join("rec.db");
+        std::io::copy(&mut entry, &mut std::fs::File::create(&rec).unwrap()).unwrap();
+        drop(entry); drop(za);
+        let conn = rusqlite::Connection::open(&rec).unwrap();
+        let count = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count("cops_master"), 3, "the OS register must be in the backup");
+        assert_eq!(count("dcr_sessions"), 1, "the revenue shift must be in the backup");
+        assert_eq!(count("dcr_entries"), 4, "every revenue duty line must be in the backup");
+    }
+
+    #[test]
+    fn a_local_copy_is_always_first_and_never_duplicated() {
+        // The local folder leads, and the off-machine slaves follow.
+        let d = with_local_copy(Some(r"C:\AppData\COPS\backups"),
+                                vec![r"\\SLAVE1\b".into(), r"\\SLAVE2\b".into()]);
+        assert_eq!(d, vec![r"C:\AppData\COPS\backups", r"\\SLAVE1\b", r"\\SLAVE2\b"]);
+
+        // If the office already listed that same local folder, it is not added
+        // twice — case- and trailing-separator-insensitive.
+        let d = with_local_copy(Some(r"C:\AppData\COPS\backups"),
+                                vec![r"c:\appdata\cops\backups\".into(), r"\\SLAVE1\b".into()]);
+        assert_eq!(d, vec![r"C:\AppData\COPS\backups", r"\\SLAVE1\b"],
+                   "the same folder must not be backed up to twice");
+
+        // With no local dir set (as in tests), only the configured folders remain.
+        let d = with_local_copy(None, vec![r"\\SLAVE1\b".into()]);
+        assert_eq!(d, vec![r"\\SLAVE1\b"]);
     }
 }

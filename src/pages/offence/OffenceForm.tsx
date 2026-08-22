@@ -1797,37 +1797,6 @@ export default function OffenceForm() {
         </div>
         </fieldset>
 
-      {/* Warning Note about Default Values */}
-      {!isViewOnly && (
-        <div className="bg-amber-50 border-l-4 border-amber-500 p-4 mt-6 rounded-r-lg">
-        <div className="flex items-start">
-          <div className="flex-shrink-0 mt-0.5">
-            <AlertCircle className="h-5 w-5 text-amber-600" aria-hidden="true" />
-          </div>
-          <div className="ml-3">
-            <h3 className="text-sm font-bold text-amber-800 uppercase tracking-wider">
-              {isEditing ? 'Please Review Your Selections' : 'Please Review Default Selections'}
-            </h3>
-            <div className="mt-2 text-sm text-amber-700">
-              <p>
-                {isEditing 
-                  ? 'Please review the following key selections and change them if necessary before submitting the O.S. for adjudication:'
-                  : 'The system has pre-selected some data by default. Please verify and change them if necessary before submitting the O.S. for adjudication:'}
-              </p>
-              <ul className="list-disc pl-5 mt-1 space-y-1 font-medium">
-                <li><b>Shift:</b> {formData.shift}</li>
-                <li><b>Booked By:</b> {formData.booked_by}</li>
-                <li><b>Case Type:</b> {formData.case_type}</li>
-                <li><b>Nationality:</b> {formData.pax_nationality}</li>
-                <li><b>Normal Residence At:</b> {formData.residence_at || 'INDIA'}</li>
-                <li><b>{formData.case_type === 'Export Case' ? 'Supposed Destination' : 'Arrived From'}:</b> {formData.arrived_from}</li>
-              </ul>
-            </div>
-          </div>
-        </div>
-      </div>
-      )}
-
       {/* Form Action Buttons at Bottom */}
       {!isViewOnly && (
       <div className="flex space-x-4 justify-end bg-white p-4 rounded-xl border border-slate-200 mt-4 mb-8">

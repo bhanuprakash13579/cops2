@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate, useLocation, Navigate } from 'react-router-dom';
 import { useState } from 'react';
-import { ShieldAlert, FileText, Plus, LogOut, Menu, User, KeyRound, Users, ClipboardList } from 'lucide-react';
+import { ShieldAlert, FileText, Plus, LogOut, Menu, User, KeyRound, ClipboardList } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 
 export default function SDOLayout() {
@@ -63,13 +63,9 @@ export default function SDOLayout() {
               </>
             )}
 
-            {user?.user_status !== 'TEMP' && (
-              <>
-                <p className="text-blue-400/70 text-xs uppercase tracking-widest font-semibold px-3 mt-4 mb-3 whitespace-nowrap transition-opacity duration-300" style={{ opacity: isCollapsed ? 0 : 1, height: isCollapsed ? 0 : 'auto', overflow: 'hidden', margin: isCollapsed ? 0 : undefined }}>Administration</p>
-                <NavItem to="/sdo/users" icon={<Users size={24}/>} label="Manage Users" color="blue" id="nav-manage-users" end={false} collapsed={isCollapsed} />
-              </>
-            )}
-            
+            {/* Managing accounts is the user admin's job (a designated AC/DC),
+                not something every SDO login can do. No "Manage Users" here. */}
+
           </nav>
 
           <div className="mt-6 px-3">
@@ -110,8 +106,9 @@ export default function SDOLayout() {
       {/* Main Content */}
       <main className="flex-1 flex flex-col min-h-screen print:h-auto print:overflow-visible">
         <div className="flex-1 min-h-0 p-4 md:p-6 print:overflow-visible print:p-0">
-          {user?.user_status === 'TEMP' && !location.pathname.endsWith('/users') ? (
-            <Navigate to="/sdo/users" replace />
+          {user?.user_status === 'TEMP' && !location.pathname.endsWith('/change-password') ? (
+            // A reset account must set its own password before doing anything else.
+            <Navigate to="/sdo/change-password" replace />
           ) : (
             <Outlet />
           )}

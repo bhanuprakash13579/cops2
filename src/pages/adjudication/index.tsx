@@ -1,10 +1,18 @@
 import { lazy, Suspense } from 'react';
-import { Routes, Route } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import AdjudicationLayout from './AdjudicationLayout';
 import AdjudicationList from './AdjudicationList';
 import AdjudicatedList from './AdjudicatedList';
 import UserManagement from '../users/UserManagement';
 import ChangePassword from '../auth/ChangePassword';
+import { useAuth } from '@/contexts/AuthContext';
+
+// The account-management screen belongs to the user admin alone. Gate it at the
+// route, not only in the menu, so typing the URL cannot reach it either.
+function UserAdminOnly({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return user?.is_user_admin ? <>{children}</> : <Navigate to="/adjudication" replace />;
+}
 
 // Lazy-load the heavy form components so navigation clicks are instant.
 // The browser parses these JS chunks only when the route is first visited.
@@ -34,10 +42,13 @@ export default function AdjudicationModule() {
         {/* Offline adjudication */}
         <Route path="offline-pending" element={<Suspense fallback={<RouteSpinner />}><OfflineAdjudicationList /></Suspense>} />
         <Route path="offline-case/:os_no/:os_year" element={<Suspense fallback={<RouteSpinner />}><OfflineAdjudicationComplete /></Suspense>} />
-        {/* User Management */}
-        <Route path="users" element={<UserManagement moduleType="adjudication" />} />
+        {/* User Management — user admin only, gated at the route */}
+        <Route path="users" element={<UserAdminOnly><UserManagement /></UserAdminOnly>} />
         {/* Change Password */}
         <Route path="change-password" element={<ChangePassword />} />
+        {/* Stray paths (including /adjudication/users reached without the role)
+            fall back to the module home rather than a blank frame. */}
+        <Route path="*" element={<Navigate to="/adjudication" replace />} />
       </Route>
     </Routes>
   );

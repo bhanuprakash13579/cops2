@@ -17,6 +17,8 @@ interface AutoBackupDestination {
   reachable: boolean;
   detail: string;
   off_machine: boolean;
+  addressing: 'name' | 'ip' | 'drive' | 'local';
+  last_ok: string | null;
 }
 
 interface AutoBackupStatus {
@@ -58,6 +60,7 @@ interface UserRow {
   user_role: string;
   user_status: string;
   created_on: string | null;
+  is_user_admin?: boolean;
 }
 
 const ALL_ROLES = ['SDO', 'DC', 'AC'];
@@ -157,14 +160,14 @@ export default function RestoreBackup() {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
-  const [newUser, setNewUser] = useState({ user_id: '', user_name: '', user_desig: '', user_pwd: '', user_role: 'SDO' });
+  const [newUser, setNewUser] = useState({ user_id: '', user_name: '', user_desig: '', user_pwd: '', user_role: 'SDO', is_user_admin: false });
   const [showNewPwd, setShowNewPwd] = useState(false);
   const [createErr, setCreateErr] = useState('');
   const [createMsg, setCreateMsg] = useState('');
 
   // Edit user
   const [editId, setEditId] = useState<number | null>(null);
-  const [editData, setEditData] = useState({ user_name: '', user_desig: '', user_pwd: '', user_role: '', user_status: '' });
+  const [editData, setEditData] = useState({ user_name: '', user_desig: '', user_pwd: '', user_role: '', user_status: '', is_user_admin: false });
   const [showEditPwd, setShowEditPwd] = useState(false);
   const [editMsg, setEditMsg] = useState('');
 
@@ -448,9 +451,10 @@ export default function RestoreBackup() {
         user_id: newUser.user_id,
         password: newUser.user_pwd,
         user_role: newUser.user_role,
+        is_user_admin: newUser.is_user_admin,
       }, { headers: adminHeaders(adminToken) });
       setCreateMsg(`User '${newUser.user_id}' created.`);
-      setNewUser({ user_id: '', user_name: '', user_desig: '', user_pwd: '', user_role: 'SDO' });
+      setNewUser({ user_id: '', user_name: '', user_desig: '', user_pwd: '', user_role: 'SDO', is_user_admin: false });
       setShowCreate(false);
       loadUsers();
     } catch (err: any) {
@@ -468,6 +472,9 @@ export default function RestoreBackup() {
     if (editData.user_pwd)    payload.password    = editData.user_pwd;
     if (editData.user_role)   payload.user_role   = editData.user_role;
     if (editData.user_status) payload.user_status = editData.user_status;
+    // Always sent, so the box can be cleared as well as set. The server refuses
+    // to place it on anyone but an AC/DC.
+    payload.is_user_admin = editData.is_user_admin;
     try {
       // Backend uses numeric id (Path<i64>), not user_id string
       await api.patch(`/admin/users/${editId}`, payload, { headers: adminHeaders(adminToken) });
@@ -1114,12 +1121,20 @@ export default function RestoreBackup() {
                 </div>
                 <div>
                   <label className="block text-xs text-slate-500 mb-1">Role</label>
-                  <select required value={newUser.user_role} onChange={e => setNewUser(p => ({ ...p, user_role: e.target.value }))}
+                  <select required value={newUser.user_role} onChange={e => setNewUser(p => ({ ...p, user_role: e.target.value, is_user_admin: (e.target.value === 'AC' || e.target.value === 'DC') && p.is_user_admin }))}
                     className="w-full border border-slate-200 rounded px-2 py-1.5 text-xs">
                     <option value="SDO">SDO — SDO Module</option>
                     <option value="DC">DC — Adjudication Module</option>
                     <option value="AC">AC — Adjudication Module</option>
                   </select>
+                </div>
+                <div className="col-span-2">
+                  <label className={`flex items-center gap-2 text-xs ${(newUser.user_role === 'AC' || newUser.user_role === 'DC') ? 'text-slate-700' : 'text-slate-400'}`}>
+                    <input type="checkbox" disabled={!(newUser.user_role === 'AC' || newUser.user_role === 'DC')}
+                      checked={newUser.is_user_admin}
+                      onChange={e => setNewUser(p => ({ ...p, is_user_admin: e.target.checked }))} />
+                    Make this user the <span className="font-semibold">user admin</span> — the one who manages accounts (AC/DC only)
+                  </label>
                 </div>
                 <div className="col-span-2">
                   <label className="block text-xs text-slate-500 mb-1">Initial Password</label>
@@ -1167,6 +1182,9 @@ export default function RestoreBackup() {
                           <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
                             u.user_role === 'SDO' ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'
                           }`}>{u.user_role}</span>
+                          {u.is_user_admin && (
+                            <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-100 text-purple-700">User Admin</span>
+                          )}
                         </td>
                         <td className="py-2 px-2">
                           <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
@@ -1176,7 +1194,7 @@ export default function RestoreBackup() {
                         <td className="py-2 px-2 flex gap-1 justify-end">
                           <button onClick={() => {
                             setEditId(u.id);
-                            setEditData({ user_name: u.user_name, user_desig: u.user_desig, user_pwd: '', user_role: u.user_role, user_status: u.user_status });
+                            setEditData({ user_name: u.user_name, user_desig: u.user_desig, user_pwd: '', user_role: u.user_role, user_status: u.user_status, is_user_admin: !!u.is_user_admin });
                             setEditMsg(''); setShowEditPwd(false);
                           }} className="p-1 rounded hover:bg-slate-100" title="Edit User">
                             <Pencil size={12} className="text-slate-500" />
@@ -1218,6 +1236,12 @@ export default function RestoreBackup() {
                                 <option value="ACTIVE">ACTIVE</option>
                                 <option value="CLOSED">CLOSED</option>
                               </select>
+                              <label className={`col-span-2 flex items-center gap-2 text-xs ${(editData.user_role === 'AC' || editData.user_role === 'DC') ? 'text-slate-700' : 'text-slate-400'}`}>
+                                <input type="checkbox" disabled={!(editData.user_role === 'AC' || editData.user_role === 'DC')}
+                                  checked={editData.is_user_admin}
+                                  onChange={e => setEditData(p => ({ ...p, is_user_admin: e.target.checked }))} />
+                                User admin — manages accounts (AC/DC only)
+                              </label>
                               <div className="flex gap-2 items-center">
                                 <button type="submit" className="px-3 py-1 text-xs rounded bg-slate-800 text-white hover:bg-slate-700">Save</button>
                                 <button type="button" onClick={() => setEditId(null)} className="px-3 py-1 text-xs rounded bg-slate-200 hover:bg-slate-300">Cancel</button>
@@ -1541,13 +1565,35 @@ export default function RestoreBackup() {
                   {autoStatus.destinations.map((d) => (
                     <li key={d.path} className="flex items-start gap-2 text-xs">
                       <span className={`mt-0.5 w-2 h-2 rounded-full shrink-0 ${d.reachable ? 'bg-emerald-500' : 'bg-red-500'}`} />
-                      <span className="font-mono text-slate-700 break-all">{d.path}</span>
-                      <span className={d.reachable ? 'text-slate-500' : 'text-red-600'}>
-                        {d.reachable ? (d.off_machine ? 'another machine' : 'this machine') : d.detail}
-                      </span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono text-slate-700 break-all">{d.path}</span>
+                          {d.off_machine && d.addressing === 'ip' && (
+                            <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold whitespace-nowrap">by IP · fragile</span>
+                          )}
+                          {d.off_machine && d.addressing === 'name' && (
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-semibold whitespace-nowrap">by name · durable</span>
+                          )}
+                        </div>
+                        <span className={d.reachable ? 'text-slate-500' : 'text-red-600'}>
+                          {d.reachable ? (d.off_machine ? 'another machine' : 'this machine') : d.detail}
+                          {d.reachable && d.off_machine && d.last_ok &&
+                            ` · last copied ${new Date(d.last_ok).toLocaleString()}`}
+                        </span>
+                      </div>
                     </li>
                   ))}
                 </ul>
+                {autoStatus.destinations.some(d => d.off_machine && d.addressing === 'ip') && (
+                  <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    <strong>A backup folder is set by IP address.</strong> It will stop working if
+                    that PC&rsquo;s address changes — which happens whenever the network is moved or
+                    the router hands out addresses again. Enter it by the PC&rsquo;s <strong>name</strong>{' '}
+                    instead (e.g. <span className="font-mono">\\SLAVE1\cops-backups</span>), or reserve
+                    a fixed address for that PC on the router. A name-based folder finds the PC on any
+                    LAN automatically.
+                  </p>
+                )}
                 {!autoStatus.any_off_machine && (
                   <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
                     Every backup folder is on this computer. If this machine fails, the

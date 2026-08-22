@@ -1,8 +1,7 @@
 import { lazy, Suspense } from 'react';
-import { Routes, Route } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import SDOLayout from './SDOLayout';
 import OffenceList from '../offence/OffenceList';
-import UserManagement from '../users/UserManagement';
 import ChangePassword from '../auth/ChangePassword';
 
 const OffenceForm = lazy(() => import('../offence/OffenceForm'));
@@ -22,8 +21,10 @@ export default function SDOModule() {
         <Route path="offline-adjudication/:osNo/:osYear/edit" element={<Suspense fallback={<RouteSpinner />}><OfflineAdjudicationForm /></Suspense>} />
         <Route path="offence/:osNo/:osYear/edit" element={<Suspense fallback={<RouteSpinner />}><OffenceForm /></Suspense>} />
         <Route path="offence/:osNo/:osYear/view" element={<Suspense fallback={<RouteSpinner />}><OffenceForm /></Suspense>} />
-        <Route path="users" element={<UserManagement moduleType="sdo" />} />
         <Route path="change-password" element={<ChangePassword />} />
+        {/* Any stray /sdo/* path — e.g. the removed Manage Users bookmark —
+            lands back on the module home rather than a blank frame. */}
+        <Route path="*" element={<Navigate to="/sdo" replace />} />
       </Route>
     </Routes>
   );

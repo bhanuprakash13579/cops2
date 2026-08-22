@@ -108,6 +108,169 @@ async fn an_officer_can_read_status_and_an_anonymous_caller_cannot() {
 }
 
 #[tokio::test]
+async fn anyone_at_the_machine_can_force_a_sync_and_the_reply_leaks_nothing() {
+    // The "Sync now" / "Back up now" button. It is offered on the pre-login main
+    // page too, so it is deliberately NOT behind a token — safe because the server
+    // binds to 127.0.0.1 and the action exposes no data. With no folders set it
+    // reports that plainly, and its reply carries only counts, never paths.
+    let (base, _d) = serve().await;
+    let c = reqwest::Client::new();
+
+    // No token needed — an anonymous POST succeeds, because the main page has no
+    // signed-in user yet.
+    let anon = c.post(format!("{base}/backup/sync")).send().await.unwrap();
+    assert_eq!(anon.status(), 200, "the sync button works before anyone signs in");
+    let body: serde_json::Value = anon.json().await.unwrap();
+
+    // No destinations in the test DB — it skips cleanly and says why.
+    assert_eq!(body["skipped"], true, "body was {body}");
+    assert_eq!(body["refused"], false, "a plain sync never forces past the safety floor: {body}");
+    assert_eq!(body["total"], 0, "no folders configured means nowhere to copy: {body}");
+
+    // The reply must leak NOTHING about the office's layout or data — counts and a
+    // safe reason only, never destination paths, row counts, or the archive name.
+    assert!(body.get("destinations").is_none(), "the reply must not carry folder paths: {body}");
+    assert!(body.get("file").is_none(), "the reply must not carry the archive name: {body}");
+    let allowed = ["ok", "skipped", "refused", "copied", "total", "reason"];
+    for k in body.as_object().unwrap().keys() {
+        assert!(allowed.contains(&k.as_str()), "unexpected field in the public reply: {k}");
+    }
+}
+
+#[tokio::test]
+async fn only_the_user_admin_may_manage_accounts_and_the_role_hands_over() {
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+
+    // A designated user admin (an AC holding the flag) and an ordinary SDO.
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO users (user_name, user_desig, user_id, user_pwd, user_role, user_status, is_user_admin)
+             VALUES ('Admin AC','AC','ua','x','AC','ACTIVE',1)", []).unwrap();
+        conn.execute(
+            "INSERT INTO users (user_name, user_desig, user_id, user_pwd, user_role, user_status, is_user_admin)
+             VALUES ('Plain SDO','Supdt','sdo1','x','SDO','ACTIVE',0)", []).unwrap();
+    }
+    let ua_token  = auth::create_token("ua",   "AC",  "Admin AC", Some("AC"),    "ACTIVE").unwrap();
+    let sdo_token = auth::create_token("sdo1", "SDO", "Plain SDO", Some("Supdt"), "ACTIVE").unwrap();
+
+    // An ordinary SDO may neither create an account nor read the roster.
+    let denied = c.post(format!("{base}/auth/users")).bearer_auth(&sdo_token)
+        .json(&serde_json::json!({"user_name":"X","user_id":"x1","password":"secret1","user_role":"SDO"}))
+        .send().await.unwrap();
+    assert_eq!(denied.status(), 403, "an ordinary SDO must not create accounts");
+    let denied_list = c.get(format!("{base}/auth/users")).bearer_auth(&sdo_token).send().await.unwrap();
+    assert_eq!(denied_list.status(), 403, "an ordinary SDO must not read the roster");
+
+    // The user admin may create any of the three roles.
+    for role in ["SDO", "AC", "DC"] {
+        let r = c.post(format!("{base}/auth/users")).bearer_auth(&ua_token)
+            .json(&serde_json::json!({
+                "user_name": format!("New {role}"), "user_id": format!("new_{role}"),
+                "password": "secret1", "user_role": role}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), 200, "the user admin creates a {role}");
+    }
+
+    // Reset a forgotten password: the account goes TEMP, the user signs in with
+    // the one-time password, then must choose their own before it reads ACTIVE.
+    let sdo_id: i64 = pool.get().unwrap()
+        .query_row("SELECT id FROM users WHERE user_id='sdo1'", [], |r| r.get(0)).unwrap();
+    let reset = c.post(format!("{base}/auth/users/{sdo_id}/reset-password")).bearer_auth(&ua_token)
+        .json(&serde_json::json!({"temp_password":"Temp#123"})).send().await.unwrap();
+    assert_eq!(reset.status(), 200, "the user admin resets a password");
+
+    let login: serde_json::Value = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({"user_id":"sdo1","password":"Temp#123"}))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(login["user_status"], "TEMP", "a reset account is TEMP until the user picks a new password");
+
+    let temp_tok = login["access_token"].as_str().unwrap();
+    let change = c.post(format!("{base}/auth/change-password")).bearer_auth(temp_tok)
+        .json(&serde_json::json!({"old_password":"Temp#123","new_password":"BrandNew#1"}))
+        .send().await.unwrap();
+    assert_eq!(change.status(), 200, "the user changes the temp password");
+    let relogin: serde_json::Value = c.post(format!("{base}/auth/login"))
+        .json(&serde_json::json!({"user_id":"sdo1","password":"BrandNew#1"}))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(relogin["user_status"], "ACTIVE", "and the account is active again");
+
+    // Hand over the role to a DC, atomically, and only to an AC/DC.
+    pool.get().unwrap().execute(
+        "INSERT INTO users (user_name, user_id, user_pwd, user_role, user_status, is_user_admin)
+         VALUES ('The DC','dc9','x','DC','ACTIVE',0)", []).unwrap();
+    let handover = c.post(format!("{base}/auth/user-admin/transfer")).bearer_auth(&ua_token)
+        .json(&serde_json::json!({"user_id":"dc9"})).send().await.unwrap();
+    assert_eq!(handover.status(), 200, "the user admin hands the role to a DC");
+    {
+        let conn = pool.get().unwrap();
+        let old: i64 = conn.query_row("SELECT is_user_admin FROM users WHERE user_id='ua'",  [], |r| r.get(0)).unwrap();
+        let new: i64 = conn.query_row("SELECT is_user_admin FROM users WHERE user_id='dc9'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 0, "the former holder gives the role up");
+        assert_eq!(new, 1, "the new holder has it");
+    }
+
+    // Revocation is immediate: the former holder's token no longer creates users.
+    let after = c.post(format!("{base}/auth/users")).bearer_auth(&ua_token)
+        .json(&serde_json::json!({"user_name":"Nope","user_id":"nope","password":"secret1","user_role":"SDO"}))
+        .send().await.unwrap();
+    assert_eq!(after.status(), 403, "handing the role over strips the power at once, not at token expiry");
+
+    // The new holder cannot pass the role to an ordinary SDO.
+    let dc9_token = auth::create_token("dc9", "DC", "The DC", Some("DC"), "ACTIVE").unwrap();
+    let bad = c.post(format!("{base}/auth/user-admin/transfer")).bearer_auth(&dc9_token)
+        .json(&serde_json::json!({"user_id":"sdo1"})).send().await.unwrap();
+    assert_eq!(bad.status(), 400, "the user admin must be an AC or a DC");
+}
+
+#[tokio::test]
+async fn the_user_admin_role_cannot_be_orphaned_bypassed_or_used_to_revive_an_account() {
+    let (base, _d, pool) = serve_with_pool(0).await;
+    let c = reqwest::Client::new();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO users (user_name, user_id, user_pwd, user_role, user_status, is_user_admin)
+             VALUES ('Admin AC','ua','x','AC','ACTIVE',1)", []).unwrap();
+        conn.execute(
+            "INSERT INTO users (user_name, user_id, user_pwd, user_role, user_status, is_user_admin)
+             VALUES ('Plain SDO','sdo1','x','SDO','ACTIVE',0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO users (user_name, user_id, user_pwd, user_role, user_status, is_user_admin)
+             VALUES ('Gone','ex','x','SDO','CLOSED',0)", []).unwrap();
+    }
+    let ua_token  = auth::create_token("ua",   "AC",  "Admin AC",  Some("AC"),    "ACTIVE").unwrap();
+    let sdo_token = auth::create_token("sdo1", "SDO", "Plain SDO", Some("Supdt"), "ACTIVE").unwrap();
+    let id_of = |uid: &str| -> i64 {
+        pool.get().unwrap().query_row("SELECT id FROM users WHERE user_id=?", [uid], |r| r.get(0)).unwrap()
+    };
+
+    // An ordinary officer cannot flip anyone's status through update_user — the
+    // hole that let an SDO close the user admin out.
+    let hole = c.put(format!("{base}/auth/users/{}", id_of("ua"))).bearer_auth(&sdo_token)
+        .json(&serde_json::json!({"user_status":"CLOSED"})).send().await.unwrap();
+    assert_eq!(hole.status(), 403, "an SDO must not be able to set another account's status");
+    let still: String = pool.get().unwrap()
+        .query_row("SELECT user_status FROM users WHERE user_id='ua'", [], |r| r.get(0)).unwrap();
+    assert_eq!(still, "ACTIVE", "and the user admin's account must be untouched");
+
+    // The user admin cannot close themselves while they still hold the role —
+    // the office would be left with no account-keeper.
+    let orphan = c.delete(format!("{base}/auth/users/{}", id_of("ua"))).bearer_auth(&ua_token)
+        .send().await.unwrap();
+    assert_eq!(orphan.status(), 400, "the user admin must hand the role over before closing their account");
+
+    // A reset must not resurrect a closed account by putting it back in TEMP.
+    let revive = c.post(format!("{base}/auth/users/{}/reset-password", id_of("ex"))).bearer_auth(&ua_token)
+        .json(&serde_json::json!({"temp_password":"Temp#123"})).send().await.unwrap();
+    assert_eq!(revive.status(), 400, "a closed account cannot be reopened by a password reset");
+    let gone: String = pool.get().unwrap()
+        .query_row("SELECT user_status FROM users WHERE user_id='ex'", [], |r| r.get(0)).unwrap();
+    assert_eq!(gone, "CLOSED", "and it stays closed");
+}
+
+#[tokio::test]
 async fn changing_where_backups_go_needs_the_administrator() {
     let (base, _d) = serve().await;
     let c = reqwest::Client::new();
@@ -2478,7 +2641,7 @@ async fn a_user_can_be_created_listed_and_have_their_role_changed() {
     let c = reqwest::Client::new();
     let t = admin_token();
 
-    let r = c.post(format!("{base}/auth/users")).bearer_auth(&t)
+    let r = c.post(format!("{base}/admin/users")).bearer_auth(&t)
         .json(&serde_json::json!({
             "user_id": "testofficer", "user_name": "TEST OFFICER",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
@@ -2487,7 +2650,7 @@ async fn a_user_can_be_created_listed_and_have_their_role_changed() {
     let body = r.text().await.unwrap();
     assert!(st.is_success(), "creating a user failed: {st} {body}");
 
-    let list: serde_json::Value = c.get(format!("{base}/auth/users")).bearer_auth(&t)
+    let list: serde_json::Value = c.get(format!("{base}/admin/users")).bearer_auth(&t)
         .send().await.unwrap().json().await.unwrap();
     let arr = list.as_array().cloned()
         .or_else(|| list["items"].as_array().cloned()).unwrap_or_default();
@@ -2499,7 +2662,7 @@ async fn a_user_can_be_created_listed_and_have_their_role_changed() {
 async fn signing_in_works_and_a_wrong_password_is_refused() {
     let (base, _d) = serve().await;
     let c = reqwest::Client::new();
-    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+    c.post(format!("{base}/admin/users")).bearer_auth(admin_token())
         .json(&serde_json::json!({
             "user_id": "loginuser", "user_name": "LOGIN USER",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
@@ -3154,7 +3317,7 @@ async fn a_master_list_entry_can_be_added_and_is_then_offered() {
 async fn an_officer_can_change_their_own_password_and_the_old_one_stops_working() {
     let (base, _d) = serve().await;
     let c = reqwest::Client::new();
-    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+    c.post(format!("{base}/admin/users")).bearer_auth(admin_token())
         .json(&serde_json::json!({
             "user_id": "pwduser", "user_name": "PWD USER",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
@@ -3190,7 +3353,7 @@ async fn a_wrong_current_password_cannot_change_the_password() {
     // Otherwise anyone at an unattended terminal takes the account.
     let (base, _d) = serve().await;
     let c = reqwest::Client::new();
-    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+    c.post(format!("{base}/admin/users")).bearer_auth(admin_token())
         .json(&serde_json::json!({
             "user_id": "guarded", "user_name": "GUARDED",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
@@ -3218,7 +3381,7 @@ async fn who_am_i_reports_the_signed_in_officer() {
     let c = reqwest::Client::new();
     // A real account, signed in properly — the shared test token belongs to a
     // user that was never inserted, and /auth/me is right to refuse it.
-    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+    c.post(format!("{base}/admin/users")).bearer_auth(admin_token())
         .json(&serde_json::json!({
             "user_id": "whoami", "user_name": "WHO AM I",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
@@ -3355,7 +3518,7 @@ async fn removing_a_user_keeps_the_cases_they_booked() {
     let c = reqwest::Client::new();
     let t = admin_token();
 
-    c.post(format!("{base}/auth/users")).bearer_auth(&t)
+    c.post(format!("{base}/admin/users")).bearer_auth(&t)
         .json(&serde_json::json!({
             "user_id": "leaver", "user_name": "DEPARTING OFFICER",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
@@ -3392,20 +3555,30 @@ async fn removing_a_user_keeps_the_cases_they_booked() {
 }
 
 #[tokio::test]
-async fn a_role_can_be_changed_and_a_nonsense_role_refused() {
-    let (base, _d) = serve().await;
+async fn a_role_can_be_changed_by_the_user_admin_and_a_nonsense_role_refused() {
+    let (base, _d, pool) = serve_with_pool(0).await;
     let c = reqwest::Client::new();
-    c.post(format!("{base}/auth/users")).bearer_auth(admin_token())
+    // The user who will be promoted, and the user admin who does it.
+    c.post(format!("{base}/admin/users")).bearer_auth(admin_token())
         .json(&serde_json::json!({
             "user_id": "promoted", "user_name": "TO BE PROMOTED",
             "password": "Str0ng#Pass1", "user_role": "SDO", "user_desig": "Supdt."
         })).send().await.unwrap();
+    pool.get().unwrap().execute(
+        "INSERT INTO users (user_name, user_id, user_pwd, user_role, user_status, is_user_admin)
+         VALUES ('Admin DC','uadmin','x','DC','ACTIVE',1)", []).unwrap();
+    let ua = auth::create_token("uadmin", "DC", "Admin DC", Some("DC"), "ACTIVE").unwrap();
 
-    let ok = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(dc_token())
+    // A plain DC (not the user admin) can no longer reshape the roster.
+    let denied = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(dc_token())
+        .json(&serde_json::json!({ "user_role": "AC" })).send().await.unwrap();
+    assert_eq!(denied.status(), 403, "only the user admin may change roles now");
+
+    let ok = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(&ua)
         .json(&serde_json::json!({ "user_role": "AC" })).send().await.unwrap();
     assert!(ok.status().is_success(), "changing the role failed: {}", ok.text().await.unwrap());
 
-    let bad = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(dc_token())
+    let bad = c.patch(format!("{base}/auth/users/promoted/role")).bearer_auth(&ua)
         .json(&serde_json::json!({ "user_role": "EMPEROR" })).send().await.unwrap();
     assert_eq!(bad.status(), 400, "a role that does not exist must be refused");
 }

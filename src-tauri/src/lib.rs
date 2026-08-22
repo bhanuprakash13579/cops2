@@ -493,13 +493,25 @@ pub fn run() {
 
             let pool = Arc::new(pool);
 
+            // A backup copy that ALWAYS lands, on this machine, on top of any
+            // off-machine folders. The office runs its other PCs asleep most of
+            // the time; without a local copy a run that found every slave folder
+            // unreachable would save the backup nowhere. This is the floor
+            // beneath the networked copies — see backup_service::set_local_dir.
+            let local_backup_dir = app_data.join("backups");
+            if let Err(e) = std::fs::create_dir_all(&local_backup_dir) {
+                tracing::warn!("could not create local backup folder {}: {e}",
+                               local_backup_dir.display());
+            }
+            backup_service::set_local_dir(local_backup_dir.to_string_lossy().into_owned());
+
             // Automatic backups. Starts a timer and returns immediately — the
             // first run is delayed so it does not compete with startup, and the
             // orphan sweep happens on that first tick rather than here, because
             // it walks the destination folders and a switched-off machine would
             // otherwise delay the application appearing.
             //
-            // Does nothing at all until a destination folder is configured.
+            // Always has at least the local folder above to write to.
             backup_service::start(pool.clone());
             // And the copy that leaves the building. It checks every few hours
             // whether thirty days have passed, rather than firing on a date an
@@ -576,9 +588,33 @@ pub fn run() {
                 .allow_methods(Any)
                 .allow_headers(Any);
 
+            // A last-resort net under every handler. Without it, a panic anywhere
+            // in a request — a backup, a report, anything — drops the connection
+            // with no reply, and the screen shows only an opaque network error.
+            // With it, the panic is logged HERE (for us), and the caller gets a
+            // clean, generic 500 that says something went wrong and to try again —
+            // never the panic text, a path, or any internal detail a probing
+            // client could learn from. The application process itself never falls
+            // over: one request failing does not take the others down.
+            let catch_panic = tower_http::catch_panic::CatchPanicLayer::custom(
+                |err: Box<dyn std::any::Any + Send + 'static>| {
+                    use axum::response::IntoResponse;
+                    let detail = err.downcast_ref::<&str>().map(|s| s.to_string())
+                        .or_else(|| err.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    tracing::error!("a request handler panicked: {detail}");
+                    let body = axum::Json(serde_json::json!({
+                        "detail": "Something went wrong on this machine. Please try again. \
+                                   If it keeps happening, contact support."
+                    }));
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+                },
+            );
+
             let router = api::build_app(pool_clone)
                 .layer(cors)
-                .layer(CompressionLayer::new());
+                .layer(CompressionLayer::new())
+                .layer(catch_panic);
 
             // ── Port binding with SO_REUSEADDR ────────────────────────────────
             // Using socket2 to set SO_REUSEADDR before bind.  Without this,

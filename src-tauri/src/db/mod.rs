@@ -102,6 +102,12 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         ("dcr_formula_rules", "lineage_id",     "INTEGER"),
         ("dcr_formula_rules", "effective_from", "TEXT"),
         ("dcr_formula_rules", "changed_by",     "TEXT"),
+        // The user admin — one designated AC/DC who alone may add, close, or reset
+        // the office's user accounts. A flag, not a role: the person keeps doing
+        // their own job and holds this authority beside it, and it moves from one
+        // officer to another by being cleared here and set there. Every existing
+        // user defaults to 0 — no one holds it until the system admin grants it.
+        ("users", "is_user_admin", "INTEGER NOT NULL DEFAULT 0"),
     ];
     for (table, col, col_type) in &col_migrations {
         let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, col_type);

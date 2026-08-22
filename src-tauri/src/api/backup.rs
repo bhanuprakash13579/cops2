@@ -1858,8 +1858,18 @@ pub async fn auto_status(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>
             .map(|d| {
                 let (ok, detail) = crate::backup_service::probe_destination(&d);
                 let remote = crate::backup_service::is_remote(&d);
+                let addressing = crate::backup_service::destination_kind(&d);
+                // When this exact folder last received a copy. The global
+                // last_success only means SOME destination succeeded, so a single
+                // slave going silent would hide behind a sibling that still works
+                // — this per-folder time is what makes that visible.
+                let last_ok = crate::backup_service::last_ok_for(&p, &d);
                 serde_json::json!({
                     "path": d, "reachable": ok, "detail": detail, "off_machine": remote,
+                    // How the other PC is named — "name" survives a network move,
+                    // "ip" is fragile, "drive" is opaque, "local" is on this PC.
+                    "addressing": addressing,
+                    "last_ok": last_ok,
                 })
             })
             .collect::<Vec<_>>()
@@ -1941,6 +1951,79 @@ pub async fn auto_run_now(
     Ok(Json(serde_json::to_value(outcome).map_err(|e| e500(&e.to_string()))?))
 }
 
+/// Force a backup to the slave machines now, rather than waiting out the rest of
+/// the half-hour interval — the "Sync now" button, offered both inside the app
+/// and on the pre-login main page.
+///
+/// Deliberately NOT behind a login. The main page is shown before anyone signs
+/// in, and the whole point is that anyone at the machine can top up the office
+/// copies before they leave. That is safe precisely here: the server binds to
+/// 127.0.0.1, so this can only be reached FROM the master machine itself, never
+/// the LAN or the internet — whoever can call it is already standing at the
+/// machine. The action exposes nothing: it produces an encrypted archive
+/// (useless without the password) and streams it to already-configured folders.
+/// `allow_shrink` stays false, so it can never be the action that overwrites good
+/// backups with an emptied database, and RUN_LOCK means pressing it repeatedly
+/// cannot stack up work. Backups already run with no one signed in; this is the
+/// manual twin of that timer.
+/// Shortest gap between two manual syncs actually doing work. CORS stops a
+/// malicious page reading a reply, but not firing the POST; without a floor a
+/// cross-site loop could keep the disk exporting back-to-back. Legitimate use —
+/// press it after waking a slave — is nowhere near this fast.
+static LAST_MANUAL_SYNC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const MANUAL_SYNC_MIN_GAP_SECS: i64 = 15;
+
+pub async fn sync_now(State(pool): Db) -> Result<Json<Value>, Err> {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_MANUAL_SYNC.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < MANUAL_SYNC_MIN_GAP_SECS {
+        return Ok(Json(serde_json::json!({
+            "ok": true, "skipped": true, "copied": 0, "total": 0,
+            "reason": "a backup was taken a moment ago",
+        })));
+    }
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::backup_service::run_once(&pool, true, false)
+    })
+    .await
+    .map_err(|e| e500(&e.to_string()))?;
+
+    // The throttle is armed only when a backup ACTUALLY ran — never for a no-op
+    // (no folders configured, or another run already in progress). So a genuine
+    // export cannot be repeated back-to-back by a loop, while a legitimate retry
+    // after fixing the configuration is not made to wait.
+    if !outcome.skipped {
+        LAST_MANUAL_SYNC.store(now, Ordering::Relaxed);
+    }
+
+    // A deliberately MINIMAL reply — counts only, never the destination paths,
+    // row counts, or archive name. So even if the response is somehow read (a
+    // hostile program already on this machine, say), it learns nothing about the
+    // office's layout or the size of its data. The detailed, per-folder health is
+    // only ever served to a signed-in officer, through /backup/auto/status.
+    let copied = outcome.destinations.iter().filter(|d| d.ok).count();
+    let total = outcome.destinations.len();
+    let reason = if outcome.refused {
+        "refused as a safeguard — a possible loss of records was detected"
+    } else if outcome.reason.contains("already running") {
+        "a backup is already running"
+    } else if outcome.reason.contains("no destinations") {
+        "no backup folders are configured"
+    } else {
+        ""
+    };
+    Ok(Json(serde_json::json!({
+        "ok": outcome.ok,
+        "skipped": outcome.skipped,
+        "refused": outcome.refused,
+        "copied": copied,
+        "total": total,
+        "reason": reason,
+    })))
+}
+
 #[derive(serde::Deserialize)]
 pub struct AutoSettings {
     pub dirs: Option<String>,
@@ -1980,13 +2063,14 @@ pub async fn auto_test_folder(
         return Err(e400("no folder given"));
     }
     let remote = crate::backup_service::is_remote(&path);
+    let addressing = crate::backup_service::destination_kind(&path);
     let (ok, detail) = tokio::task::spawn_blocking(move || {
         crate::backup_service::probe_destination(&path)
     })
     .await
     .map_err(|e| e500(&e.to_string()))?;
     Ok(Json(serde_json::json!({
-        "ok": ok, "detail": detail, "off_machine": remote,
+        "ok": ok, "detail": detail, "off_machine": remote, "addressing": addressing,
     })))
 }
 

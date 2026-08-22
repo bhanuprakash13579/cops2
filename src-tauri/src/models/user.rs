@@ -52,6 +52,11 @@ pub struct CreateUserRequest {
     pub user_id: String,
     pub password: String,
     pub user_role: String,
+    /// Only the hidden system-admin path reads this — it designates the user
+    /// admin. The in-app `create_user` ignores it, so a user admin cannot mint
+    /// another user admin; only the system admin can.
+    #[serde(default)]
+    pub is_user_admin: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

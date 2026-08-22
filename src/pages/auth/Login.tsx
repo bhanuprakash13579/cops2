@@ -48,8 +48,8 @@ export default function Login() {
         password: password,
       });
 
-      const { access_token, user_name, user_id, user_role, user_desig, user_status } = response.data;
-      login(access_token, { user_name, user_id, user_role, user_desig, user_status });
+      const { access_token, user_name, user_id, user_role, user_desig, user_status, is_user_admin } = response.data;
+      login(access_token, { user_name, user_id, user_role, user_desig, user_status, is_user_admin });
 
       // Navigate to the precise module dashboard instead of generic /modules
       if (isSDO) navigate('/sdo');

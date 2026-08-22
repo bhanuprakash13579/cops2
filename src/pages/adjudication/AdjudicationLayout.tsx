@@ -106,7 +106,8 @@ export default function AdjudicationLayout() {
               </>
             )}
 
-            {user?.user_status !== 'TEMP' && (
+            {/* Only the designated user admin sees the account-management screen. */}
+            {user?.user_status !== 'TEMP' && user?.is_user_admin && (
               <>
                 {!isCollapsed && <p className="text-amber-400/70 text-xs uppercase tracking-widest font-semibold px-3 mt-4 mb-3 whitespace-nowrap transition-opacity duration-300" style={{ opacity: isCollapsed ? 0 : 1 }}>Administration</p>}
                 <AdjNavItem
@@ -118,7 +119,7 @@ export default function AdjudicationLayout() {
                 />
               </>
             )}
-            
+
           </nav>
 
           <div className="mt-6 px-3">
@@ -158,8 +159,9 @@ export default function AdjudicationLayout() {
       {/* Main Content */}
       <main className="flex-1 flex flex-col min-h-screen print:h-auto print:overflow-visible">
         <div className="flex-1 min-h-0 p-5 md:p-7 bg-amber-50 print:overflow-visible print:p-0">
-          {user?.user_status === 'TEMP' && !location.pathname.endsWith('/users') ? (
-            <Navigate to="/adjudication/users" replace />
+          {user?.user_status === 'TEMP' && !location.pathname.endsWith('/change-password') ? (
+            // A reset account must set its own password before doing anything else.
+            <Navigate to="/adjudication/change-password" replace />
           ) : (
             <Outlet />
           )}

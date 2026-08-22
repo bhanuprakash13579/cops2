@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ClipboardEdit, Gavel, ArrowRight, Search, ScanLine, ExternalLink, Mail, ClipboardList } from 'lucide-react';
+import { ClipboardEdit, Gavel, ArrowRight, Search, ScanLine, ExternalLink, Mail, ClipboardList, RefreshCw, Check, AlertTriangle } from 'lucide-react';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 import api from '@/lib/api';
 
@@ -9,6 +9,30 @@ export default function ModuleSelection() {
   const [secretClicks, setSecretClicks] = useState(0);
   const [apisEnabled, setApisEnabled] = useState(() => localStorage.getItem('cops_apis_enabled') === 'true');
   const [dcrEnabled, setDcrEnabled] = useState(() => localStorage.getItem('cops_dcr_enabled') === 'true');
+
+  // A one-press backup, before anyone signs in. It only triggers the same
+  // encrypted backup the timer takes and reports a bare success/failure — it
+  // never returns any data (see the sync_now handler), which is why it is safe
+  // to offer here on the open page.
+  const [backup, setBackup] = useState<'idle' | 'running' | 'ok' | 'partial' | 'fail'>('idle');
+  const [backupMsg, setBackupMsg] = useState('');
+  const backupNow = async () => {
+    setBackup('running'); setBackupMsg('');
+    try {
+      const r = await api.post('/backup/sync', {}, { timeout: 0 });
+      const o = r.data as { ok: boolean; refused: boolean; copied: number; total: number; reason: string };
+      const reason = (o.reason || '').toLowerCase();
+      if (reason.includes('a moment ago')) { setBackup('ok'); setBackupMsg('Backed up just now'); }
+      else if (o.refused) { setBackup('fail'); setBackupMsg('Refused as a safeguard — tell the administrator'); }
+      else if (reason.includes('already running')) { setBackup('ok'); setBackupMsg('A backup is already running'); }
+      else if (o.total === 0) { setBackup('fail'); setBackupMsg('No backup folders configured'); }
+      else if (o.copied === o.total) { setBackup('ok'); setBackupMsg(`Backed up to all ${o.total} location(s)`); }
+      else { setBackup('partial'); setBackupMsg(`Backed up to ${o.copied} of ${o.total} — one machine unreachable`); }
+    } catch {
+      setBackup('fail'); setBackupMsg('Could not back up right now');
+    }
+    setTimeout(() => setBackup(s => (s === 'running' ? s : 'idle')), 6000);
+  };
 
   useEffect(() => {
     api.get('/features')
@@ -42,6 +66,33 @@ export default function ModuleSelection() {
 
   return (
     <div className="min-h-screen flex flex-col justify-center items-center relative overflow-hidden" style={{ background: 'linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%)' }}>
+      {/* Back up now — top right. Triggers the same encrypted backup the timer
+          takes; exposes no data, so it is safe on this pre-login page. */}
+      <div className="absolute top-4 right-4 z-30 flex items-center gap-2">
+        {backup !== 'idle' && backupMsg && (
+          <span className={`text-xs font-medium px-2.5 py-1 rounded-full border ${
+            backup === 'ok' ? 'bg-emerald-500/15 border-emerald-400/30 text-emerald-200'
+            : backup === 'partial' ? 'bg-amber-500/15 border-amber-400/30 text-amber-200'
+            : backup === 'fail' ? 'bg-red-500/15 border-red-400/30 text-red-200'
+            : 'bg-white/10 border-white/20 text-blue-100'}`}>
+            {backup === 'ok' && <Check size={12} className="inline mr-1 -mt-0.5" />}
+            {(backup === 'fail' || backup === 'partial') && <AlertTriangle size={12} className="inline mr-1 -mt-0.5" />}
+            {backupMsg}
+          </span>
+        )}
+        <button
+          onClick={backupNow}
+          disabled={backup === 'running'}
+          title="Save a backup now, to the office's other machines"
+          className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-white/10 border border-white/20
+                     text-white/80 hover:bg-white/20 hover:text-white text-xs font-semibold
+                     transition-colors focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-60"
+        >
+          <RefreshCw size={14} className={backup === 'running' ? 'animate-spin' : ''} />
+          {backup === 'running' ? 'Backing up…' : 'Back up now'}
+        </button>
+      </div>
+
       {/* Background orbs — blur removed, radial-gradient already looks soft */}
       <div className="absolute top-[-10%] right-[-5%] w-[500px] h-[500px] rounded-full opacity-20" style={{ background: 'radial-gradient(circle, #3b82f6, transparent)' }} />
       <div className="absolute bottom-[-10%] left-[-5%] w-[500px] h-[500px] rounded-full opacity-20" style={{ background: 'radial-gradient(circle, #f59e0b, transparent)' }} />

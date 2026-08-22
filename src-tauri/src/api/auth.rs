@@ -48,16 +48,16 @@ pub async fn login(State(pool): Db, Json(req): Json<LoginRequest>) -> Result<Jso
 
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
 
-    let user: Option<(String, String, String, Option<String>, Option<String>)> = conn
+    let user: Option<(String, String, String, Option<String>, Option<String>, i64)> = conn
         .query_row(
-            "SELECT user_id, user_pwd, user_role, user_desig, user_status FROM users WHERE user_id = ? AND (user_status IS NULL OR user_status != 'CLOSED')",
+            "SELECT user_id, user_pwd, user_role, user_desig, user_status, COALESCE(is_user_admin, 0) FROM users WHERE user_id = ? AND (user_status IS NULL OR user_status != 'CLOSED')",
             [&req.user_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()
         .map_err(|e| err500(&e.to_string()))?;
 
-    let (user_id, pwd_hash, role, desig, status) = user
+    let (user_id, pwd_hash, role, desig, status, is_user_admin) = user
         .ok_or_else(|| err401("Invalid credentials"))?;
 
     let status = status.unwrap_or_else(|| "ACTIVE".to_string());
@@ -99,14 +99,42 @@ pub async fn login(State(pool): Db, Json(req): Json<LoginRequest>) -> Result<Jso
         "user_role": role,
         "user_desig": desig,
         "user_status": status,
+        "is_user_admin": is_user_admin == 1,
     })))
 }
 
-pub async fn list_users(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+/// Confirms the signed-in caller is the designated **user admin** — an active AC
+/// or DC holding the `is_user_admin` flag. Read from the database on every call,
+/// never from the token: revoking the flag, handing it over, or closing the
+/// account then takes effect at once rather than lingering until a token expires.
+fn require_user_admin(conn: &rusqlite::Connection, user_id: &str)
+    -> Result<(), (StatusCode, Json<Value>)>
+{
+    let row: Option<(i64, String, Option<String>)> = conn.query_row(
+        "SELECT COALESCE(is_user_admin, 0), user_role, user_status FROM users WHERE user_id = ?",
+        [user_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional().map_err(|e| err500(&e.to_string()))?;
+
+    let (flag, role, status) = row.ok_or_else(|| err403("Only the user administrator may manage user accounts."))?;
+    let active = status.as_deref() != Some("CLOSED");
+    let acdc   = role == "AC" || role == "DC";
+    if flag == 1 && acdc && active {
+        Ok(())
+    } else {
+        Err(err403("Only the user administrator may manage user accounts."))
+    }
+}
+
+// Listing the office's users is itself a user-admin action now — the in-app
+// management screen is the only caller, and no one else needs the roster.
+pub async fn list_users(State(pool): Db, auth: AuthUser) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+    require_user_admin(&conn, &auth.0.sub)?;
     let mut stmt = conn.prepare(
-        "SELECT id, user_name, user_desig, user_id, user_role, user_status, created_on
-         FROM users WHERE (user_status IS NULL OR user_status = 'ACTIVE')
+        "SELECT id, user_name, user_desig, user_id, user_role, user_status, created_on,
+                COALESCE(is_user_admin, 0)
+         FROM users WHERE (user_status IS NULL OR user_status != 'CLOSED')
          ORDER BY user_role, user_name"
     ).map_err(|e| err500(&e.to_string()))?;
 
@@ -119,6 +147,7 @@ pub async fn list_users(State(pool): Db, _auth: AuthUser) -> Result<Json<Value>,
             "user_role": r.get::<_, String>(4)?,
             "user_status": r.get::<_, Option<String>>(5)?,
             "created_on": r.get::<_, Option<String>>(6)?,
+            "is_user_admin": r.get::<_, i64>(7)? == 1,
         }))
     }).map_err(|e| err500(&e.to_string()))?
     .filter_map(|r| r.ok())
@@ -131,33 +160,21 @@ pub async fn create_user(State(pool): Db, auth: AuthUser, Json(req): Json<Create
     if !["SDO", "DC", "AC"].contains(&req.user_role.as_str()) {
         return Err(err400("Invalid role. Must be SDO, DC, or AC."));
     }
-
-    // ── Who may create WHICH role ────────────────────────────────────────────
-    //
-    // upgrade_role already refuses to promote anyone unless the caller is a DC,
-    // so the intent is clear: an SDO must not be able to make adjudicators. That
-    // guard was bypassable, because this endpoint accepted any role from any
-    // signed-in officer — an SDO could not promote themselves, but could create
-    // a brand-new DC account and sign in as it. Same escalation, one step round.
-    //
-    // These rules are what the screens already do: the SDO module only ever
-    // creates SDO accounts, adjudication creates ACs, and a DC promotes an AC.
-    // Enforcing them here changes no legitimate workflow — it stops the request
-    // that never comes from those screens.
-    let caller = auth.0.role.as_str();
-    let permitted = match req.user_role.as_str() {
-        "SDO" => true,                              // ordinary staff
-        "AC"  => caller == "DC" || caller == "AC",  // adjudication side only
-        "DC"  => caller == "DC",                    // same rule as upgrade_role
-        _ => false,
-    };
-    if !permitted {
-        return Err(err403(&format!(
-            "Your role ({caller}) is not permitted to create a {} account.",
-            req.user_role
-        )));
+    // A blank login ID or name makes an account nobody can sign into or identify.
+    if req.user_id.trim().is_empty() {
+        return Err(err400("A login ID is required."));
     }
+    if req.user_name.trim().is_empty() {
+        return Err(err400("A name is required."));
+    }
+
+    // Creating accounts is the user admin's job, and only theirs. It used to be
+    // open to every signed-in officer with per-role rules, which let an SDO make
+    // a fresh DC account and sign in as it — the same privilege escalation, one
+    // step round. Now one designated AC/DC owns account creation for the office,
+    // and may create any of the three roles; no one else reaches this at all.
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+    require_user_admin(&conn, &auth.0.sub)?;
 
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM users WHERE user_id = ?",
@@ -178,8 +195,13 @@ pub async fn create_user(State(pool): Db, auth: AuthUser, Json(req): Json<Create
     Ok(Json(json!({ "message": "User created." })))
 }
 
-pub async fn update_user(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn update_user(State(pool): Db, auth: AuthUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+    // Editing someone's status or name is a user-admin action. Left open, this
+    // let any signed-in officer set another account — the user admin's included —
+    // to CLOSED and lock them out. The screen never called it; the guard costs
+    // no legitimate use.
+    require_user_admin(&conn, &auth.0.sub)?;
 
     if let Some(status) = req.get("user_status").and_then(|v| v.as_str()) {
         conn.execute("UPDATE users SET user_status = ? WHERE id = ?", rusqlite::params![status, id])
@@ -195,14 +217,27 @@ pub async fn update_user(State(pool): Db, _auth: AuthUser, Path(id): Path<i64>, 
 pub async fn delete_user(State(pool): Db, auth: AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
 
-    // Users may only close their own account.
+    // Anyone may close their OWN account; closing someone else's is the user
+    // admin's to do. That is the only widening — an ordinary officer still cannot
+    // reach past their own account.
     let target_user_id: Option<String> = conn.query_row(
         "SELECT user_id FROM users WHERE id = ?",
         rusqlite::params![id], |r| r.get(0),
     ).optional().map_err(|e| err500(&e.to_string()))?;
     let target_user_id = target_user_id.ok_or_else(|| err404("User not found"))?;
     if target_user_id != auth.0.sub {
-        return Err(err403("You may only close your own account."));
+        require_user_admin(&conn, &auth.0.sub)?;
+    }
+
+    // The user admin must not be closed out of existence — neither by themselves
+    // nor by anyone — while they still hold the role, or the office is left with
+    // no one able to manage accounts. The role is handed over first, then the
+    // account can be closed.
+    let holds_admin: i64 = conn.query_row(
+        "SELECT COALESCE(is_user_admin, 0) FROM users WHERE id = ?", [id], |r| r.get(0),
+    ).optional().map_err(|e| err500(&e.to_string()))?.unwrap_or(0);
+    if holds_admin == 1 {
+        return Err(err400("This account is the user admin. Hand the role over first, then close it."));
     }
 
     conn.execute("UPDATE users SET user_status = 'CLOSED', closed_on = ? WHERE id = ?",
@@ -275,19 +310,20 @@ pub async fn bootstrap(State(pool): Db, Path(module_type): Path<String>) -> Resu
 
 pub async fn me(State(pool): Db, auth: AuthUser) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
-    let row: Option<(String, Option<String>, String, Option<String>)> = conn.query_row(
-        "SELECT user_name, user_desig, user_role, user_status FROM users WHERE user_id = ?",
+    let row: Option<(String, Option<String>, String, Option<String>, i64)> = conn.query_row(
+        "SELECT user_name, user_desig, user_role, user_status, COALESCE(is_user_admin, 0) FROM users WHERE user_id = ?",
         [&auth.0.sub],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     ).optional().map_err(|e| err500(&e.to_string()))?;
 
-    let (name, desig, role, status) = row.ok_or_else(|| err404("User not found"))?;
+    let (name, desig, role, status, is_user_admin) = row.ok_or_else(|| err404("User not found"))?;
     Ok(Json(json!({
         "user_id": auth.0.sub,
         "user_name": name,
         "user_desig": desig,
         "user_role": role,
         "user_status": status,
+        "is_user_admin": is_user_admin == 1,
     })))
 }
 
@@ -299,22 +335,109 @@ pub async fn upgrade_role(
     Path(user_id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Only DC users are permitted to change roles.
-    if auth.0.role != "DC" {
-        return Err(err403("Only DC users can upgrade roles."));
-    }
     let new_role = req.get("user_role").and_then(|v| v.as_str())
         .ok_or_else(|| err400("user_role is required"))?;
     if !["SDO", "DC", "AC"].contains(&new_role) {
         return Err(err400("Invalid role. Must be SDO, DC, or AC"));
     }
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+    // Changing a role is user management, which now belongs to the user admin
+    // alone. It used to be open to any DC, which sat outside the one-keeper model
+    // the office asked for — a DC who was not the user admin could still reshape
+    // the roster. Only the user admin reaches it now.
+    require_user_admin(&conn, &auth.0.sub)?;
+    // Never let this be the way the user-admin flag moves — an AC carrying the
+    // flag must not be silently demoted, nor a promotion double as a handover.
+    // Handover has its own guarded path.
+    if new_role == "SDO" {
+        let holds: i64 = conn.query_row(
+            "SELECT COALESCE(is_user_admin, 0) FROM users WHERE user_id = ?",
+            [&user_id], |r| r.get(0),
+        ).optional().map_err(|e| err500(&e.to_string()))?.unwrap_or(0);
+        if holds == 1 {
+            return Err(err400("This user is the user admin. Hand the role over first, then change their role."));
+        }
+    }
     let affected = conn.execute(
         "UPDATE users SET user_role = ? WHERE user_id = ?",
         rusqlite::params![new_role, user_id],
     ).map_err(|e| err500(&e.to_string()))?;
     if affected == 0 { return Err(err404("User not found")); }
     Ok(Json(json!({ "message": format!("Role updated to {new_role}") })))
+}
+
+// ── Reset a user's password (user admin) ──────────────────────────────────────
+// Sets a temporary password and marks the account TEMP, so the user is required
+// to choose their own the next time they sign in. The admin never learns the
+// permanent password — they set only the one-time value the user replaces.
+pub async fn reset_password(
+    State(pool): Db,
+    auth: AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+    require_user_admin(&conn, &auth.0.sub)?;
+
+    let temp = req.get("temp_password").and_then(|v| v.as_str()).unwrap_or("");
+    if temp.chars().count() < 6 {
+        return Err(err400("Temporary password must be at least 6 characters."));
+    }
+    // A closed account must not be revived by a reset — setting it TEMP would put
+    // it back in the sign-in table. Reopening a closed account is the system
+    // admin's call, not a password reset.
+    let status: Option<Option<String>> = conn.query_row(
+        "SELECT user_status FROM users WHERE id = ?", [id], |r| r.get(0),
+    ).optional().map_err(|e| err500(&e.to_string()))?;
+    match status {
+        None => return Err(err404("User not found")),
+        Some(s) if s.as_deref() == Some("CLOSED") =>
+            return Err(err400("This account is closed. It must be reopened by the system administrator before a password can be set.")),
+        _ => {}
+    }
+    let pwd_hash = hash(temp, DEFAULT_COST).map_err(|e| err500(&e.to_string()))?;
+    conn.execute(
+        "UPDATE users SET user_pwd = ?, user_status = 'TEMP' WHERE id = ?",
+        rusqlite::params![pwd_hash, id],
+    ).map_err(|e| err500(&e.to_string()))?;
+    Ok(Json(json!({ "message": "Temporary password set. The user must choose a new one at next sign-in." })))
+}
+
+// ── Hand over the user-admin role (user admin) ────────────────────────────────
+// The holder passes the role to another active AC or DC. Done in one transaction
+// so the office is never left with two holders or none.
+pub async fn transfer_user_admin(
+    State(pool): Db,
+    auth: AuthUser,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+    require_user_admin(&conn, &auth.0.sub)?;
+
+    let target = req.get("user_id").and_then(|v| v.as_str())
+        .ok_or_else(|| err400("user_id is required"))?;
+    if target == auth.0.sub {
+        return Err(err400("You already hold the user-admin role."));
+    }
+    let row: Option<(String, Option<String>)> = conn.query_row(
+        "SELECT user_role, user_status FROM users WHERE user_id = ?",
+        [target], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional().map_err(|e| err500(&e.to_string()))?;
+    let (role, status) = row.ok_or_else(|| err404("The chosen user was not found."))?;
+    if !(role == "AC" || role == "DC") {
+        return Err(err400("The user admin must be an AC or a DC."));
+    }
+    if status.as_deref() == Some("CLOSED") {
+        return Err(err400("Cannot hand the role to a closed account."));
+    }
+
+    let tx = conn.transaction().map_err(|e| err500(&e.to_string()))?;
+    tx.execute("UPDATE users SET is_user_admin = 0 WHERE user_id = ?", [&auth.0.sub])
+        .map_err(|e| err500(&e.to_string()))?;
+    tx.execute("UPDATE users SET is_user_admin = 1 WHERE user_id = ?", [target])
+        .map_err(|e| err500(&e.to_string()))?;
+    tx.commit().map_err(|e| err500(&e.to_string()))?;
+    Ok(Json(json!({ "message": format!("The user-admin role now belongs to {target}.") })))
 }
 
 // ── Admin login ───────────────────────────────────────────────────────────────
@@ -387,7 +510,8 @@ pub async fn admin_login(Json(req): Json<serde_json::Value>) -> Result<Json<Valu
 pub async fn admin_list_users(State(pool): Db, _admin: AdminUser) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT id, user_name, user_desig, user_id, user_role, user_status, created_on, closed_on
+        "SELECT id, user_name, user_desig, user_id, user_role, user_status, created_on, closed_on,
+                COALESCE(is_user_admin, 0)
          FROM users ORDER BY user_role, user_name"
     ).map_err(|e| err500(&e.to_string()))?;
 
@@ -401,6 +525,7 @@ pub async fn admin_list_users(State(pool): Db, _admin: AdminUser) -> Result<Json
             "user_status": r.get::<_, Option<String>>(5)?,
             "created_on":  r.get::<_, Option<String>>(6)?,
             "closed_on":   r.get::<_, Option<String>>(7)?,
+            "is_user_admin": r.get::<_, i64>(8)? == 1,
         }))
     }).map_err(|e| err500(&e.to_string()))?
     .filter_map(|r| r.ok())
@@ -423,12 +548,19 @@ pub async fn admin_create_user(State(pool): Db, _admin: AdminUser, Json(req): Js
         return Err(err409("A user with this login ID already exists."));
     }
 
+    // The user-admin flag can only rest on an AC or a DC — the office's
+    // account-keeper is an adjudicating officer, never ordinary staff.
+    let make_admin = req.is_user_admin.unwrap_or(false);
+    if make_admin && !(req.user_role == "AC" || req.user_role == "DC") {
+        return Err(err400("Only an AC or a DC can be made the user admin."));
+    }
+
     let pwd_hash = hash(&req.password, DEFAULT_COST).map_err(|e| err500(&e.to_string()))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     conn.execute(
-        "INSERT INTO users (user_name, user_desig, user_id, user_pwd, user_role, user_status, created_on) VALUES (?,?,?,?,?,?,?)",
-        rusqlite::params![req.user_name, req.user_desig, req.user_id, pwd_hash, req.user_role, "ACTIVE", today],
+        "INSERT INTO users (user_name, user_desig, user_id, user_pwd, user_role, user_status, created_on, is_user_admin) VALUES (?,?,?,?,?,?,?,?)",
+        rusqlite::params![req.user_name, req.user_desig, req.user_id, pwd_hash, req.user_role, "ACTIVE", today, make_admin as i64],
     ).map_err(|e| err400(&e.to_string()))?;
 
     Ok(Json(json!({ "message": "User created." })))
@@ -436,6 +568,24 @@ pub async fn admin_create_user(State(pool): Db, _admin: AdminUser, Json(req): Js
 
 pub async fn admin_update_user(State(pool): Db, _admin: AdminUser, Path(id): Path<i64>, Json(req): Json<serde_json::Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = pool.get().map_err(|e| err500(&e.to_string()))?;
+
+    // Validate the user-admin flag against the role this edit will LEAVE the
+    // account with — the role being set in this same request, or the current one
+    // — before writing anything. Checking after the writes could reject the flag
+    // only once the role and password had already been changed, leaving a
+    // half-applied edit behind.
+    let make_admin = req.get("is_user_admin").and_then(|v| v.as_bool());
+    if make_admin == Some(true) {
+        let effective_role: String = match req.get("user_role").and_then(|v| v.as_str()) {
+            Some(r) => r.to_string(),
+            None => conn.query_row("SELECT user_role FROM users WHERE id=?", [id], |r| r.get(0))
+                .optional().map_err(|e| err500(&e.to_string()))?
+                .ok_or_else(|| err404("User not found"))?,
+        };
+        if !(effective_role == "AC" || effective_role == "DC") {
+            return Err(err400("Only an AC or a DC can be made the user admin."));
+        }
+    }
 
     if let Some(status) = req.get("user_status").and_then(|v| v.as_str()) {
         conn.execute("UPDATE users SET user_status=? WHERE id=?", rusqlite::params![status, id])
@@ -459,6 +609,13 @@ pub async fn admin_update_user(State(pool): Db, _admin: AdminUser, Path(id): Pat
             conn.execute("UPDATE users SET user_pwd=? WHERE id=?", rusqlite::params![pwd_hash, id])
                 .map_err(|e| err500(&e.to_string()))?;
         }
+    }
+    // Designate or remove the user admin — already validated against the final
+    // role above.
+    if let Some(mk) = make_admin {
+        conn.execute("UPDATE users SET is_user_admin=? WHERE id=?",
+                     rusqlite::params![mk as i64, id])
+            .map_err(|e| err500(&e.to_string()))?;
     }
     Ok(Json(json!({ "message": "User updated." })))
 }

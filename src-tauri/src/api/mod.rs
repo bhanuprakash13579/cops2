@@ -139,7 +139,9 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/auth/login",                    post(auth::login))
         .route("/auth/users",                    get(auth::list_users).post(auth::create_user))
         .route("/auth/users/:id",               put(auth::update_user).delete(auth::delete_user))
+        .route("/auth/users/:id/reset-password", post(auth::reset_password))
         .route("/auth/users/:user_id/role",     patch(auth::upgrade_role))
+        .route("/auth/user-admin/transfer",      post(auth::transfer_user_admin))
         .route("/auth/change-password",          post(auth::change_password))
         .route("/auth/bootstrap/:module_type",  get(auth::bootstrap))
         .route("/auth/me",                       get(auth::me))
@@ -257,12 +259,15 @@ fn build_routes(pool: Arc<DbPool>) -> Router<()> {
         .route("/backup/adjudication-summary-pdf",  post(backup::adjudication_summary_pdf))
 
         // ── Automatic backups ────────────────────────────────────────────────
-        // Status and the archive download are open to any signed-in officer:
-        // the archive is the copy that leaves the building, and requiring the
-        // administrator to be present to take one is how a month goes by
-        // without anybody taking one. Changing where backups go, and forcing a
-        // run, stay with the administrator.
+        // Status, the archive download, and forcing a sync are open to any
+        // signed-in officer: the archive is the copy that leaves the building,
+        // and requiring the administrator to be present is how a month goes by
+        // without anybody taking one. An officer can push a fresh copy to the
+        // slave machines on demand ("Sync now") instead of waiting out the
+        // half-hour — but only the administrator may change where backups go, or
+        // force a run PAST the safety floor that guards a shrunken database.
         .route("/backup/auto/status",               get(backup::auto_status))
+        .route("/backup/sync",                      post(backup::sync_now))
         // The monthly copy that leaves the building on its own.
         .route("/backup/cloud/status",              get(backup::cloud_status))
         .route("/admin/backup/cloud/settings",      post(backup::cloud_settings))

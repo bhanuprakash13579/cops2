@@ -117,17 +117,29 @@ function AdjudicationRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+// A user whose password was just reset (status TEMP) must set a new one before
+// using anything. The change-password screen lives in the SDO and adjudication
+// modules; send them to whichever is theirs. The SDO and adjudication layouts
+// enforce this within their own subtree (and guard against a redirect loop by
+// checking the path); these secondary modules have no change-password screen of
+// their own, so they bounce the user to their home module instead.
+function tempPasswordRedirect(user: { user_role?: string; user_status?: string } | null): string | null {
+  if (user?.user_status !== 'TEMP') return null;
+  return user.user_role === 'SDO' ? '/sdo/change-password' : '/adjudication/change-password';
+}
+
 // Query guard (allows SDO and Adjn roles)
 function QueryRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, canAccessQuery } = useAuth();
+  const { isAuthenticated, canAccessQuery, user } = useAuth();
   if (!isAuthenticated) return <Navigate to="/login/query" replace />;
   if (!canAccessQuery()) return <Navigate to="/login/query" replace />;
+  const t = tempPasswordRedirect(user); if (t) return <Navigate to={t} replace />;
   return <>{children}</>;
 }
 
 // DCR guard — any authenticated user + dcr_enabled feature flag
 function DcrRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
   const { data, isLoading } = useQuery({
     queryKey: queryKeys.features(),
     queryFn: fetchers.features,
@@ -137,12 +149,13 @@ function DcrRoute({ children }: { children: React.ReactNode }) {
   if (isLoading) return <div className="min-h-screen bg-slate-900" />;
   if (!data?.dcr_enabled) return <Navigate to="/modules" replace />;
   if (!isAuthenticated) return <Navigate to="/login/dcr" replace />;
+  const t = tempPasswordRedirect(user); if (t) return <Navigate to={t} replace />;
   return <>{children}</>;
 }
 
 // APIS guard (SDO and Adjn roles + feature flag must be enabled)
 function ApisRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, canAccessApis } = useAuth();
+  const { isAuthenticated, canAccessApis, user } = useAuth();
   const { data, isLoading } = useQuery({
     queryKey: queryKeys.features(),
     queryFn: fetchers.features,
@@ -153,6 +166,7 @@ function ApisRoute({ children }: { children: React.ReactNode }) {
   if (!data?.apis_enabled) return <Navigate to="/modules" replace />;
   if (!isAuthenticated) return <Navigate to="/login/apis" replace />;
   if (!canAccessApis()) return <Navigate to="/login/apis" replace />;
+  const t = tempPasswordRedirect(user); if (t) return <Navigate to={t} replace />;
   return <>{children}</>;
 }
 
